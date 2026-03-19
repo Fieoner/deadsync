@@ -821,6 +821,7 @@ pub struct ShellState {
     pending_exit: bool,
     shift_held: bool,
     ctrl_held: bool,
+    tab_held: bool,
     window_focused: bool,
     window_occluded: bool,
     surface_active: bool,
@@ -997,6 +998,7 @@ impl ShellState {
             pending_exit: false,
             shift_held: false,
             ctrl_held: false,
+            tab_held: false,
             window_focused: true,
             window_occluded: false,
             surface_active: cfg.display_width > 0 && cfg.display_height > 0,
@@ -2593,10 +2595,13 @@ impl App {
     ) {
         let prev_frame_end = self.state.shell.last_frame_end_time;
         let pre_redraw_gap_us = elapsed_us_between(redraw_started, prev_frame_end);
-        let delta_time = redraw_started
+        let mut delta_time = redraw_started
             .duration_since(self.state.shell.last_frame_time)
             .as_secs_f32();
         self.state.shell.last_frame_time = redraw_started;
+        if self.state.shell.tab_held {
+            delta_time *= 4.0;
+        }
         let total_elapsed = redraw_started
             .duration_since(self.state.shell.start_time)
             .as_secs_f32();
@@ -5963,6 +5968,9 @@ impl App {
             KeyCode::ControlLeft | KeyCode::ControlRight => {
                 self.state.shell.ctrl_held = key_event.pressed;
             }
+            KeyCode::Tab => {
+                self.state.shell.tab_held = key_event.pressed;
+            }
             _ => {}
         }
 
@@ -6039,6 +6047,9 @@ impl App {
                 }
                 KeyCode::ControlLeft | KeyCode::ControlRight => {
                     self.state.shell.ctrl_held = raw_key.pressed;
+                }
+                KeyCode::Tab => {
+                    self.state.shell.tab_held = raw_key.pressed;
                 }
                 _ => {}
             }
