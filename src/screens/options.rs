@@ -5351,8 +5351,9 @@ pub fn update(state: &mut State, dt: f32, asset_manager: &AssetManager) -> Optio
         state.nav_key_last_scrolled_at,
     ) {
         let now = Instant::now();
-        if now.duration_since(held_since) > NAV_INITIAL_HOLD_DELAY
-            && now.duration_since(last_scrolled_at) >= NAV_REPEAT_SCROLL_INTERVAL
+        let sm = crate::app::speed_multiplier();
+        if now.duration_since(held_since) > NAV_INITIAL_HOLD_DELAY / sm
+            && now.duration_since(last_scrolled_at) >= NAV_REPEAT_SCROLL_INTERVAL / sm
         {
             match state.view {
                 OptionsView::Main => {
@@ -5387,8 +5388,9 @@ pub fn update(state: &mut State, dt: f32, asset_manager: &AssetManager) -> Optio
         state.nav_lr_last_adjusted_at,
     ) {
         let now = Instant::now();
-        if now.duration_since(held_since) > NAV_INITIAL_HOLD_DELAY
-            && now.duration_since(last_adjusted) >= NAV_REPEAT_SCROLL_INTERVAL
+        let sm = crate::app::speed_multiplier();
+        if now.duration_since(held_since) > NAV_INITIAL_HOLD_DELAY / sm
+            && now.duration_since(last_adjusted) >= NAV_REPEAT_SCROLL_INTERVAL / sm
             && matches!(state.view, OptionsView::Submenu(_))
         {
             if pending_action.is_none() {

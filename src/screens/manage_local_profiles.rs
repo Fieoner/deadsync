@@ -257,10 +257,11 @@ fn update_hold_scroll(state: &mut State) {
     };
 
     let now = Instant::now();
-    if now.duration_since(held_since) < NAV_INITIAL_HOLD_DELAY {
+    let sm = crate::app::speed_multiplier();
+    if now.duration_since(held_since) < NAV_INITIAL_HOLD_DELAY / sm {
         return;
     }
-    if now.duration_since(last_at) < NAV_REPEAT_SCROLL_INTERVAL {
+    if now.duration_since(last_at) < NAV_REPEAT_SCROLL_INTERVAL / sm {
         return;
     }
 

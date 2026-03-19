@@ -315,8 +315,9 @@ pub fn update(state: &mut State, dt: f32) {
         state.nav_key_last_scrolled_at,
     ) {
         let now = Instant::now();
-        if now.duration_since(held_since) > NAV_INITIAL_HOLD_DELAY
-            && now.duration_since(last_scrolled_at) >= NAV_REPEAT_SCROLL_INTERVAL
+        let sm = crate::app::speed_multiplier();
+        if now.duration_since(held_since) > NAV_INITIAL_HOLD_DELAY / sm
+            && now.duration_since(last_scrolled_at) >= NAV_REPEAT_SCROLL_INTERVAL / sm
         {
             move_selection(state, direction);
             state.nav_key_last_scrolled_at = Some(now);

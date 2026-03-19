@@ -33,7 +33,8 @@ use std::collections::{HashMap, HashSet};
 #[cfg(windows)]
 use std::mem::MaybeUninit;
 #[cfg(windows)]
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::{
     error::Error,
     ffi::OsString,
@@ -43,6 +44,16 @@ use std::{
 };
 
 use crate::ui::actors::Actor;
+
+/* -------------------- tab speedup (SM-style fast-forward) -------------------- */
+static TAB_SPEED_MULTIPLIER: AtomicU32 = AtomicU32::new(1);
+
+/// Returns the current speed multiplier (4 when Tab is held, 1 otherwise).
+/// Used by screens to scale hold-repeat intervals.
+pub fn speed_multiplier() -> u32 {
+    TAB_SPEED_MULTIPLIER.load(Ordering::Relaxed)
+}
+
 /* -------------------- gamepad -------------------- */
 use crate::core::input::{GpSystemEvent, PadEvent};
 
@@ -5970,6 +5981,7 @@ impl App {
             }
             KeyCode::Tab => {
                 self.state.shell.tab_held = key_event.pressed;
+                TAB_SPEED_MULTIPLIER.store(if key_event.pressed { 4 } else { 1 }, Ordering::Relaxed);
             }
             _ => {}
         }
@@ -6050,6 +6062,7 @@ impl App {
                 }
                 KeyCode::Tab => {
                     self.state.shell.tab_held = raw_key.pressed;
+                    TAB_SPEED_MULTIPLIER.store(if raw_key.pressed { 4 } else { 1 }, Ordering::Relaxed);
                 }
                 _ => {}
             }

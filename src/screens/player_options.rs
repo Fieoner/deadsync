@@ -4067,8 +4067,9 @@ pub fn update(state: &mut State, dt: f32, asset_manager: &AssetManager) {
         ) else {
             continue;
         };
-        if now.duration_since(held_since) <= NAV_INITIAL_HOLD_DELAY
-            || now.duration_since(last_scrolled_at) < NAV_REPEAT_SCROLL_INTERVAL
+        let sm = crate::app::speed_multiplier();
+        if now.duration_since(held_since) <= NAV_INITIAL_HOLD_DELAY / sm
+            || now.duration_since(last_scrolled_at) < NAV_REPEAT_SCROLL_INTERVAL / sm
         {
             continue;
         }
