@@ -760,6 +760,7 @@ fn make_course_song(meta: &CourseMeta) -> SongData {
         music_length_seconds: meta.total_length_seconds.max(0) as f32,
         total_length_seconds: meta.total_length_seconds.max(0),
         charts: Vec::new(),
+        cached_precise_last_second: 0.0,
     }
 }
 

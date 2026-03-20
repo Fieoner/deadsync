@@ -131,6 +131,7 @@ fn bench_song(pack_idx: usize, song_idx: usize) -> Arc<SongData> {
         music_length_seconds: 92.0 + song_idx as f32,
         total_length_seconds: 92 + song_idx as i32,
         charts: bench_charts(&base, has_edit),
+        cached_precise_last_second: 0.0,
     })
 }
 

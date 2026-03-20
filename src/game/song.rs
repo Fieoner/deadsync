@@ -47,6 +47,8 @@ pub struct SongData {
     /// Length of the chart in seconds based on the last note/hold (`Song::GetLastSecond()` semantics).
     pub total_length_seconds: i32,
     pub charts: Vec<ChartData>,
+    /// Pre-computed `precise_last_second()` so note data can be stripped from memory.
+    pub cached_precise_last_second: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -142,6 +144,14 @@ impl SongData {
     /// Mirrors ITGmania's `Song::GetLastSecond()` chart-selection behavior:
     /// if any non-Edit chart exists, ignore Edit charts for song length.
     pub fn precise_last_second(&self) -> f32 {
+        // Use pre-computed value when note data has been stripped.
+        if self.cached_precise_last_second > 0.0 {
+            return self.cached_precise_last_second;
+        }
+        self.compute_precise_last_second()
+    }
+
+    pub(crate) fn compute_precise_last_second(&self) -> f32 {
         let has_non_edit = self
             .charts
             .iter()

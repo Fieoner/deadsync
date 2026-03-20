@@ -708,6 +708,7 @@ impl From<SerializableSongData> for SongData {
             music_length_seconds: song.music_length_seconds,
             total_length_seconds: song.total_length_seconds,
             charts: song.charts.into_iter().map(ChartData::from).collect(),
+            cached_precise_last_second: 0.0,
         }
     }
 }
@@ -915,6 +916,15 @@ fn hydrate_chart_timings(song: &mut SongData, global_offset_seconds: f32) {
     }
 }
 
+/// Pre-computes `precise_last_second`, then drops the heavy per-note vectors
+/// from every chart so the in-memory song cache stays compact.
+fn strip_song_note_data(song: &mut SongData) {
+    song.cached_precise_last_second = song.compute_precise_last_second();
+    for chart in &mut song.charts {
+        chart.strip_notes();
+    }
+}
+
 /// Helper to load a song from cache OR parse it if needed.
 /// Returns (`SongData`, `is_cache_hit`).
 fn process_song(
@@ -956,12 +966,13 @@ pub fn reload_song_in_cache(simfile_path: &Path) -> Result<Arc<SongData>, String
     let config = crate::config::get();
     let global_offset_seconds = config.global_offset_seconds;
     let cachesongs = config.cachesongs;
-    let (song_data, _) = process_song(
+    let (mut song_data, _) = process_song(
         simfile_path.to_path_buf(),
         false,
         cachesongs,
         global_offset_seconds,
     )?;
+    strip_song_note_data(&mut song_data);
     let updated = Arc::new(song_data);
 
     let mut song_cache = get_song_cache();
@@ -1353,12 +1364,13 @@ where
                         cachesongs,
                         global_offset_seconds,
                     ) {
-                        Ok((song_data, is_hit)) => {
+                        Ok((mut song_data, is_hit)) => {
                             if is_hit {
                                 songs_cache_hits += 1;
                             } else {
                                 songs_parsed += 1;
                             }
+                            strip_song_note_data(&mut song_data);
                             loaded_packs[pack_idx].songs.push(Arc::new(song_data));
                         }
                         Err(e) => {
@@ -1387,7 +1399,10 @@ where
                             cachesongs,
                             global_offset_seconds,
                         )
-                        .map(|(d, h)| (Arc::new(d), h))
+                        .map(|(mut d, h)| {
+                            strip_song_note_data(&mut d);
+                            (Arc::new(d), h)
+                        })
                     }))
                     .unwrap_or_else(|_| Err("Song parse panicked".to_string()));
                     let _ = tx.send((pack_idx, simfile_path_owned, out));
@@ -1400,12 +1415,13 @@ where
                     cachesongs,
                     global_offset_seconds,
                 ) {
-                    Ok((song_data, is_hit)) => {
+                    Ok((mut song_data, is_hit)) => {
                         if is_hit {
                             songs_cache_hits += 1;
                         } else {
                             songs_parsed += 1;
                         }
+                        strip_song_note_data(&mut song_data);
                         loaded_packs[pack_idx].songs.push(Arc::new(song_data));
                     }
                     Err(e) => {
@@ -2308,6 +2324,7 @@ fn parse_and_process_song_file(
             music_length_seconds,
             total_length_seconds: summary.total_length,
             charts,
+            cached_precise_last_second: 0.0,
         },
         content_hash,
     ))

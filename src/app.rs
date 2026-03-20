@@ -1633,8 +1633,10 @@ fn build_course_run_from_selection(
             ) else {
                 continue;
             };
+            let mut chart_hydrated = chart.clone();
+            chart_hydrated.hydrate_notes();
             let add = crate::game::gameplay::course_display_totals_for_chart(
-                chart,
+                &chart_hydrated,
                 global_offset_seconds,
             );
             let total = &mut course_display_totals[player_idx];
@@ -6164,49 +6166,36 @@ impl App {
                 self.state.shell.ctrl_held = raw_key.pressed;
             }
             KeyCode::Tab => {
-                self.state.shell.tab_held = key_event.pressed;
-                TAB_SPEED_MULTIPLIER.store(if key_event.pressed { 4 } else { 1 }, Ordering::Relaxed);
+                self.state.shell.tab_held = raw_key.pressed;
+                TAB_SPEED_MULTIPLIER.store(if raw_key.pressed { 4 } else { 1 }, Ordering::Relaxed);
             }
             _ => {}
         }
 
-        if key_event.pressed && key_event.code == KeyCode::F3 {
+        if raw_key.pressed && raw_key.code == KeyCode::F3 {
             let mode = self.state.shell.cycle_overlay_mode();
             debug!("Overlay {}", self.state.shell.overlay_mode.label());
             config::update_show_stats_mode(mode);
             options::sync_show_stats_mode(&mut self.state.screens.options_state, mode);
-            return Ok(());
+            return true;
         }
 
-        if self.state.gameplay_offset_save_prompt.is_none() {
-            if key_event.pressed
-                && self.state.shell.ctrl_held
-                && key_event.code == KeyCode::KeyR
-                && config::get().keyboard_features
-                && self.state.session.course_run.is_none()
-            {
-                self.try_gameplay_restart(event_loop, "Ctrl+R");
-                return Ok(());
-            }
-            if let Some(gs) = &mut self.state.screens.gameplay_state {
-                let action = crate::game::gameplay::handle_raw_key_event(
-                    gs,
-                    &key_event,
-                    self.state.shell.shift_held,
-                );
-                if !matches!(action, ScreenAction::None) {
-                    self.handle_action(action, event_loop)?;
-                    return Ok(());
+        let mut input_err: Option<Box<dyn Error>> = None;
+        input::map_raw_key_event_with(&raw_key, |ev| {
+            if !ev.action.is_gameplay_arrow() {
+                if input_err.is_none() {
+                    if let Err(e) = self.route_input_event(event_loop, ev) {
+                        input_err = Some(e);
+                    }
                 }
             }
-        }
-
-        input::map_raw_key_event_with(&key_event, |ev| {
-            if !ev.action.is_gameplay_arrow() {
-                self.queue_input_event(ev);
-            }
         });
-        Ok(())
+        if let Some(e) = input_err {
+            log::error!("Failed to handle input: {e}");
+            event_loop.exit();
+            return true;
+        }
+        false
     }
 
     #[inline(always)]
@@ -6224,165 +6213,6 @@ impl App {
             timestamp,
             host_nanos: 0,
         })
-    }
-
-    #[inline(always)]
-    fn handle_key_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        key_event: winit::event::KeyEvent,
-    ) {
-        let event_timestamp = Instant::now();
-        let raw_key = Self::raw_key_from_winit(&key_event, event_timestamp);
-        let text = key_event.text.as_deref();
-        if let Some(raw_key) = raw_key {
-            use winit::keyboard::KeyCode;
-            match raw_key.code {
-                KeyCode::ShiftLeft | KeyCode::ShiftRight => {
-                    self.state.shell.shift_held = raw_key.pressed;
-                }
-                KeyCode::ControlLeft | KeyCode::ControlRight => {
-                    self.state.shell.ctrl_held = raw_key.pressed;
-                }
-                KeyCode::Tab => {
-                    self.state.shell.tab_held = raw_key.pressed;
-                    TAB_SPEED_MULTIPLIER.store(if raw_key.pressed { 4 } else { 1 }, Ordering::Relaxed);
-                }
-                _ => {}
-            }
-        }
-
-        if self.state.screens.current_screen == CurrentScreen::Sandbox {
-            let action = crate::screens::sandbox::handle_raw_key_event(
-                &mut self.state.screens.sandbox_state,
-                &raw_key,
-            );
-            if !matches!(action, ScreenAction::None) {
-                if let Err(e) = self.handle_action(action, event_loop) {
-                    log::error!("Failed to handle Sandbox raw key action: {e}");
-                }
-                return true;
-            }
-        } else if self.state.screens.current_screen == CurrentScreen::Menu {
-            let action = crate::screens::menu::handle_raw_key_event(
-                &mut self.state.screens.menu_state,
-                &raw_key,
-            );
-            if !matches!(action, ScreenAction::None) {
-                if let Err(e) = self.handle_action(action, event_loop) {
-                    log::error!("Failed to handle Menu raw key action: {e}");
-                }
-                return true;
-            }
-        } else if self.state.screens.current_screen == CurrentScreen::Mappings {
-            let action = crate::screens::mappings::handle_raw_key_event(
-                &mut self.state.screens.mappings_state,
-                &raw_key,
-            );
-            if !matches!(action, ScreenAction::None)
-                && let Err(e) = self.handle_action(action, event_loop)
-            {
-                log::error!("Failed to handle Mappings raw key action: {e}");
-            }
-            // On the Mappings screen, arrows/Enter/Escape are handled entirely
-            // via raw keycodes; do not route through the virtual keymap.
-            return true;
-        } else if self.state.screens.current_screen == CurrentScreen::ManageLocalProfiles {
-            let action = crate::screens::manage_local_profiles::handle_raw_key_event(
-                &mut self.state.screens.manage_local_profiles_state,
-                Some(&raw_key),
-                None,
-            );
-            if !matches!(action, ScreenAction::None) {
-                if let Err(e) = self.handle_action(action, event_loop) {
-                    log::error!("Failed to handle ManageLocalProfiles raw key action: {e}");
-                }
-                return true;
-            }
-        } else if self.state.screens.current_screen == CurrentScreen::Input {
-            let action = crate::screens::input::handle_raw_key_event(
-                &mut self.state.screens.input_state,
-                &raw_key,
-            );
-            if !matches!(action, ScreenAction::None) {
-                if let Err(e) = self.handle_action(action, event_loop) {
-                    log::error!("Failed to handle Input raw key action: {e}");
-                }
-                return true;
-            }
-        } else if self.state.screens.current_screen == CurrentScreen::SelectMusic {
-            // Route screen-specific raw key handling (e.g., F7 fetch) to the screen
-            let action = crate::screens::select_music::handle_raw_key_event(
-                &mut self.state.screens.select_music_state,
-                Some(&raw_key),
-                None,
-            );
-            if !matches!(action, ScreenAction::None) {
-                if let Err(e) = self.handle_action(action, event_loop) {
-                    log::error!("Failed to handle SelectMusic raw key action: {e}");
-                }
-                return true;
-            }
-        } else if self.state.screens.current_screen == CurrentScreen::Evaluation {
-            if raw_key.pressed && !self.state.session.course_eval_pages.is_empty() {
-                match raw_key.code {
-                    KeyCode::KeyN => {
-                        self.step_course_eval_page(1);
-                        return true;
-                    }
-                    KeyCode::KeyP => {
-                        self.step_course_eval_page(-1);
-                        return true;
-                    }
-                    _ => {}
-                }
-            }
-        }
-        let is_transitioning = !matches!(self.state.shell.transition, TransitionState::Idle);
-
-        if raw_key.pressed && raw_key.code == KeyCode::F3 {
-            let mode = self.state.shell.cycle_overlay_mode();
-            debug!("Overlay {}", self.state.shell.overlay_mode.label());
-            config::update_show_stats_mode(mode);
-            options::sync_show_stats_mode(&mut self.state.screens.options_state, mode);
-        }
-        if raw_key.pressed
-            && !raw_key.repeat
-            && self.state.shell.ctrl_held
-            && self.state.shell.shift_held
-            && raw_key.code == KeyCode::F10
-        {
-            self.capture_compose_case_now();
-            return true;
-        }
-        // Screen-specific Escape handling resides in per-screen raw handlers now
-
-        if is_transitioning {
-            input::clear_debounce_state();
-            self.state.pending_input_events.clear();
-            self.clear_gameplay_input_events();
-            return true;
-        }
-
-        let gameplay_screen = self.state.screens.current_screen == CurrentScreen::Gameplay;
-        if gameplay_screen {
-            return false;
-        }
-
-        let mut input_err: Option<Box<dyn Error>> = None;
-        input::map_raw_key_event_with(&raw_key, |ev| {
-            if input_err.is_none()
-                && let Err(e) = self.route_input_event(event_loop, ev)
-            {
-                input_err = Some(e);
-            }
-        });
-        if let Some(e) = input_err {
-            log::error!("Failed to handle input: {e}");
-            event_loop.exit();
-            return true;
-        }
-        false
     }
 
     /* -------------------- pad event routing -------------------- */
@@ -6971,15 +6801,17 @@ impl App {
                     chart_ref
                 };
 
+                let hydrate = |chart_ref: &crate::game::chart::ChartData| {
+                    let mut c = chart_ref.clone();
+                    c.hydrate_notes();
+                    Arc::new(c)
+                };
                 let (charts, last_played_chart_ref, last_played_idx) = match play_style {
                     profile::PlayStyle::Versus => {
                         let chart_ref_p1 = resolve_chart(0);
                         let chart_ref_p2 = resolve_chart(1);
                         (
-                            [
-                                Arc::new(chart_ref_p1.clone()),
-                                Arc::new(chart_ref_p2.clone()),
-                            ],
+                            [hydrate(chart_ref_p1), hydrate(chart_ref_p2)],
                             chart_ref_p1,
                             0usize,
                         )
@@ -6990,7 +6822,7 @@ impl App {
                             profile::PlayerSide::P2 => 1,
                         };
                         let chart_ref = resolve_chart(idx);
-                        let chart = Arc::new(chart_ref.clone());
+                        let chart = hydrate(chart_ref);
                         ([chart.clone(), chart], chart_ref, idx)
                     }
                 };

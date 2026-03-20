@@ -1,7 +1,8 @@
-use crate::game::parsing::notes::ParsedNote;
+use crate::game::parsing::notes::{ParsedNote, parse_chart_notes};
 use crate::game::timing::{TimingData, TimingSegments};
 use rssp::TechCounts;
 use rssp::stats::ArrowStats;
+use rssp::timing::compute_row_to_beat;
 
 #[derive(Clone, Debug, Default)]
 pub struct StaminaCounts {
@@ -59,4 +60,27 @@ pub struct ChartData {
     pub chart_speeds: Option<String>,
     pub chart_scrolls: Option<String>,
     pub chart_fakes: Option<String>,
+}
+
+fn chart_type_lanes(chart_type: &str) -> usize {
+    let normalized = chart_type.trim().to_ascii_lowercase().replace('_', "-");
+    if normalized == "dance-double" { 8 } else { 4 }
+}
+
+impl ChartData {
+    /// Drops the heavy per-note vectors to reclaim memory.
+    /// They can be regenerated from the raw `notes` bytes via `hydrate_notes`.
+    pub fn strip_notes(&mut self) {
+        self.parsed_notes = Vec::new();
+        self.row_to_beat = Vec::new();
+    }
+
+    /// Regenerates `parsed_notes` and `row_to_beat` from the raw `notes` bytes.
+    pub fn hydrate_notes(&mut self) {
+        if self.parsed_notes.is_empty() && !self.notes.is_empty() {
+            let lanes = chart_type_lanes(&self.chart_type);
+            self.parsed_notes = parse_chart_notes(&self.notes, lanes);
+            self.row_to_beat = compute_row_to_beat(&self.notes);
+        }
+    }
 }
