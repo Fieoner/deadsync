@@ -760,6 +760,7 @@ fn make_course_song(meta: &CourseMeta) -> SongData {
         total_length_seconds: meta.total_length_seconds.max(0),
         precise_last_second_seconds: meta.total_length_seconds.max(0) as f32,
         charts: Vec::new(),
+        cached_precise_last_second: 0.0,
     }
 }
 
@@ -1311,9 +1312,10 @@ fn handle_wheel_dir(state: &mut State, dir: PadDir, pressed: bool, ts: Instant) 
         }
         (PadDir::Left, false) => {
             if state.nav_key_held_direction == Some(NavDirection::Left) {
+                let sm = crate::app::speed_multiplier();
                 let moving_started = state
                     .nav_key_held_since
-                    .is_some_and(|t| ts.duration_since(t) >= NAV_INITIAL_HOLD_DELAY);
+                    .is_some_and(|t| ts.duration_since(t) >= NAV_INITIAL_HOLD_DELAY / sm);
                 if moving_started
                     && state.wheel_offset_from_selection.abs() < MUSIC_WHEEL_STOP_SPINDOWN_THRESHOLD
                 {
@@ -1325,9 +1327,10 @@ fn handle_wheel_dir(state: &mut State, dir: PadDir, pressed: bool, ts: Instant) 
         }
         (PadDir::Right, false) => {
             if state.nav_key_held_direction == Some(NavDirection::Right) {
+                let sm = crate::app::speed_multiplier();
                 let moving_started = state
                     .nav_key_held_since
-                    .is_some_and(|t| ts.duration_since(t) >= NAV_INITIAL_HOLD_DELAY);
+                    .is_some_and(|t| ts.duration_since(t) >= NAV_INITIAL_HOLD_DELAY / sm);
                 if moving_started
                     && state.wheel_offset_from_selection.abs() < MUSIC_WHEEL_STOP_SPINDOWN_THRESHOLD
                 {
@@ -1777,9 +1780,10 @@ pub fn update(state: &mut State, dt: f32) -> ScreenAction {
     state.time_since_selection_change += dt;
 
     let now = Instant::now();
+    let sm = crate::app::speed_multiplier();
     let moving = state
         .nav_key_held_since
-        .is_some_and(|t| now.duration_since(t) >= NAV_INITIAL_HOLD_DELAY);
+        .is_some_and(|t| now.duration_since(t) >= NAV_INITIAL_HOLD_DELAY / sm);
     if moving {
         match state.nav_key_held_direction.clone() {
             Some(dir) => music_wheel_update_hold_scroll(state, dt, dir),

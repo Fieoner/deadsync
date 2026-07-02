@@ -6061,8 +6061,9 @@ fn update_overlay_nav_hold(state: &mut State) {
     }
 
     let now = Instant::now();
-    if now.duration_since(held_since) < OVERLAY_NAV_INITIAL_HOLD_DELAY
-        || now.duration_since(last_at) < OVERLAY_NAV_REPEAT_SCROLL_INTERVAL
+    let sm = crate::app::speed_multiplier();
+    if now.duration_since(held_since) < OVERLAY_NAV_INITIAL_HOLD_DELAY / sm
+        || now.duration_since(last_at) < OVERLAY_NAV_REPEAT_SCROLL_INTERVAL / sm
     {
         return;
     }
@@ -9101,7 +9102,16 @@ pub fn handle_pad_dir(
                 state.menu_chord_mask &= !MENU_CHORD_LEFT;
                 state.menu_chord_left_pressed_at = None;
                 if state.nav_key_held_direction == Some(NavDirection::Left) {
+<<<<<<< HEAD
                     if nav_hold_started(state)
+=======
+                    let now = timestamp;
+                    let sm = crate::app::speed_multiplier();
+                    let moving_started = state
+                        .nav_key_held_since
+                        .is_some_and(|t| now.duration_since(t) >= NAV_INITIAL_HOLD_DELAY / sm);
+                    if moving_started
+>>>>>>> origin/main
                         && state.wheel_offset_from_selection.abs()
                             < MUSIC_WHEEL_STOP_SPINDOWN_THRESHOLD
                     {
@@ -9117,7 +9127,16 @@ pub fn handle_pad_dir(
                 state.menu_chord_mask &= !MENU_CHORD_RIGHT;
                 state.menu_chord_right_pressed_at = None;
                 if state.nav_key_held_direction == Some(NavDirection::Right) {
+<<<<<<< HEAD
                     if nav_hold_started(state)
+=======
+                    let now = timestamp;
+                    let sm = crate::app::speed_multiplier();
+                    let moving_started = state
+                        .nav_key_held_since
+                        .is_some_and(|t| now.duration_since(t) >= NAV_INITIAL_HOLD_DELAY / sm);
+                    if moving_started
+>>>>>>> origin/main
                         && state.wheel_offset_from_selection.abs()
                             < MUSIC_WHEEL_STOP_SPINDOWN_THRESHOLD
                     {
@@ -10102,7 +10121,15 @@ pub fn update(state: &mut State, dt: f32) -> ScreenAction {
         update_overlay_nav_hold(state);
     }
 
+<<<<<<< HEAD
     let wheel_moving = advance_nav_hold(state, dt);
+=======
+    let now = Instant::now();
+    let sm = crate::app::speed_multiplier();
+    let wheel_moving = state
+        .nav_key_held_since
+        .is_some_and(|t| now.duration_since(t) >= NAV_INITIAL_HOLD_DELAY / sm);
+>>>>>>> origin/main
     if wheel_moving {
         match state.nav_key_held_direction {
             Some(dir) => music_wheel_update_hold_scroll(state, dt, dir),

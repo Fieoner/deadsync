@@ -346,6 +346,7 @@ fn bench_song() -> SongData {
         total_length_seconds: 128,
         precise_last_second_seconds: 128.0,
         charts: vec![chart],
+        cached_precise_last_second: 0.0,
     }
 }
 
