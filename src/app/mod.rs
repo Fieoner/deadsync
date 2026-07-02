@@ -1,6 +1,7 @@
 use deadsync_profile as profile_data;
 use deadsync_profile::pad_config as pad_profile_data;
 use deadsync_score as score_data;
+use std::sync::atomic::{AtomicU32, Ordering};
 mod commands;
 mod dynamic_media;
 mod graphics;
@@ -101,6 +102,15 @@ pub enum UserEvent {
     Pad(PadEvent),
     Key(RawKeyboardEvent),
     GamepadSystem(GpSystemEvent),
+}
+
+/* -------------------- tab speedup (SM-style fast-forward) -------------------- */
+static TAB_SPEED_MULTIPLIER: AtomicU32 = AtomicU32::new(1);
+
+/// Returns the current speed multiplier (4 when fast-forward is held, 1 otherwise).
+/// Used by screens to scale hold-repeat intervals.
+pub fn speed_multiplier() -> u32 {
+    TAB_SPEED_MULTIPLIER.load(Ordering::Relaxed)
 }
 
 /// Imperative effects to be executed by the shell.
@@ -8653,6 +8663,7 @@ impl App {
             })
         }) {
             self.state.shell.fast_forward_held = raw_key.pressed;
+            TAB_SPEED_MULTIPLIER.store(if raw_key.pressed { 4 } else { 1 }, Ordering::Relaxed);
         }
         if logical_input::with_keymap(|km| {
             km.raw_key_event_has_action(&raw_key, |action| {
