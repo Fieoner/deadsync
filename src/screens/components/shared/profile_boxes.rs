@@ -1,21 +1,26 @@
 use crate::act;
-use crate::assets::AssetManager;
-use crate::core::audio;
-use crate::core::gfx::BlendMode;
-use crate::core::input::{InputEvent, VirtualAction};
-use crate::core::space::{screen_center_x, screen_center_y, screen_height, screen_width};
-use crate::game::parsing::noteskin::{self, NUM_QUANTIZATIONS, Noteskin, Quantization};
-use crate::game::profile::{self, ActiveProfile};
+use crate::assets::i18n::{tr, tr_fmt};
+use crate::assets::{self, AssetManager, visual_styles};
+use crate::game::parsing::noteskin::{self, Noteskin};
+use crate::game::profile;
 use crate::game::scores;
-use crate::game::scroll::ScrollSpeedSetting;
 use crate::screens::components::shared::noteskin_model::noteskin_model_actor;
 use crate::screens::components::shared::screen_bar::{
     ScreenBarParams, ScreenBarPosition, ScreenBarTitlePlacement,
 };
-use crate::screens::components::shared::{heart_bg, screen_bar};
+use crate::screens::components::shared::{screen_bar, visual_style_bg};
+use crate::screens::input as screen_input;
 use crate::screens::{Screen, ScreenAction};
-use crate::ui::actors::{self, Actor};
-use crate::ui::color;
+
+use deadlib_present::actors::{self, Actor};
+use deadlib_present::color;
+use deadlib_present::space::{screen_center_x, screen_center_y};
+use deadlib_render::BlendMode;
+use deadsync_audio_stream as audio;
+use deadsync_input::{InputEvent, VirtualAction};
+use deadsync_noteskin::{NUM_QUANTIZATIONS, Quantization, Style};
+use deadsync_profile as profile_data;
+use deadsync_rules::scroll::{GUEST_SCROLL_SPEED, ScrollSpeedSetting};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -41,6 +46,11 @@ pub const fn exit_anim_duration() -> f32 {
 /* ------------------------------ layout ------------------------------- */
 const ROW_H: f32 = 35.0;
 const ROWS_VISIBLE: i32 = 9;
+// Name scroller tween: offset (in rows) decays toward 0 with this exponential time
+// constant so a navigation slides quickly but smoothly instead of snapping.
+const SCROLL_TWEEN_TAU: f32 = 0.045;
+// Snap the scroll offset to rest once it is within this many rows of settled.
+const SCROLL_SNAP_EPS: f32 = 0.002;
 const FRAME_BASE_W: f32 = 200.0;
 const FRAME_W_SCROLLER: f32 = FRAME_BASE_W * 1.1;
 const FRAME_W_JOIN: f32 = FRAME_BASE_W * 0.9;
@@ -76,8 +86,6 @@ const TOTAL_SONGS_ZOOM: f32 = 0.65; // SL: TotalSongs zoom(0.65)
 const MODS_ZOOM: f32 = 0.625; // SL: RecentMods zoom(0.625)
 const MODS_Y_OFF: f32 = 47.0; // SL: RecentMods xy(...,47)
 
-const JOIN_TEXT: &str = "Press &START; to join!";
-const WAITING_TEXT: &str = "Waiting ...";
 const SELECTED_NAME_Y_OFF: f32 = 160.0; // SL: SelectedProfileText y(160)
 const SELECTED_NAME_ZOOM: f32 = 1.35; // SL: SelectedProfileText zoom(1.35)
 
@@ -86,15 +94,15 @@ const SHAKE_DUR: f32 = SHAKE_STEP_DUR * 3.0;
 
 #[derive(Clone)]
 struct Choice {
-    kind: ActiveProfile,
+    kind: profile_data::ActiveProfile,
     display_name: String,
     speed_mod: String,
     avatar_key: Option<String>,
     total_songs: String,
-    scroll_option: profile::ScrollOption,
-    mini_indicator: profile::MiniIndicator,
-    noteskin: profile::NoteSkin,
-    judgment: profile::JudgmentGraphic,
+    scroll_option: profile_data::ScrollOption,
+    mini_indicator: profile_data::MiniIndicator,
+    noteskin: profile_data::NoteSkin,
+    judgment: profile_data::JudgmentGraphic,
 }
 
 pub struct State {
@@ -107,7 +115,7 @@ pub struct State {
     p2_selected_index: usize,
     exit_anim: bool,
     choices: Vec<Choice>,
-    bg: heart_bg::State,
+    bg: visual_style_bg::State,
     noteskin_cache: NoteskinCache,
     p1_preview_noteskin: Option<Arc<Noteskin>>,
     p2_preview_noteskin: Option<Arc<Noteskin>>,
@@ -117,29 +125,38 @@ pub struct State {
     p2_join_pulse_t: f32,
     p1_shake_t: f32,
     p2_shake_t: f32,
+    // Animated vertical offset (in rows) of the name scroller, lagging behind the
+    // logical selected index and decaying to 0 to produce the scroll tween.
+    p1_scroll_anim: f32,
+    p2_scroll_anim: f32,
+    menu_lr_chord: screen_input::MenuLrChordTracker,
+    menu_lr_undo: [i8; 2],
 }
 
 struct NoteskinCache {
     cache: HashMap<String, Arc<Noteskin>>,
-    style: noteskin::Style,
+    style: Style,
 }
 
 impl NoteskinCache {
     fn new(_choices: &[Choice]) -> Self {
-        let style = noteskin::Style {
+        let style = Style {
             num_cols: 4,
             num_players: 1,
         };
         let mut cache = HashMap::with_capacity(1);
         if let Ok(default_skin) =
-            noteskin::load_itg_skin_cached(&style, profile::NoteSkin::DEFAULT_NAME)
+            noteskin::load_itg_skin_cached(&style, profile_data::NoteSkin::DEFAULT_NAME)
         {
-            cache.insert(profile::NoteSkin::DEFAULT_NAME.to_string(), default_skin);
+            cache.insert(
+                profile_data::NoteSkin::DEFAULT_NAME.to_string(),
+                default_skin,
+            );
         }
         Self { cache, style }
     }
 
-    fn get(&mut self, kind: &profile::NoteSkin) -> Option<Arc<Noteskin>> {
+    fn get(&mut self, kind: &profile_data::NoteSkin) -> Option<Arc<Noteskin>> {
         let requested = kind.as_str();
         if let Some(cached) = self.cache.get(requested) {
             return Some(cached.clone());
@@ -150,15 +167,15 @@ impl NoteskinCache {
             return Some(loaded);
         }
 
-        if let Some(default_cached) = self.cache.get(profile::NoteSkin::DEFAULT_NAME) {
+        if let Some(default_cached) = self.cache.get(profile_data::NoteSkin::DEFAULT_NAME) {
             return Some(default_cached.clone());
         }
 
         if let Ok(default_loaded) =
-            noteskin::load_itg_skin_cached(&self.style, profile::NoteSkin::DEFAULT_NAME)
+            noteskin::load_itg_skin_cached(&self.style, profile_data::NoteSkin::DEFAULT_NAME)
         {
             self.cache.insert(
-                profile::NoteSkin::DEFAULT_NAME.to_string(),
+                profile_data::NoteSkin::DEFAULT_NAME.to_string(),
                 default_loaded.clone(),
             );
             return Some(default_loaded);
@@ -173,21 +190,30 @@ fn preview_noteskin_for_choice(
     choices: &[Choice],
     selected_index: usize,
 ) -> Option<Arc<Noteskin>> {
-    let Some(choice) = choices.get(selected_index) else {
-        return None;
-    };
+    let choice = choices.get(selected_index)?;
     match choice.kind {
-        ActiveProfile::Guest => None,
-        ActiveProfile::Local { .. } => cache.get(&choice.noteskin),
+        profile_data::ActiveProfile::Guest => None,
+        profile_data::ActiveProfile::Local { .. } => cache.get(&choice.noteskin),
     }
 }
 
 #[inline(always)]
 fn format_total_songs_played(count: u32) -> String {
+    let count_str = count.to_string();
     if count == 1 {
-        format!("{count} Song Played")
+        tr_fmt(
+            "SelectProfile",
+            "SongPlayedSingular",
+            &[("count", &count_str)],
+        )
+        .to_string()
     } else {
-        format!("{count} Songs Played")
+        tr_fmt(
+            "SelectProfile",
+            "SongPlayedPlural",
+            &[("count", &count_str)],
+        )
+        .to_string()
     }
 }
 
@@ -206,8 +232,9 @@ fn parse_ini_bool(raw: &str) -> Option<bool> {
 #[inline(always)]
 fn format_recent_mods(
     speed_mod: &str,
-    scroll: profile::ScrollOption,
-    mini_indicator: profile::MiniIndicator,
+    scroll: profile_data::ScrollOption,
+    mini_indicator: profile_data::MiniIndicator,
+    noteskin: &profile_data::NoteSkin,
 ) -> String {
     let mut out = String::new();
     let mut first = true;
@@ -224,33 +251,44 @@ fn format_recent_mods(
     };
 
     push(speed_mod.trim());
-    if scroll.contains(profile::ScrollOption::Reverse) {
-        push("Reverse");
+    if scroll.contains(profile_data::ScrollOption::Reverse) {
+        let s = tr("SelectProfile", "Reverse");
+        push(&s);
     }
-    if scroll.contains(profile::ScrollOption::Split) {
-        push("Split");
+    if scroll.contains(profile_data::ScrollOption::Split) {
+        let s = tr("SelectProfile", "Split");
+        push(&s);
     }
-    if scroll.contains(profile::ScrollOption::Alternate) {
-        push("Alternate");
+    if scroll.contains(profile_data::ScrollOption::Alternate) {
+        let s = tr("SelectProfile", "Alternate");
+        push(&s);
     }
-    if scroll.contains(profile::ScrollOption::Cross) {
-        push("Cross");
+    if scroll.contains(profile_data::ScrollOption::Cross) {
+        let s = tr("SelectProfile", "Cross");
+        push(&s);
     }
-    if scroll.contains(profile::ScrollOption::Centered) {
-        push("Centered");
+    if scroll.contains(profile_data::ScrollOption::Centered) {
+        let s = tr("SelectProfile", "Centered");
+        push(&s);
     }
-    push("Overhead");
+    let overhead = tr("SelectProfile", "Overhead");
+    push(&overhead);
+    push(noteskin.as_str());
     let mini_indicator_label = match mini_indicator {
-        profile::MiniIndicator::None => None,
-        profile::MiniIndicator::SubtractiveScoring => Some("Subtractive Scoring"),
-        profile::MiniIndicator::PredictiveScoring => Some("Predictive Scoring"),
-        profile::MiniIndicator::PaceScoring => Some("Pace Scoring"),
-        profile::MiniIndicator::RivalScoring => Some("Rival Scoring"),
-        profile::MiniIndicator::Pacemaker => Some("Pacemaker"),
-        profile::MiniIndicator::StreamProg => Some("Stream Progress"),
+        profile_data::MiniIndicator::None => None,
+        profile_data::MiniIndicator::SubtractiveScoring => {
+            Some(tr("SelectProfile", "SubtractiveScoring"))
+        }
+        profile_data::MiniIndicator::PredictiveScoring => {
+            Some(tr("SelectProfile", "PredictiveScoring"))
+        }
+        profile_data::MiniIndicator::PaceScoring => Some(tr("SelectProfile", "PaceScoring")),
+        profile_data::MiniIndicator::RivalScoring => Some(tr("SelectProfile", "RivalScoring")),
+        profile_data::MiniIndicator::Pacemaker => Some(tr("SelectProfile", "Pacemaker")),
+        profile_data::MiniIndicator::StreamProg => Some(tr("SelectProfile", "StreamProgress")),
     };
     if let Some(label) = mini_indicator_label {
-        push(label);
+        push(&label);
     }
     out
 }
@@ -258,34 +296,36 @@ fn format_recent_mods(
 fn build_choices() -> Vec<Choice> {
     let mut out = Vec::new();
 
-    let default_profile = crate::game::profile::Profile::default();
+    let default_profile = profile_data::Profile::default();
     let default_speed_mod = format!("{}", default_profile.scroll_speed);
-    let guest_speed_mod = format!("{}", crate::game::profile::GUEST_SCROLL_SPEED);
+    let guest_speed_mod = format!("{GUEST_SCROLL_SPEED}");
     let default_scroll_option = default_profile.scroll_option;
+    let player_options_section =
+        profile_data::player_options_section(profile::get_session_play_style());
     out.push(Choice {
-        kind: ActiveProfile::Guest,
-        display_name: "[ GUEST ]".to_string(),
+        kind: profile_data::ActiveProfile::Guest,
+        display_name: tr("SelectProfile", "GuestLabel").to_string(),
         speed_mod: guest_speed_mod,
         avatar_key: None,
         total_songs: String::new(),
         scroll_option: default_scroll_option,
-        mini_indicator: profile::MiniIndicator::None,
-        noteskin: profile::NoteSkin::default(),
-        judgment: profile::JudgmentGraphic::default(),
+        mini_indicator: profile_data::MiniIndicator::None,
+        noteskin: profile_data::NoteSkin::default(),
+        judgment: profile_data::JudgmentGraphic::default(),
     });
     for p in profile::scan_local_profiles() {
         let total_songs = format_total_songs_played(scores::total_songs_played_for_profile(&p.id));
         let mut speed_mod = default_speed_mod.clone();
         let mut scroll_option = default_scroll_option;
-        let mut mini_indicator = profile::MiniIndicator::None;
-        let mut noteskin = profile::NoteSkin::default();
-        let mut judgment = profile::JudgmentGraphic::default();
-        let ini_path = std::path::Path::new("save/profiles")
-            .join(&p.id)
-            .join("profile.ini");
+        let mut mini_indicator = profile_data::MiniIndicator::None;
+        let mut noteskin = profile_data::NoteSkin::default();
+        let mut judgment = profile_data::JudgmentGraphic::default();
+        let ini_path = profile::local_profile_dir_for_id(&p.id).join("profile.ini");
         let mut ini = crate::config::SimpleIni::new();
         if ini.load(&ini_path).is_ok() {
-            if let Some(raw) = ini.get("PlayerOptions", "ScrollSpeed") {
+            let get_player_option = |key: &str| ini.get(player_options_section, key);
+
+            if let Some(raw) = get_player_option("ScrollSpeed") {
                 let trimmed = raw.trim();
                 speed_mod = if let Ok(setting) = ScrollSpeedSetting::from_str(trimmed) {
                     format!("{setting}")
@@ -294,58 +334,53 @@ fn build_choices() -> Vec<Choice> {
                 };
             }
 
-            scroll_option = ini
-                .get("PlayerOptions", "Scroll")
-                .and_then(|s| profile::ScrollOption::from_str(&s).ok())
+            scroll_option = get_player_option("Scroll")
+                .and_then(|s| profile_data::ScrollOption::from_str(&s).ok())
                 .unwrap_or_else(|| {
-                    let reverse_enabled = ini
-                        .get("PlayerOptions", "ReverseScroll")
+                    let reverse_enabled = get_player_option("ReverseScroll")
                         .and_then(|v| v.parse::<u8>().ok())
                         .is_some_and(|v| v != 0);
                     if reverse_enabled {
-                        profile::ScrollOption::Reverse
+                        profile_data::ScrollOption::Reverse
                     } else {
                         default_scroll_option
                     }
                 });
-            mini_indicator = ini
-                .get("PlayerOptions", "MiniIndicator")
-                .and_then(|v| profile::MiniIndicator::from_str(&v).ok())
+            mini_indicator = get_player_option("MiniIndicator")
+                .and_then(|v| profile_data::MiniIndicator::from_str(&v).ok())
                 .unwrap_or_else(|| {
-                    let subtractive = ini
-                        .get("PlayerOptions", "SubtractiveScoring")
+                    let subtractive = get_player_option("SubtractiveScoring")
                         .and_then(|v| parse_ini_bool(&v))
                         .unwrap_or(false);
-                    let pacemaker = ini
-                        .get("PlayerOptions", "Pacemaker")
+                    let pacemaker = get_player_option("Pacemaker")
                         .and_then(|v| parse_ini_bool(&v))
                         .unwrap_or(false);
                     if subtractive {
-                        profile::MiniIndicator::SubtractiveScoring
+                        profile_data::MiniIndicator::SubtractiveScoring
                     } else if pacemaker {
-                        profile::MiniIndicator::Pacemaker
+                        profile_data::MiniIndicator::Pacemaker
                     } else {
-                        profile::MiniIndicator::None
+                        profile_data::MiniIndicator::None
                     }
                 });
         }
         if let Ok(value) = ini
-            .get("PlayerOptions", "NoteSkin")
+            .get(player_options_section, "NoteSkin")
             .unwrap_or_default()
-            .parse::<profile::NoteSkin>()
+            .parse::<profile_data::NoteSkin>()
         {
             noteskin = value;
         }
         if let Ok(value) = ini
-            .get("PlayerOptions", "JudgmentGraphic")
+            .get(player_options_section, "JudgmentGraphic")
             .unwrap_or_default()
-            .parse::<profile::JudgmentGraphic>()
+            .parse::<profile_data::JudgmentGraphic>()
         {
             judgment = value;
         }
 
         out.push(Choice {
-            kind: ActiveProfile::Local { id: p.id },
+            kind: profile_data::ActiveProfile::Local { id: p.id },
             display_name: p.display_name,
             speed_mod,
             avatar_key: p
@@ -361,29 +396,28 @@ fn build_choices() -> Vec<Choice> {
     out
 }
 
-pub fn init() -> State {
+fn selected_index_for(choices: &[Choice], active: profile_data::ActiveProfile) -> usize {
+    match active {
+        profile_data::ActiveProfile::Guest => 0,
+        profile_data::ActiveProfile::Local { id } => choices
+            .iter()
+            .position(|c| match &c.kind {
+                profile_data::ActiveProfile::Local { id: cid } => cid == &id,
+                profile_data::ActiveProfile::Guest => false,
+            })
+            .unwrap_or(0),
+    }
+}
+
+fn init_with_profiles(
+    p1_profile: profile_data::ActiveProfile,
+    p2_profile: profile_data::ActiveProfile,
+) -> State {
     let choices = build_choices();
     let noteskin_cache = NoteskinCache::new(&choices);
     let active_color_index = crate::config::get().simply_love_color;
-
-    let selected_index_for = |active: ActiveProfile| -> usize {
-        match active {
-            ActiveProfile::Guest => 0,
-            ActiveProfile::Local { id } => choices
-                .iter()
-                .position(|c| match &c.kind {
-                    ActiveProfile::Local { id: cid } => cid == &id,
-                    ActiveProfile::Guest => false,
-                })
-                .unwrap_or(0),
-        }
-    };
-    let p1_selected_index = selected_index_for(profile::get_active_profile_for_side(
-        profile::PlayerSide::P1,
-    ));
-    let p2_selected_index = selected_index_for(profile::get_active_profile_for_side(
-        profile::PlayerSide::P2,
-    ));
+    let p1_selected_index = selected_index_for(&choices, p1_profile);
+    let p2_selected_index = selected_index_for(&choices, p2_profile);
 
     let mut state = State {
         active_color_index,
@@ -395,7 +429,7 @@ pub fn init() -> State {
         p2_selected_index,
         exit_anim: false,
         choices,
-        bg: heart_bg::State::new(),
+        bg: visual_style_bg::State::new(),
         noteskin_cache,
         p1_preview_noteskin: None,
         p2_preview_noteskin: None,
@@ -405,6 +439,10 @@ pub fn init() -> State {
         p2_join_pulse_t: JOIN_PULSE_DURATION,
         p1_shake_t: SHAKE_DUR,
         p2_shake_t: SHAKE_DUR,
+        p1_scroll_anim: 0.0,
+        p2_scroll_anim: 0.0,
+        menu_lr_chord: screen_input::MenuLrChordTracker::default(),
+        menu_lr_undo: [0; 2],
     };
     state.p1_preview_noteskin = preview_noteskin_for_choice(
         &mut state.noteskin_cache,
@@ -419,6 +457,40 @@ pub fn init() -> State {
     state
 }
 
+pub fn init() -> State {
+    init_with_profiles(
+        profile::get_default_profile_for_side(profile_data::PlayerSide::P1),
+        profile::get_default_profile_for_side(profile_data::PlayerSide::P2),
+    )
+}
+
+pub fn init_active() -> State {
+    init_with_profiles(
+        profile::get_active_profile_for_side(profile_data::PlayerSide::P1),
+        profile::get_active_profile_for_side(profile_data::PlayerSide::P2),
+    )
+}
+
+pub fn init_late_join(joining_side: profile_data::PlayerSide) -> State {
+    let p1_profile = match joining_side {
+        profile_data::PlayerSide::P1 => {
+            profile::get_default_profile_for_side(profile_data::PlayerSide::P1)
+        }
+        profile_data::PlayerSide::P2 => {
+            profile::get_active_profile_for_side(profile_data::PlayerSide::P1)
+        }
+    };
+    let p2_profile = match joining_side {
+        profile_data::PlayerSide::P1 => {
+            profile::get_active_profile_for_side(profile_data::PlayerSide::P2)
+        }
+        profile_data::PlayerSide::P2 => {
+            profile::get_default_profile_for_side(profile_data::PlayerSide::P2)
+        }
+    };
+    init_with_profiles(p1_profile, p2_profile)
+}
+
 pub fn set_joined(state: &mut State, p1_joined: bool, p2_joined: bool) {
     state.p1_joined = p1_joined;
     state.p2_joined = p2_joined;
@@ -426,6 +498,42 @@ pub fn set_joined(state: &mut State, p1_joined: bool, p2_joined: bool) {
     state.p2_ready = false;
     state.p1_join_pulse_t = JOIN_PULSE_DURATION;
     state.p2_join_pulse_t = JOIN_PULSE_DURATION;
+
+    state.p1_preview_noteskin = preview_noteskin_for_choice(
+        &mut state.noteskin_cache,
+        &state.choices,
+        state.p1_selected_index,
+    );
+    state.p2_preview_noteskin = preview_noteskin_for_choice(
+        &mut state.noteskin_cache,
+        &state.choices,
+        state.p2_selected_index,
+    );
+}
+
+/// Configure the overlay for a late-join scenario: the existing player is
+/// pre-readied with their current profile, and only `joining_side` needs to
+/// pick a profile. Used when a second player presses Start mid-set on a
+/// screen with an embedded profile-select overlay.
+pub fn enter_late_join(state: &mut State, joining_side: profile_data::PlayerSide) {
+    match joining_side {
+        profile_data::PlayerSide::P1 => {
+            state.p1_joined = true;
+            state.p1_ready = false;
+            state.p1_join_pulse_t = 0.0;
+            state.p2_joined = true;
+            state.p2_ready = true;
+            state.p2_join_pulse_t = JOIN_PULSE_DURATION;
+        }
+        profile_data::PlayerSide::P2 => {
+            state.p1_joined = true;
+            state.p1_ready = true;
+            state.p1_join_pulse_t = JOIN_PULSE_DURATION;
+            state.p2_joined = true;
+            state.p2_ready = false;
+            state.p2_join_pulse_t = 0.0;
+        }
+    }
 
     state.p1_preview_noteskin = preview_noteskin_for_choice(
         &mut state.noteskin_cache,
@@ -449,29 +557,25 @@ pub fn update(state: &mut State, dt: f32) {
     state.p2_join_pulse_t = (state.p2_join_pulse_t + dt).min(JOIN_PULSE_DURATION);
     state.p1_shake_t = (state.p1_shake_t + dt).min(SHAKE_DUR);
     state.p2_shake_t = (state.p2_shake_t + dt).min(SHAKE_DUR);
+
+    // Decay the name-scroller offset toward 0 (frame-rate independent).
+    let scroll_decay = (-dt / SCROLL_TWEEN_TAU).exp();
+    state.p1_scroll_anim *= scroll_decay;
+    state.p2_scroll_anim *= scroll_decay;
+    if state.p1_scroll_anim.abs() < SCROLL_SNAP_EPS {
+        state.p1_scroll_anim = 0.0;
+    }
+    if state.p2_scroll_anim.abs() < SCROLL_SNAP_EPS {
+        state.p2_scroll_anim = 0.0;
+    }
 }
 
 pub fn in_transition() -> (Vec<Actor>, f32) {
-    let actor = act!(quad:
-        align(0.0, 0.0): xy(0.0, 0.0):
-        zoomto(screen_width(), screen_height()):
-        diffuse(0.0, 0.0, 0.0, 1.0):
-        z(1100):
-        linear(TRANSITION_IN_DURATION): alpha(0.0):
-        linear(0.0): visible(false)
-    );
-    (vec![actor], TRANSITION_IN_DURATION)
+    super::transitions::fade_in_black(TRANSITION_IN_DURATION, 1100)
 }
 
 pub fn out_transition() -> (Vec<Actor>, f32) {
-    let actor = act!(quad:
-        align(0.0, 0.0): xy(0.0, 0.0):
-        zoomto(screen_width(), screen_height()):
-        diffuse(0.0, 0.0, 0.0, 0.0):
-        z(1200):
-        linear(TRANSITION_OUT_DURATION): alpha(1.0)
-    );
-    (vec![actor], TRANSITION_OUT_DURATION)
+    super::transitions::fade_out_black(TRANSITION_OUT_DURATION, 1200)
 }
 
 #[inline(always)]
@@ -480,24 +584,43 @@ const fn both_ready(state: &State) -> bool {
 }
 
 #[inline(always)]
-fn active_choices(state: &State) -> (ActiveProfile, ActiveProfile) {
+fn active_choices(state: &State) -> (profile_data::ActiveProfile, profile_data::ActiveProfile) {
     let p1 = if state.p1_joined {
         state
             .choices
             .get(state.p1_selected_index)
-            .map_or(ActiveProfile::Guest, |c| c.kind.clone())
+            .map_or(profile_data::ActiveProfile::Guest, |c| c.kind.clone())
     } else {
-        ActiveProfile::Guest
+        profile_data::ActiveProfile::Guest
     };
     let p2 = if state.p2_joined {
         state
             .choices
             .get(state.p2_selected_index)
-            .map_or(ActiveProfile::Guest, |c| c.kind.clone())
+            .map_or(profile_data::ActiveProfile::Guest, |c| c.kind.clone())
     } else {
-        ActiveProfile::Guest
+        profile_data::ActiveProfile::Guest
     };
     (p1, p2)
+}
+
+fn sync_play_style_for_joined(p1_joined: bool, p2_joined: bool) {
+    let style = profile_data::play_style_for_joined(
+        profile::get_session_play_style(),
+        p1_joined,
+        p2_joined,
+    );
+    profile::set_session_play_style(style);
+}
+
+fn commit_profile_box_session(state: &State) {
+    profile::set_session_player_side(if state.p1_joined {
+        profile_data::PlayerSide::P1
+    } else {
+        profile_data::PlayerSide::P2
+    });
+    profile::set_session_joined(state.p1_joined, state.p2_joined);
+    sync_play_style_for_joined(state.p1_joined, state.p2_joined);
 }
 
 fn trigger_invalid_choice(state: &mut State, is_p1: bool) {
@@ -513,9 +636,129 @@ fn trigger_invalid_choice(state: &mut State, is_p1: bool) {
     audio::play_sfx("assets/sounds/boom.ogg");
 }
 
+fn shift_choice(
+    state: &mut State,
+    side: profile_data::PlayerSide,
+    dir: i32,
+    play_sound: bool,
+) -> bool {
+    let (joined, ready, selected_index, preview_slot) = match side {
+        profile_data::PlayerSide::P1 => (
+            state.p1_joined,
+            state.p1_ready,
+            &mut state.p1_selected_index,
+            &mut state.p1_preview_noteskin,
+        ),
+        profile_data::PlayerSide::P2 => (
+            state.p2_joined,
+            state.p2_ready,
+            &mut state.p2_selected_index,
+            &mut state.p2_preview_noteskin,
+        ),
+    };
+    if !joined || ready {
+        return false;
+    }
+    let old_index = *selected_index;
+    if dir < 0 {
+        if *selected_index > 0 {
+            *selected_index -= 1;
+        }
+    } else if *selected_index + 1 < state.choices.len() {
+        *selected_index += 1;
+    }
+    if *selected_index == old_index {
+        return false;
+    }
+    let new_index = *selected_index;
+    *preview_slot =
+        preview_noteskin_for_choice(&mut state.noteskin_cache, &state.choices, new_index);
+    // Seed the scroller offset so the rows visually start at the old position and
+    // tween toward the new selection. Accumulates across rapid presses.
+    let delta = new_index as f32 - old_index as f32;
+    match side {
+        profile_data::PlayerSide::P1 => state.p1_scroll_anim += delta,
+        profile_data::PlayerSide::P2 => state.p2_scroll_anim += delta,
+    }
+    if play_sound {
+        audio::play_sfx("assets/sounds/expand.ogg");
+    }
+    true
+}
+
+fn handle_cancel(state: &mut State, side: profile_data::PlayerSide) -> ScreenAction {
+    match side {
+        profile_data::PlayerSide::P1 => {
+            if state.p1_joined && state.p1_ready {
+                state.p1_ready = false;
+                audio::play_sfx("assets/sounds/unjoin.ogg");
+                return ScreenAction::None;
+            }
+            if state.p1_joined {
+                state.p1_joined = false;
+                state.p1_ready = false;
+                audio::play_sfx("assets/sounds/unjoin.ogg");
+                return ScreenAction::None;
+            }
+            if state.p2_joined {
+                return ScreenAction::None;
+            }
+            state.exit_anim = true;
+            let _ = exit_anim_t(true);
+            if profile::fast_profile_switch_from_select_music() {
+                profile::set_fast_profile_switch_from_select_music(false);
+                return ScreenAction::Navigate(Screen::SelectMusic);
+            }
+            ScreenAction::Navigate(Screen::Menu)
+        }
+        profile_data::PlayerSide::P2 => {
+            if state.p2_joined && state.p2_ready {
+                state.p2_ready = false;
+                audio::play_sfx("assets/sounds/unjoin.ogg");
+                return ScreenAction::None;
+            }
+            if state.p2_joined {
+                state.p2_joined = false;
+                state.p2_ready = false;
+                audio::play_sfx("assets/sounds/unjoin.ogg");
+                return ScreenAction::None;
+            }
+            if state.p1_joined {
+                return ScreenAction::None;
+            }
+            state.exit_anim = true;
+            let _ = exit_anim_t(true);
+            if profile::fast_profile_switch_from_select_music() {
+                profile::set_fast_profile_switch_from_select_music(false);
+                return ScreenAction::Navigate(Screen::SelectMusic);
+            }
+            ScreenAction::Navigate(Screen::Menu)
+        }
+    }
+}
+
 pub fn handle_input(state: &mut State, ev: &InputEvent) -> ScreenAction {
-    if !ev.pressed || state.exit_anim {
+    let chord_side = if crate::config::get().three_key_navigation {
+        state.menu_lr_chord.update(ev)
+    } else {
+        None
+    };
+    if !ev.pressed {
+        if let Some(side) = screen_input::menu_lr_side(ev.action) {
+            state.menu_lr_undo[profile_data::player_side_index(side)] = 0;
+        }
         return ScreenAction::None;
+    }
+    if state.exit_anim {
+        return ScreenAction::None;
+    }
+    if let Some(side) = chord_side {
+        let undo = state.menu_lr_undo[profile_data::player_side_index(side)];
+        state.menu_lr_undo[profile_data::player_side_index(side)] = 0;
+        if undo != 0 {
+            let _ = shift_choice(state, side, i32::from(undo), false);
+        }
+        return handle_cancel(state, side);
     }
 
     match ev.action {
@@ -523,36 +766,24 @@ pub fn handle_input(state: &mut State, ev: &InputEvent) -> ScreenAction {
         | VirtualAction::p1_menu_up
         | VirtualAction::p1_left
         | VirtualAction::p1_menu_left => {
-            if !state.p1_joined || state.p1_ready {
-                return ScreenAction::None;
-            }
-            if state.p1_selected_index > 0 {
-                state.p1_selected_index -= 1;
-                state.p1_preview_noteskin = preview_noteskin_for_choice(
-                    &mut state.noteskin_cache,
-                    &state.choices,
-                    state.p1_selected_index,
-                );
-                audio::play_sfx("assets/sounds/change.ogg");
-            }
+            state.menu_lr_undo[profile_data::player_side_index(profile_data::PlayerSide::P1)] =
+                if shift_choice(state, profile_data::PlayerSide::P1, -1, true) {
+                    1
+                } else {
+                    0
+                };
             ScreenAction::None
         }
         VirtualAction::p1_down
         | VirtualAction::p1_menu_down
         | VirtualAction::p1_right
         | VirtualAction::p1_menu_right => {
-            if !state.p1_joined || state.p1_ready {
-                return ScreenAction::None;
-            }
-            if state.p1_selected_index + 1 < state.choices.len() {
-                state.p1_selected_index += 1;
-                state.p1_preview_noteskin = preview_noteskin_for_choice(
-                    &mut state.noteskin_cache,
-                    &state.choices,
-                    state.p1_selected_index,
-                );
-                audio::play_sfx("assets/sounds/change.ogg");
-            }
+            state.menu_lr_undo[profile_data::player_side_index(profile_data::PlayerSide::P1)] =
+                if shift_choice(state, profile_data::PlayerSide::P1, 1, true) {
+                    -1
+                } else {
+                    0
+                };
             ScreenAction::None
         }
         VirtualAction::p1_start => {
@@ -576,7 +807,7 @@ pub fn handle_input(state: &mut State, ev: &InputEvent) -> ScreenAction {
             if state.p2_joined
                 && state.p2_ready
                 && state.choices.get(state.p1_selected_index).is_some_and(|c| {
-                    !matches!(&c.kind, ActiveProfile::Guest)
+                    !matches!(&c.kind, profile_data::ActiveProfile::Guest)
                         && state
                             .choices
                             .get(state.p2_selected_index)
@@ -592,74 +823,37 @@ pub fn handle_input(state: &mut State, ev: &InputEvent) -> ScreenAction {
                 audio::play_sfx("assets/sounds/start.ogg");
                 state.exit_anim = true;
                 let _ = exit_anim_t(true);
-                profile::set_session_player_side(if state.p1_joined {
-                    profile::PlayerSide::P1
-                } else {
-                    profile::PlayerSide::P2
-                });
-                profile::set_session_joined(state.p1_joined, state.p2_joined);
+                commit_profile_box_session(state);
                 let (p1, p2) = active_choices(state);
                 return ScreenAction::SelectProfiles { p1, p2 };
             }
             ScreenAction::None
         }
         VirtualAction::p1_back | VirtualAction::p1_select => {
-            if state.p1_joined && state.p1_ready {
-                state.p1_ready = false;
-                audio::play_sfx("assets/sounds/unjoin.ogg");
-                return ScreenAction::None;
-            }
-            if state.p1_joined {
-                state.p1_joined = false;
-                state.p1_ready = false;
-                audio::play_sfx("assets/sounds/unjoin.ogg");
-                return ScreenAction::None;
-            }
-            if state.p2_joined {
-                return ScreenAction::None;
-            }
-            state.exit_anim = true;
-            let _ = exit_anim_t(true);
-            if profile::fast_profile_switch_from_select_music() {
-                profile::set_fast_profile_switch_from_select_music(false);
-                return ScreenAction::Navigate(Screen::SelectMusic);
-            }
-            ScreenAction::Navigate(Screen::Menu)
+            handle_cancel(state, profile_data::PlayerSide::P1)
         }
         VirtualAction::p2_up
         | VirtualAction::p2_menu_up
         | VirtualAction::p2_left
         | VirtualAction::p2_menu_left => {
-            if !state.p2_joined || state.p2_ready {
-                return ScreenAction::None;
-            }
-            if state.p2_selected_index > 0 {
-                state.p2_selected_index -= 1;
-                state.p2_preview_noteskin = preview_noteskin_for_choice(
-                    &mut state.noteskin_cache,
-                    &state.choices,
-                    state.p2_selected_index,
-                );
-                audio::play_sfx("assets/sounds/change.ogg");
-            }
+            state.menu_lr_undo[profile_data::player_side_index(profile_data::PlayerSide::P2)] =
+                if shift_choice(state, profile_data::PlayerSide::P2, -1, true) {
+                    1
+                } else {
+                    0
+                };
             ScreenAction::None
         }
         VirtualAction::p2_down
         | VirtualAction::p2_menu_down
         | VirtualAction::p2_right
         | VirtualAction::p2_menu_right => {
-            if !state.p2_joined || state.p2_ready {
-                return ScreenAction::None;
-            }
-            if state.p2_selected_index + 1 < state.choices.len() {
-                state.p2_selected_index += 1;
-                state.p2_preview_noteskin = preview_noteskin_for_choice(
-                    &mut state.noteskin_cache,
-                    &state.choices,
-                    state.p2_selected_index,
-                );
-                audio::play_sfx("assets/sounds/change.ogg");
-            }
+            state.menu_lr_undo[profile_data::player_side_index(profile_data::PlayerSide::P2)] =
+                if shift_choice(state, profile_data::PlayerSide::P2, 1, true) {
+                    -1
+                } else {
+                    0
+                };
             ScreenAction::None
         }
         VirtualAction::p2_start => {
@@ -683,7 +877,7 @@ pub fn handle_input(state: &mut State, ev: &InputEvent) -> ScreenAction {
             if state.p1_joined
                 && state.p1_ready
                 && state.choices.get(state.p2_selected_index).is_some_and(|c| {
-                    !matches!(&c.kind, ActiveProfile::Guest)
+                    !matches!(&c.kind, profile_data::ActiveProfile::Guest)
                         && state
                             .choices
                             .get(state.p1_selected_index)
@@ -699,119 +893,34 @@ pub fn handle_input(state: &mut State, ev: &InputEvent) -> ScreenAction {
                 audio::play_sfx("assets/sounds/start.ogg");
                 state.exit_anim = true;
                 let _ = exit_anim_t(true);
-                profile::set_session_player_side(if state.p1_joined {
-                    profile::PlayerSide::P1
-                } else {
-                    profile::PlayerSide::P2
-                });
-                profile::set_session_joined(state.p1_joined, state.p2_joined);
+                commit_profile_box_session(state);
                 let (p1, p2) = active_choices(state);
                 return ScreenAction::SelectProfiles { p1, p2 };
             }
             ScreenAction::None
         }
         VirtualAction::p2_back | VirtualAction::p2_select => {
-            if state.p2_joined && state.p2_ready {
-                state.p2_ready = false;
-                audio::play_sfx("assets/sounds/unjoin.ogg");
-                return ScreenAction::None;
-            }
-            if state.p2_joined {
-                state.p2_joined = false;
-                state.p2_ready = false;
-                audio::play_sfx("assets/sounds/unjoin.ogg");
-                return ScreenAction::None;
-            }
-            if state.p1_joined {
-                return ScreenAction::None;
-            }
-            state.exit_anim = true;
-            let _ = exit_anim_t(true);
-            if profile::fast_profile_switch_from_select_music() {
-                profile::set_fast_profile_switch_from_select_music(false);
-                return ScreenAction::Navigate(Screen::SelectMusic);
-            }
-            ScreenAction::Navigate(Screen::Menu)
+            handle_cancel(state, profile_data::PlayerSide::P2)
         }
         _ => ScreenAction::None,
     }
 }
 
-fn apply_alpha_to_actor(actor: &mut Actor, alpha: f32) {
-    match actor {
-        Actor::Sprite { tint, .. } => tint[3] *= alpha,
-        Actor::Text { color, .. } => color[3] *= alpha,
-        Actor::Mesh { vertices, .. } => {
-            let mut out: Vec<crate::core::gfx::MeshVertex> = Vec::with_capacity(vertices.len());
-            for v in vertices.iter() {
-                let mut c = v.color;
-                c[3] *= alpha;
-                out.push(crate::core::gfx::MeshVertex {
-                    pos: v.pos,
-                    color: c,
-                });
-            }
-            *vertices = std::sync::Arc::from(out);
-        }
-        Actor::TexturedMesh { vertices, .. } => {
-            let mut out: Vec<crate::core::gfx::TexturedMeshVertex> =
-                Vec::with_capacity(vertices.len());
-            for v in vertices.iter() {
-                let mut c = v.color;
-                c[3] *= alpha;
-                out.push(crate::core::gfx::TexturedMeshVertex {
-                    pos: v.pos,
-                    uv: v.uv,
-                    tex_matrix_scale: v.tex_matrix_scale,
-                    color: c,
-                });
-            }
-            *vertices = std::sync::Arc::from(out);
-        }
-        Actor::Frame {
-            background,
-            children,
-            ..
-        } => {
-            if let Some(actors::Background::Color(c)) = background {
-                c[3] *= alpha;
-            }
-            for child in children {
-                apply_alpha_to_actor(child, alpha);
-            }
-        }
-        Actor::Camera { children, .. } => {
-            for child in children {
-                apply_alpha_to_actor(child, alpha);
-            }
-        }
-        Actor::Shadow { color, child, .. } => {
-            color[3] *= alpha;
-            apply_alpha_to_actor(child, alpha);
-        }
-    }
-}
-
 #[inline(always)]
 fn exit_anim_t(exiting: bool) -> f32 {
-    if !exiting {
-        return 0.0;
-    }
-
-    use crate::ui::{anim, runtime};
-    static STEPS: std::sync::OnceLock<Vec<anim::Step>> = std::sync::OnceLock::new();
-    let dur = EXIT_ANIM_DURATION.max(0.0);
-    let steps = STEPS.get_or_init(|| vec![anim::linear(dur).x(dur).build()]);
-
-    let mut init = anim::TweenState::default();
-    init.x = 0.0;
-    let sid = runtime::site_id(file!(), line!(), column!(), 0x53454C5052455849u64); // "SELPREXI"
-    runtime::materialize(sid, init, steps).x.max(0.0)
+    static STEPS: std::sync::OnceLock<Vec<deadlib_present::anim::Step>> =
+        std::sync::OnceLock::new();
+    super::transitions::linear_elapsed(
+        exiting,
+        EXIT_ANIM_DURATION,
+        &STEPS,
+        0x53454C5052455849u64, // "SELPREXI"
+    )
 }
 
 #[inline(always)]
 fn exit_zoom(exit_t: f32) -> f32 {
-    let p = crate::ui::anim::bouncebegin_p(
+    let p = deadlib_present::anim::bouncebegin_p(
         (exit_t / PLAYERFRAME_EXIT_ZOOM_OUT_DURATION).clamp(0.0, 1.0),
     );
     (1.0 - p).max(0.0)
@@ -827,7 +936,7 @@ fn join_pulse_zoom(join_t: f32) -> f32 {
     if join_t >= JOIN_PULSE_DURATION {
         return 1.0;
     }
-    let p = crate::ui::anim::bounceend_p((join_t / JOIN_PULSE_DURATION).clamp(0.0, 1.0));
+    let p = deadlib_present::anim::bounceend_p((join_t / JOIN_PULSE_DURATION).clamp(0.0, 1.0));
     lerp(JOIN_PULSE_ZOOM_IN, 1.0, p).max(0.0)
 }
 
@@ -836,18 +945,18 @@ fn shake_x(shake_t: f32) -> f32 {
     if shake_t >= SHAKE_DUR {
         return 0.0;
     }
-    let p = crate::ui::anim::bounceend_p((shake_t / SHAKE_STEP_DUR).clamp(0.0, 1.0));
+    let p = deadlib_present::anim::bounceend_p((shake_t / SHAKE_STEP_DUR).clamp(0.0, 1.0));
     if shake_t < SHAKE_STEP_DUR {
         lerp(0.0, 5.0, p)
     } else if shake_t < SHAKE_STEP_DUR * 2.0 {
         let t = (shake_t - SHAKE_STEP_DUR).clamp(0.0, SHAKE_STEP_DUR);
-        let p = crate::ui::anim::bounceend_p((t / SHAKE_STEP_DUR).clamp(0.0, 1.0));
+        let p = deadlib_present::anim::bounceend_p((t / SHAKE_STEP_DUR).clamp(0.0, 1.0));
         lerp(5.0, -5.0, p)
     } else {
         let t = SHAKE_STEP_DUR
             .mul_add(-2.0, shake_t)
             .clamp(0.0, SHAKE_STEP_DUR);
-        let p = crate::ui::anim::bounceend_p((t / SHAKE_STEP_DUR).clamp(0.0, 1.0));
+        let p = deadlib_present::anim::bounceend_p((t / SHAKE_STEP_DUR).clamp(0.0, 1.0));
         lerp(-5.0, 0.0, p)
     }
 }
@@ -888,9 +997,9 @@ fn apply_zoom_to_actor(actor: &mut Actor, pivot: [f32; 2], zoom: f32) {
                     *v *= zoom;
                 }
             }
-            let mut out: Vec<crate::core::gfx::MeshVertex> = Vec::with_capacity(vertices.len());
+            let mut out: Vec<deadlib_render::MeshVertex> = Vec::with_capacity(vertices.len());
             for v in vertices.iter() {
-                out.push(crate::core::gfx::MeshVertex {
+                out.push(deadlib_render::MeshVertex {
                     pos: [v.pos[0] * zoom, v.pos[1] * zoom],
                     color: v.color,
                 });
@@ -910,11 +1019,11 @@ fn apply_zoom_to_actor(actor: &mut Actor, pivot: [f32; 2], zoom: f32) {
                     *v *= zoom;
                 }
             }
-            let mut out: Vec<crate::core::gfx::TexturedMeshVertex> =
+            let mut out: Vec<deadlib_render::TexturedMeshVertex> =
                 Vec::with_capacity(vertices.len());
             for v in vertices.iter() {
-                out.push(crate::core::gfx::TexturedMeshVertex {
-                    pos: [v.pos[0] * zoom, v.pos[1] * zoom],
+                out.push(deadlib_render::TexturedMeshVertex {
+                    pos: [v.pos[0] * zoom, v.pos[1] * zoom, v.pos[2] * zoom],
                     uv: v.uv,
                     tex_matrix_scale: v.tex_matrix_scale,
                     color: v.color,
@@ -968,11 +1077,31 @@ fn apply_zoom_to_actor(actor: &mut Actor, pivot: [f32; 2], zoom: f32) {
                 apply_zoom_to_actor(child, pivot, zoom);
             }
         }
+        Actor::SharedFrame {
+            offset,
+            size,
+            children,
+            ..
+        } => {
+            offset[0] = scale_about(offset[0], pivot[0], zoom);
+            offset[1] = scale_about(offset[1], pivot[1], zoom);
+            for s in size.iter_mut() {
+                if let actors::SizeSpec::Px(v) = s {
+                    *v *= zoom;
+                }
+            }
+            if let Some(children) = std::sync::Arc::get_mut(children) {
+                for child in children {
+                    apply_zoom_to_actor(child, pivot, zoom);
+                }
+            }
+        }
         Actor::Camera { children, .. } => {
             for child in children {
                 apply_zoom_to_actor(child, pivot, zoom);
             }
         }
+        Actor::CameraPush { .. } | Actor::CameraPop => {}
         Actor::Shadow { len, child, .. } => {
             len[0] *= zoom;
             len[1] *= zoom;
@@ -1009,11 +1138,16 @@ fn apply_offset_to_actor(actor: &mut Actor, dx: f32, dy: f32) {
             offset[0] += dx;
             offset[1] += dy;
         }
+        Actor::SharedFrame { offset, .. } => {
+            offset[0] += dx;
+            offset[1] += dy;
+        }
         Actor::Camera { children, .. } => {
             for child in children {
                 apply_offset_to_actor(child, dx, dy);
             }
         }
+        Actor::CameraPush { .. } | Actor::CameraPop => {}
         Actor::Shadow { child, .. } => apply_offset_to_actor(child, dx, dy),
     }
 }
@@ -1024,8 +1158,12 @@ fn apply_z_offset(actor: &mut Actor, dz: i16) {
         | Actor::Text { z, .. }
         | Actor::Mesh { z, .. }
         | Actor::TexturedMesh { z, .. }
-        | Actor::Frame { z, .. } => *z = z.saturating_add(dz),
-        Actor::Camera { .. } | Actor::Shadow { .. } => {}
+        | Actor::Frame { z, .. }
+        | Actor::SharedFrame { z, .. } => *z = z.saturating_add(dz),
+        Actor::Camera { .. }
+        | Actor::CameraPush { .. }
+        | Actor::CameraPop
+        | Actor::Shadow { .. } => {}
     }
     match actor {
         Actor::Frame { children, .. } | Actor::Camera { children, .. } => {
@@ -1033,7 +1171,15 @@ fn apply_z_offset(actor: &mut Actor, dz: i16) {
                 apply_z_offset(child, dz);
             }
         }
+        Actor::SharedFrame { children, .. } => {
+            if let Some(children) = std::sync::Arc::get_mut(children) {
+                for child in children {
+                    apply_z_offset(child, dz);
+                }
+            }
+        }
         Actor::Shadow { child, .. } => apply_z_offset(child, dz),
+        Actor::CameraPush { .. } | Actor::CameraPop => {}
         _ => {}
     }
 }
@@ -1046,19 +1192,30 @@ fn apply_clip_rect_to_actor(actor: &mut Actor, rect: [f32; 4]) {
                 apply_clip_rect_to_actor(child, rect);
             }
         }
+        Actor::SharedFrame { children, .. } => {
+            if let Some(children) = std::sync::Arc::get_mut(children) {
+                for child in children {
+                    apply_clip_rect_to_actor(child, rect);
+                }
+            }
+        }
         Actor::Camera { children, .. } => {
             for child in children {
                 apply_clip_rect_to_actor(child, rect);
             }
         }
         Actor::Shadow { child, .. } => apply_clip_rect_to_actor(child, rect),
-        Actor::Sprite { .. } | Actor::Mesh { .. } | Actor::TexturedMesh { .. } => {}
+        Actor::Sprite { .. }
+        | Actor::Mesh { .. }
+        | Actor::TexturedMesh { .. }
+        | Actor::CameraPush { .. }
+        | Actor::CameraPop => {}
     }
 }
 
 #[inline(always)]
 fn box_inner_alpha() -> f32 {
-    use crate::ui::{anim, runtime};
+    use deadlib_present::{anim, runtime};
     static STEPS: std::sync::OnceLock<Vec<anim::Step>> = std::sync::OnceLock::new();
 
     let steps = STEPS.get_or_init(|| {
@@ -1070,7 +1227,8 @@ fn box_inner_alpha() -> f32 {
 
     let mut init = anim::TweenState::default();
     init.x = 0.0;
-    let sid = runtime::site_id(file!(), line!(), column!(), 0x53454C50524F4649u64); // "SELPROFI"
+    const SITE_BASE: u64 = runtime::site_base(file!(), line!(), column!());
+    let sid = runtime::site_id(SITE_BASE, 0x53454C50524F4649u64); // "SELPROFI"
     runtime::materialize(sid, init, steps).x.clamp(0.0, 1.0)
 }
 
@@ -1082,7 +1240,7 @@ fn push_join_prompt(
     border_rgba: [f32; 4],
     inner_alpha: f32,
     time: f32,
-    text: &str,
+    text: std::sync::Arc<str>,
 ) {
     // ITGmania diffuse_shift: period=1, color1=white, color2=gray.
     // f = sin((t + 0.25) * 2π) / 2 + 0.5
@@ -1091,8 +1249,10 @@ fn push_join_prompt(
         .sin()
         .mul_add(0.5, 0.5);
     let shade = 0.5f32.mul_add(f, 0.5);
+    let salt = u64::from(cx.to_bits());
 
     out.push(act!(quad:
+        tweensalt(salt):
         align(0.5, 0.5):
         xy(cx, cy):
         zoomto(FRAME_W_JOIN + FRAME_BORDER, frame_h + FRAME_BORDER):
@@ -1102,6 +1262,7 @@ fn push_join_prompt(
         z(100)
     ));
     out.push(act!(quad:
+        tweensalt(salt):
         align(0.5, 0.5):
         xy(cx, cy):
         zoomto(FRAME_W_JOIN, frame_h):
@@ -1128,6 +1289,7 @@ fn push_scroller_frame(
     _asset_manager: &AssetManager,
     choices: &[Choice],
     selected_index: usize,
+    scroll_anim: f32,
     preview_noteskin: Option<&Noteskin>,
     preview_time: f32,
     preview_beat: f32,
@@ -1146,9 +1308,11 @@ fn push_scroller_frame(
     // - Scroller highlight + info pane use semi-transparent black overlays (alpha 0.5)
     let col_frame = color::simply_love_rgba(color_index);
     let col_frame_top = color::lighten_rgba(col_frame);
+    let salt = u64::from(frame_cx.to_bits());
 
     // Frame border.
     out.push(act!(quad:
+        tweensalt(salt):
         align(0.5, 0.5):
         xy(frame_cx, frame_cy):
         zoomto(FRAME_W_SCROLLER + FRAME_BORDER, frame_h + FRAME_BORDER):
@@ -1159,6 +1323,7 @@ fn push_scroller_frame(
     ));
     // Base fill.
     out.push(act!(quad:
+        tweensalt(salt):
         align(0.5, 0.5):
         xy(frame_cx, frame_cy):
         zoomto(FRAME_W_SCROLLER, frame_h):
@@ -1169,6 +1334,7 @@ fn push_scroller_frame(
     ));
     // Top-edge lighten gradient (approx for diffusetopedge()).
     out.push(act!(quad:
+        tweensalt(salt):
         align(0.5, 0.5):
         xy(frame_cx, frame_cy):
         zoomto(FRAME_W_SCROLLER, frame_h):
@@ -1185,6 +1351,7 @@ fn push_scroller_frame(
     let info_max_w = INFO_PAD.mul_add(-2.5, INFO_W);
 
     out.push(act!(quad:
+        tweensalt(salt):
         align(0.0, 0.0):
         xy(info_x0, frame_y0):
         zoomto(INFO_W, frame_h):
@@ -1197,6 +1364,7 @@ fn push_scroller_frame(
     // Scroller highlight bar.
     let scroller_cx = frame_cx + SCROLLER_CX_OFF;
     out.push(act!(quad:
+        tweensalt(salt):
         align(0.5, 0.5):
         xy(scroller_cx, frame_cy):
         zoomto(SCROLLER_W, ROW_H):
@@ -1214,13 +1382,15 @@ fn push_scroller_frame(
         frame_h,
     ];
     let rows_half = ROWS_VISIBLE / 2;
-    for d in -rows_half..=rows_half {
+    // Render one extra row on each side so a row sliding in during the scroll tween
+    // does not pop into existence at the clipped edge.
+    for d in -(rows_half + 1)..=(rows_half + 1) {
         let idx_i = selected_index as i32 + d;
         if idx_i < 0 || idx_i >= choices.len() as i32 {
             continue;
         }
         let choice = &choices[idx_i as usize];
-        let y = (d as f32).mul_add(ROW_H, frame_cy);
+        let y = (d as f32 + scroll_anim).mul_add(ROW_H, frame_cy);
 
         let mut row = act!(text:
             align(0.5, 0.5):
@@ -1240,7 +1410,7 @@ fn push_scroller_frame(
 
     let selected = choices.get(selected_index);
     let selected_is_local =
-        selected.is_some_and(|c| matches!(&c.kind, ActiveProfile::Local { .. }));
+        selected.is_some_and(|c| matches!(&c.kind, profile_data::ActiveProfile::Local { .. }));
 
     // Avatar slot (SL-style): show profile.png if present, else heart + text.
     let avatar_dim = INFO_PAD.mul_add(-2.25, INFO_W);
@@ -1248,7 +1418,7 @@ fn push_scroller_frame(
     let avatar_y = frame_cy + AVATAR_Y_OFF;
 
     if let Some(choice) = selected {
-        let is_guest = matches!(&choice.kind, ActiveProfile::Guest);
+        let is_guest = matches!(&choice.kind, profile_data::ActiveProfile::Guest);
         let show_fallback = is_guest || choice.avatar_key.is_none();
         if show_fallback {
             let bg = color::rgba_hex(AVATAR_BG_HEX);
@@ -1259,15 +1429,22 @@ fn push_scroller_frame(
                 diffuse(bg[0], bg[1], bg[2], bg[3] * inner_alpha):
                 z(103)
             ));
-            out.push(act!(sprite("heart.png"):
+            let visual_style = visual_styles::current_style();
+            let texture = visual_styles::select_color_texture_key();
+            let zoom = AVATAR_HEART_ZOOM * visual_styles::select_color_zoom_scale(visual_style);
+            out.push(act!(sprite(texture):
                 align(0.0, 0.0):
                 xy(avatar_x + AVATAR_HEART_X, avatar_y + AVATAR_HEART_Y):
-                zoom(AVATAR_HEART_ZOOM):
+                zoom(zoom):
                 diffuse(1.0, 1.0, 1.0, 0.9 * inner_alpha):
                 z(104)
             ));
 
-            let label = if is_guest { "[ GUEST ]" } else { "No Avatar" };
+            let label = if is_guest {
+                tr("SelectProfile", "GuestLabel")
+            } else {
+                tr("SelectProfile", "NoAvatar")
+            };
             out.push(act!(text:
                 align(0.5, 0.0):
                 xy(avatar_x + avatar_dim * 0.5, avatar_y + AVATAR_TEXT_Y):
@@ -1315,7 +1492,9 @@ fn push_scroller_frame(
     // NoteSkin + JudgmentGraphic previews (SL-style placement).
     if selected_is_local {
         let selected_mods = selected
-            .map(|c| format_recent_mods(&c.speed_mod, c.scroll_option, c.mini_indicator))
+            .map(|c| {
+                format_recent_mods(&c.speed_mod, c.scroll_option, c.mini_indicator, &c.noteskin)
+            })
             .unwrap_or_default();
         let preview_y = frame_cy + PREVIEW_Y_OFF;
 
@@ -1460,38 +1639,11 @@ fn push_scroller_frame(
             }
         }
 
-        let judgment_texture = selected.and_then(|c| match c.judgment {
-            profile::JudgmentGraphic::Love => Some("judgements/Love 2x7 (doubleres).png"),
-            profile::JudgmentGraphic::LoveChroma => {
-                Some("judgements/Love Chroma 2x7 (doubleres).png")
-            }
-            profile::JudgmentGraphic::Rainbowmatic => {
-                Some("judgements/Rainbowmatic 2x7 (doubleres).png")
-            }
-            profile::JudgmentGraphic::GrooveNights => {
-                Some("judgements/GrooveNights 2x7 (doubleres).png")
-            }
-            profile::JudgmentGraphic::Emoticon => Some("judgements/Emoticon 2x7 (doubleres).png"),
-            profile::JudgmentGraphic::Censored => Some("judgements/Censored 1x7 (doubleres).png"),
-            profile::JudgmentGraphic::Chromatic => Some("judgements/Chromatic 2x7 (doubleres).png"),
-            profile::JudgmentGraphic::ITG2 => Some("judgements/ITG2 2x7 (doubleres).png"),
-            profile::JudgmentGraphic::Bebas => Some("judgements/Bebas 2x7 (doubleres).png"),
-            profile::JudgmentGraphic::Code => Some("judgements/Code 2x7 (doubleres).png"),
-            profile::JudgmentGraphic::ComicSans => {
-                Some("judgements/Comic Sans 2x7 (doubleres).png")
-            }
-            profile::JudgmentGraphic::Focus => Some("judgements/Focus 2x7 (doubleres).png"),
-            profile::JudgmentGraphic::Grammar => Some("judgements/Grammar 2x7 (doubleres).png"),
-            profile::JudgmentGraphic::Miso => Some("judgements/Miso 2x7 (doubleres).png"),
-            profile::JudgmentGraphic::Papyrus => Some("judgements/Papyrus 2x7 (doubleres).png"),
-            profile::JudgmentGraphic::Roboto => Some("judgements/Roboto 2x7 (doubleres).png"),
-            profile::JudgmentGraphic::Shift => Some("judgements/Shift 2x7 (doubleres).png"),
-            profile::JudgmentGraphic::Tactics => Some("judgements/Tactics 2x7 (doubleres).png"),
-            profile::JudgmentGraphic::Wendy => Some("judgements/Wendy 2x7 (doubleres).png"),
-            profile::JudgmentGraphic::WendyChroma => {
-                Some("judgements/Wendy Chroma 2x7 (doubleres).png")
-            }
-            profile::JudgmentGraphic::None => None,
+        let judgment_texture = selected.and_then(|c| {
+            assets::resolve_texture_choice(
+                c.judgment.texture_key(),
+                assets::judgment_texture_choices(),
+            )
         });
 
         if let Some(texture) = judgment_texture {
@@ -1547,8 +1699,8 @@ fn build_box_actors(
 
     let frame_y0 = frame_h.mul_add(-0.5, cy);
 
-    // IMPORTANT: Apply shake as a post-transform, otherwise the changing X affects
-    // act! tween site_ids (salt includes init.x) and restarts tweens every frame.
+    // IMPORTANT: Apply shake as a post-transform so the frame's explicit tween salt
+    // stays stable and the crop-in tweens do not restart every frame.
     let p1_cx = cx - FRAME_CX_OFF;
     let p2_cx = cx + FRAME_CX_OFF;
     let p1_shake_dx = shake_x(state.p1_shake_t);
@@ -1571,6 +1723,7 @@ fn build_box_actors(
             asset_manager,
             &state.choices,
             state.p1_selected_index,
+            state.p1_scroll_anim,
             state.p1_preview_noteskin.as_deref(),
             state.preview_time,
             state.preview_beat,
@@ -1584,11 +1737,16 @@ fn build_box_actors(
             col_overlay,
         );
         for a in &mut scroller_ui {
-            apply_alpha_to_actor(a, if show_scroller { 1.0 } else { 0.0 });
+            a.mul_alpha(if show_scroller { 1.0 } else { 0.0 });
         }
         p1_ui.extend(scroller_ui);
 
         let mut join_ui: Vec<Actor> = Vec::new();
+        let join_text = if state.p1_ready {
+            tr("SelectProfile", "WaitingText")
+        } else {
+            tr("SelectProfile", "JoinText")
+        };
         push_join_prompt(
             &mut join_ui,
             p1_cx,
@@ -1597,22 +1755,18 @@ fn build_box_actors(
             border_rgba,
             inner_alpha,
             state.preview_time,
-            if state.p1_ready {
-                WAITING_TEXT
-            } else {
-                JOIN_TEXT
-            },
+            join_text,
         );
         for a in &mut join_ui {
-            apply_alpha_to_actor(a, if show_join { 1.0 } else { 0.0 });
+            a.mul_alpha(if show_join { 1.0 } else { 0.0 });
         }
         p1_ui.extend(join_ui);
 
         if show_selected_name {
-            let name = state
-                .choices
-                .get(state.p1_selected_index)
-                .map_or_else(|| "[ GUEST ]".to_string(), |c| c.display_name.clone());
+            let name = state.choices.get(state.p1_selected_index).map_or_else(
+                || tr("SelectProfile", "GuestLabel").to_string(),
+                |c| c.display_name.clone(),
+            );
             let a = act!(text:
                 align(0.5, 0.5):
                 xy(p1_cx, cy + SELECTED_NAME_Y_OFF):
@@ -1656,6 +1810,7 @@ fn build_box_actors(
             asset_manager,
             &state.choices,
             state.p2_selected_index,
+            state.p2_scroll_anim,
             state.p2_preview_noteskin.as_deref(),
             state.preview_time,
             state.preview_beat,
@@ -1669,11 +1824,16 @@ fn build_box_actors(
             col_overlay,
         );
         for a in &mut scroller_ui {
-            apply_alpha_to_actor(a, if show_scroller { 1.0 } else { 0.0 });
+            a.mul_alpha(if show_scroller { 1.0 } else { 0.0 });
         }
         p2_ui.extend(scroller_ui);
 
         let mut join_ui: Vec<Actor> = Vec::new();
+        let join_text = if state.p2_ready {
+            tr("SelectProfile", "WaitingText")
+        } else {
+            tr("SelectProfile", "JoinText")
+        };
         push_join_prompt(
             &mut join_ui,
             p2_cx,
@@ -1682,22 +1842,18 @@ fn build_box_actors(
             border_rgba,
             inner_alpha,
             state.preview_time,
-            if state.p2_ready {
-                WAITING_TEXT
-            } else {
-                JOIN_TEXT
-            },
+            join_text,
         );
         for a in &mut join_ui {
-            apply_alpha_to_actor(a, if show_join { 1.0 } else { 0.0 });
+            a.mul_alpha(if show_join { 1.0 } else { 0.0 });
         }
         p2_ui.extend(join_ui);
 
         if show_selected_name {
-            let name = state
-                .choices
-                .get(state.p2_selected_index)
-                .map_or_else(|| "[ GUEST ]".to_string(), |c| c.display_name.clone());
+            let name = state.choices.get(state.p2_selected_index).map_or_else(
+                || tr("SelectProfile", "GuestLabel").to_string(),
+                |c| c.display_name.clone(),
+            );
             let a = act!(text:
                 align(0.5, 0.5):
                 xy(p2_cx, cy + SELECTED_NAME_Y_OFF):
@@ -1728,7 +1884,7 @@ fn build_box_actors(
     }
 
     for mut a in ui {
-        apply_alpha_to_actor(&mut a, alpha_multiplier);
+        a.mul_alpha(alpha_multiplier);
         actors.push(a);
     }
     actors
@@ -1749,22 +1905,27 @@ pub fn get_box_actors_with_z(
     actors
 }
 
-pub fn get_actors(
+pub fn push_actors(
+    actors: &mut Vec<Actor>,
     state: &State,
     asset_manager: &AssetManager,
     alpha_multiplier: f32,
-) -> Vec<Actor> {
-    let mut actors: Vec<Actor> = Vec::with_capacity(160);
+) {
+    actors.reserve(160);
 
-    actors.extend(state.bg.build(heart_bg::Params {
-        active_color_index: state.active_color_index,
-        backdrop_rgba: [0.0, 0.0, 0.0, 1.0],
-        alpha_mul: 1.0,
-    }));
+    state.bg.push(
+        actors,
+        visual_style_bg::Params {
+            active_color_index: state.active_color_index,
+            backdrop_rgba: [0.0, 0.0, 0.0, 1.0],
+            alpha_mul: 1.0,
+        },
+    );
 
     let fg = [1.0, 1.0, 1.0, 1.0];
+    let title = tr("ScreenTitles", "SelectProfile");
     actors.push(screen_bar::build(ScreenBarParams {
-        title: "SELECT PROFILE",
+        title: &title,
         title_placement: ScreenBarTitlePlacement::Left,
         position: ScreenBarPosition::Top,
         transparent: false,
@@ -1776,14 +1937,17 @@ pub fn get_actors(
         right_avatar: None,
     }));
 
+    let press_start = tr("Common", "PressStart");
+    let not_present = tr("SelectProfile", "NotPresent");
     let (footer_left, footer_right) = match (state.p1_joined, state.p2_joined) {
-        (false, false) => (Some("PRESS START"), Some("PRESS START")),
-        (true, false) => (None, Some("NOT PRESENT")),
-        (false, true) => (Some("NOT PRESENT"), None),
+        (false, false) => (Some(press_start.as_ref()), Some(press_start.as_ref())),
+        (true, false) => (None, Some(not_present.as_ref())),
+        (false, true) => (Some(not_present.as_ref()), None),
         (true, true) => (None, None),
     };
+    let event_mode = tr("Common", "EventMode");
     actors.push(screen_bar::build(ScreenBarParams {
-        title: "EVENT MODE",
+        title: &event_mode,
         title_placement: ScreenBarTitlePlacement::Center,
         position: ScreenBarPosition::Bottom,
         transparent: false,
@@ -1795,5 +1959,14 @@ pub fn get_actors(
         right_avatar: None,
     }));
     actors.extend(build_box_actors(state, asset_manager, alpha_multiplier));
+}
+
+pub fn get_actors(
+    state: &State,
+    asset_manager: &AssetManager,
+    alpha_multiplier: f32,
+) -> Vec<Actor> {
+    let mut actors = Vec::with_capacity(160);
+    push_actors(&mut actors, state, asset_manager, alpha_multiplier);
     actors
 }

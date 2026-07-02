@@ -1,18 +1,14 @@
 use crate::assets::AssetManager;
-use crate::game::chart::{ChartData, StaminaCounts};
-use crate::game::judgment::JudgeGrade;
-use crate::game::profile;
-use crate::game::scores::Grade;
-use crate::game::scroll::ScrollSpeedSetting;
-use crate::game::song::SongData;
-use crate::game::timing::{HistogramMs, TimingData, TimingSegments, TimingStats, WindowCounts};
 use crate::screens::components::evaluation::pane_stats;
 use crate::screens::evaluation::{EvalPane, ScoreInfo};
 use crate::test_support::compose_scenarios;
-use crate::ui::actors::Actor;
-use rssp::TechCounts;
-use rssp::stats::ArrowStats;
-use std::collections::HashMap;
+use deadlib_present::actors::Actor;
+use deadsync_chart::SongData;
+use deadsync_chart::{ArrowStats, ChartData, StaminaCounts, TechCounts};
+use deadsync_profile as profile_data;
+use deadsync_rules::scroll::ScrollSpeedSetting;
+use deadsync_rules::timing::{HistogramMs, TimingStats, WindowCounts};
+use deadsync_score::{Grade, GrooveStatsEvalState, ItlEvalState};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -21,7 +17,7 @@ pub const SCENARIO_NAME: &str = "pane-stats";
 pub struct PaneStatsBenchFixture {
     score_info: ScoreInfo,
     pane: EvalPane,
-    controller: profile::PlayerSide,
+    controller: profile_data::PlayerSide,
     asset_manager: AssetManager,
     elapsed_s: f32,
 }
@@ -47,39 +43,49 @@ pub fn fixture() -> PaneStatsBenchFixture {
     PaneStatsBenchFixture {
         score_info: bench_score_info(),
         pane: EvalPane::HardEx,
-        controller: profile::PlayerSide::P1,
+        controller: profile_data::PlayerSide::P1,
         asset_manager,
         elapsed_s: 0.41,
     }
 }
 
-fn bench_score_info() -> ScoreInfo {
+pub fn bench_score_info() -> ScoreInfo {
     let song = Arc::new(bench_song());
     let chart = Arc::new(song.charts[0].clone());
-    let judgment_counts = HashMap::from([
-        (JudgeGrade::Fantastic, 28_904),
-        (JudgeGrade::Excellent, 2_318),
-        (JudgeGrade::Great, 481),
-        (JudgeGrade::Decent, 53),
-        (JudgeGrade::WayOff, 7),
-        (JudgeGrade::Miss, 1),
-    ]);
+    let judgment_counts = [28_904, 2_318, 481, 53, 7, 1];
 
     ScoreInfo {
         song,
         chart,
+        course_graph_stages: Vec::new(),
+        side: profile_data::PlayerSide::P1,
         profile_name: "BenchPlayer".to_string(),
         score_valid: true,
+        disqualified: false,
+        expected_groovestats_submit: false,
+        expected_arrowcloud_submit: false,
+        groovestats: GrooveStatsEvalState {
+            valid: true,
+            reason_lines: Vec::new(),
+            manual_qr_url: None,
+        },
+        itl: ItlEvalState::default(),
         judgment_counts,
         score_percent: 0.9765,
+        earned_grade_points: 0,
+        possible_grade_points: 0,
         grade: Grade::Tier02,
         speed_mod: ScrollSpeedSetting::CMod(700.0),
+        mods_text: Arc::<str>::from("C700, Overhead, cel"),
         hands_achieved: 237,
         hands_total: 288,
         holds_held: 452,
+        holds_held_for_score: 452,
         holds_total: 487,
         rolls_held: 73,
+        rolls_held_for_score: 73,
         rolls_total: 81,
+        mines_hit_for_score: 94,
         mines_avoided: 905,
         mines_total: 999,
         timing: TimingStats {
@@ -88,13 +94,13 @@ fn bench_score_info() -> ScoreInfo {
             stddev_ms: 13.2,
             max_abs_ms: 42.5,
         },
+        arrow_timing: Default::default(),
         scatter: Vec::new(),
         scatter_worst_window_ms: 180.0,
         histogram: HistogramMs::default(),
         graph_first_second: 0.0,
         graph_last_second: 128.0,
         music_rate: 1.0,
-        scroll_option: profile::ScrollOption::Normal,
         life_history: Vec::new(),
         fail_time: None,
         window_counts: WindowCounts {
@@ -117,6 +123,7 @@ fn bench_score_info() -> ScoreInfo {
         },
         ex_score_percent: 99.14,
         hard_ex_score_percent: 98.43,
+        calories_burned: 412.7,
         column_judgments: Vec::new(),
         noteskin: None,
         show_fa_plus_window: true,
@@ -124,6 +131,7 @@ fn bench_score_info() -> ScoreInfo {
         show_hard_ex_score: true,
         show_fa_plus_pane: true,
         track_early_judgments: true,
+        disabled_timing_windows: [false; 5],
         machine_records: Vec::new(),
         machine_record_highlight_rank: None,
         personal_records: Vec::new(),
@@ -134,15 +142,21 @@ fn bench_score_info() -> ScoreInfo {
 
 fn bench_song() -> SongData {
     SongData {
-        simfile_path: PathBuf::from("Songs/Bench/Pane Stats/pane-stats.ssc"),
+        simfile_path: PathBuf::from("songs/Bench/Pane Stats/pane-stats.ssc"),
         title: "Pane Stats Benchmark".to_string(),
         subtitle: "Optimization Pass".to_string(),
         translit_title: String::new(),
         translit_subtitle: String::new(),
         artist: "Bench Artist".to_string(),
+        genre: String::new(),
         banner_path: None,
         background_path: None,
         background_changes: Vec::new(),
+        background_layer2_changes: Vec::new(),
+        foreground_changes: Vec::new(),
+        background_lua_changes: Vec::new(),
+        foreground_lua_changes: Vec::new(),
+        has_lua: false,
         cdtitle_path: None,
         music_path: None,
         display_bpm: "180".to_string(),
@@ -152,14 +166,10 @@ fn bench_song() -> SongData {
         min_bpm: 180.0,
         max_bpm: 180.0,
         normalized_bpms: "0.000=180.000".to_string(),
-        normalized_stops: String::new(),
-        normalized_delays: String::new(),
-        normalized_warps: String::new(),
-        normalized_speeds: String::new(),
-        normalized_scrolls: String::new(),
-        normalized_fakes: String::new(),
         music_length_seconds: 128.0,
+        first_second: 0.0,
         total_length_seconds: 128,
+        precise_last_second_seconds: 128.0,
         charts: vec![bench_chart()],
         cached_precise_last_second: 0.0,
     }
@@ -173,20 +183,7 @@ fn bench_chart() -> ChartData {
         chart_name: String::new(),
         meter: 15,
         step_artist: String::new(),
-        notes: vec![b'0', b'0', b'0', b'0'],
-        parsed_notes: Vec::new(),
-        row_to_beat: Vec::new(),
-        timing_segments: TimingSegments {
-            beat0_offset_adjust: 0.0,
-            bpms: vec![(0.0, 180.0)],
-            stops: Vec::new(),
-            delays: Vec::new(),
-            warps: Vec::new(),
-            speeds: Vec::new(),
-            scrolls: Vec::new(),
-            fakes: Vec::new(),
-        },
-        timing: TimingData::default(),
+        music_path: None,
         short_hash: "pane-stats-bench".to_string(),
         stats: ArrowStats {
             total_arrows: 0,
@@ -219,6 +216,7 @@ fn bench_chart() -> ChartData {
         mines_nonfake: 999,
         stamina_counts: StaminaCounts::default(),
         total_streams: 0,
+        matrix_rating: 0.0,
         max_nps: 0.0,
         sn_detailed_breakdown: String::new(),
         sn_partial_breakdown: String::new(),
@@ -228,13 +226,16 @@ fn bench_chart() -> ChartData {
         simple_breakdown: String::new(),
         total_measures: 0,
         measure_nps_vec: Vec::new(),
-        chart_attacks: None,
-        chart_bpms: None,
-        chart_stops: None,
-        chart_delays: None,
-        chart_warps: None,
-        chart_speeds: None,
-        chart_scrolls: None,
-        chart_fakes: None,
+        measure_seconds_vec: Vec::new(),
+        first_second: 0.0,
+        has_note_data: true,
+        has_chart_attacks: false,
+        possible_grade_points: 0,
+        holds_total: 487,
+        rolls_total: 81,
+        mines_total: 999,
+        display_bpm: None,
+        min_bpm: 150.0,
+        max_bpm: 150.0,
     }
 }

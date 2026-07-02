@@ -1,9 +1,9 @@
 use crate::act;
-use crate::game::profile;
-use crate::game::scores;
 use crate::screens::evaluation::ScoreInfo;
-use crate::ui::actors::{Actor, SizeSpec};
-use crate::ui::color;
+use deadlib_present::actors::{Actor, SizeSpec};
+use deadlib_present::color;
+use deadsync_profile as profile_data;
+use deadsync_score as score_data;
 
 use super::utils::{format_machine_record_date, pane_origin_x};
 
@@ -12,7 +12,6 @@ const MACHINE_RECORD_SPLIT_MACHINE_ROWS: usize = 8;
 const MACHINE_RECORD_SPLIT_PERSONAL_ROWS: usize = 2;
 const MACHINE_RECORD_DEFAULT_ROW_HEIGHT: f32 = 22.0;
 const MACHINE_RECORD_SPLIT_ROW_HEIGHT: f32 = 20.25;
-const MACHINE_RECORD_SPLIT_SEPARATOR_Y_ROWS: f32 = 9.0;
 const MACHINE_RECORD_HIGHLIGHT_PERIOD_SECONDS: f32 = 4.0 / 3.0;
 
 #[inline(always)]
@@ -35,13 +34,13 @@ fn format_machine_record_score(score_10000: f64) -> String {
 
 #[inline(always)]
 fn machine_record_highlight_color(
-    side: profile::PlayerSide,
+    side: profile_data::PlayerSide,
     active_color_index: i32,
     elapsed_s: f32,
 ) -> [f32; 4] {
     let base = match side {
-        profile::PlayerSide::P1 => color::simply_love_rgba(active_color_index),
-        profile::PlayerSide::P2 => color::simply_love_rgba(active_color_index - 2),
+        profile_data::PlayerSide::P1 => color::simply_love_rgba(active_color_index),
+        profile_data::PlayerSide::P2 => color::simply_love_rgba(active_color_index - 2),
     };
     let phase =
         ((elapsed_s / MACHINE_RECORD_HIGHLIGHT_PERIOD_SECONDS) * std::f32::consts::TAU).sin() * 0.5
@@ -57,7 +56,7 @@ fn machine_record_highlight_color(
 
 fn push_machine_record_row(
     children: &mut Vec<Actor>,
-    entry: Option<&scores::LeaderboardEntry>,
+    entry: Option<&score_data::LeaderboardEntry>,
     rank: u32,
     y: f32,
     rank_x: f32,
@@ -130,12 +129,12 @@ fn push_machine_record_row(
 
 pub fn build_machine_records_pane(
     score_info: &ScoreInfo,
-    controller: profile::PlayerSide,
+    controller: profile_data::PlayerSide,
     active_color_index: i32,
     elapsed_s: f32,
 ) -> Vec<Actor> {
     let pane_origin_x = pane_origin_x(controller);
-    let pane_origin_y = crate::core::space::screen_center_y() - 62.0;
+    let pane_origin_y = deadlib_present::space::screen_center_y() - 62.0;
     let pane_zoom = 0.8_f32;
     let rank_x = -120.0 * pane_zoom;
     let name_x = -110.0 * pane_zoom;
@@ -165,8 +164,8 @@ pub fn build_machine_records_pane(
             );
         }
 
-        let split_y = first_row_y
-            + MACHINE_RECORD_SPLIT_SEPARATOR_Y_ROWS * MACHINE_RECORD_SPLIT_ROW_HEIGHT * pane_zoom;
+        let machine_rows_height = MACHINE_RECORD_SPLIT_MACHINE_ROWS as f32 * row_height;
+        let split_y = first_row_y + machine_rows_height - row_height * 0.5;
         children.push(act!(quad:
             align(0.5, 0.5):
             xy(0.0, split_y):
@@ -175,6 +174,7 @@ pub fn build_machine_records_pane(
             z(101)
         ));
 
+        let first_personal_row_y = first_row_y + machine_rows_height;
         for i in 0..MACHINE_RECORD_SPLIT_PERSONAL_ROWS {
             let rank = (i as u32).saturating_add(1);
             let col = if score_info.personal_record_highlight_rank == Some(rank) {
@@ -186,7 +186,7 @@ pub fn build_machine_records_pane(
                 &mut children,
                 score_info.personal_records.get(i),
                 rank,
-                split_y + i as f32 * row_height,
+                first_personal_row_y + i as f32 * row_height,
                 rank_x,
                 name_x,
                 score_x,

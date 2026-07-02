@@ -1,92 +1,96 @@
+use super::{GameplayCoreState, chart_effects_from_profile, gameplay_attack_mode};
 use crate::config::SimpleIni;
-use crate::core::input::InputSource;
-use crate::core::network;
-use crate::game::gameplay;
-use crate::game::judgment;
-use crate::game::profile::{self, Profile};
+use crate::game::online::groovestats as online_groovestats;
+use crate::game::profile;
 use crate::game::song::get_song_cache;
 use crate::game::stage_stats;
-use chrono::{Local, TimeZone};
+use deadlib_platform::dirs;
+use deadsync_profile::Profile;
 use log::{debug, warn};
-use serde::de::Deserializer;
-use serde::{Deserialize, Serialize};
-use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use bincode::{Decode, Encode};
+use deadsync_gameplay::{
+    PlayerRuntime, ScoreValidityOptions, score_invalid_reason_lines_for_options,
+};
+use deadsync_online::arrowcloud::{self as arrowcloud_api, ARROWCLOUD_BULK_MAX_HASHES};
+use deadsync_online::boxed_request_error;
+use deadsync_online::groovestats::{self as groovestats_api, GrooveStatsSubmitApiPlayer};
+use deadsync_profile as profile_data;
+use deadsync_rules::judgment;
 
-// --- Grade Definitions ---
+mod arrowcloud;
+mod groovestats;
+mod itl;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
-#[allow(dead_code)] // Quint will be used eventually for W0 tracking
-pub enum Grade {
-    Quint,
-    Tier01,
-    Tier02,
-    Tier03,
-    Tier04,
-    Tier05,
-    Tier06,
-    Tier07,
-    Tier08,
-    Tier09,
-    Tier10,
-    Tier11,
-    Tier12,
-    Tier13,
-    Tier14,
-    Tier15,
-    Tier16,
-    Tier17,
-    Failed,
+#[inline(always)]
+fn active_groovestats_service() -> groovestats_api::Service {
+    online_groovestats::active_service()
 }
 
-impl Grade {
-    /// Converts a grade to the corresponding frame index on the "grades 1x19.png" spritesheet.
-    pub const fn to_sprite_state(&self) -> u32 {
-        match self {
-            Self::Quint => 0,
-            Self::Tier01 => 1,
-            Self::Tier02 => 2,
-            Self::Tier03 => 3,
-            Self::Tier04 => 4,
-            Self::Tier05 => 5,
-            Self::Tier06 => 6,
-            Self::Tier07 => 7,
-            Self::Tier08 => 8,
-            Self::Tier09 => 9,
-            Self::Tier10 => 10,
-            Self::Tier11 => 11,
-            Self::Tier12 => 12,
-            Self::Tier13 => 13,
-            Self::Tier14 => 14,
-            Self::Tier15 => 15,
-            Self::Tier16 => 16,
-            Self::Tier17 => 17,
-            Self::Failed => 18,
-        }
-    }
+fn score_invalid_reason_lines_for_profile(
+    chart: &deadsync_chart::ChartData,
+    profile: &profile_data::Profile,
+    music_rate: f32,
+) -> Vec<&'static str> {
+    score_invalid_reason_lines_for_options(
+        chart,
+        ScoreValidityOptions {
+            chart_effects: chart_effects_from_profile(profile),
+            attack_mode: gameplay_attack_mode(profile.attack_mode),
+            music_rate,
+        },
+    )
 }
 
-/// A struct to hold both the calculated grade and the precise score percentage.
-#[derive(Debug, Clone, Copy, PartialEq, Encode, Decode)]
-pub struct CachedScore {
-    pub grade: Grade,
-    pub score_percent: f64, // Stored as 0.0 to 1.0
-    /// Optional lamp index for UI (e.g., Select Music wheel).
-    /// This is intentionally UI-agnostic: the meaning of the index is left
-    /// to the presentation layer (colors, effects, etc.).
-    pub lamp_index: Option<u8>,
-    /// Optional single-digit judge count for the lamp (e.g. 1..=9).
-    pub lamp_judge_count: Option<u8>,
-}
+pub use arrowcloud::{
+    arrowcloud_next_retry_is_auto, arrowcloud_next_retry_remaining_secs,
+    get_arrowcloud_submit_ui_status_for_side, retry_arrowcloud_submit,
+    submit_arrowcloud_payloads_from_gameplay, tick_arrowcloud_auto_retries,
+};
+use deadsync_score::{
+    ArrowCloudLeaderboard, ArrowCloudScores, CachedPlayerLeaderboardData, CachedScore,
+    CachedScoreImportResult, GameplayScoreboxProfileSnapshot, Grade, GrooveStatsSubmitRecordBanner,
+    GsLampChartStats, GsScoreEntry, ImportedPlayerScore, LOCAL_SCORE_VERSION, LeaderboardEntry,
+    LocalReplayEdge, LocalScalarScore, LocalScoreEntry, LocalScoreHeader, LocalScoreIndex,
+    MachineLeaderboardPlay, MachineReplayEntry, MachineReplayPlay, PlayerLeaderboardCacheKey,
+    PlayerLeaderboardData, ScoreBulkImportSummary, ScoreImportEndpoint, ScoreImportProgress,
+    arrowcloud_score_from_submit_percent, cached_missing_gs_score, cached_score_from_gs_entry,
+    cached_score_from_imported_player_score, cached_score_from_local_header,
+    cached_score_import_result_from_imported, compute_local_lamp, decode_gs_score_entry,
+    decode_local_score_entry, decode_local_score_header, decode_local_score_index,
+    encode_gs_score_entry, encode_local_score_entry, encode_local_score_index,
+    failed_score_override, fix_gs_cached_score, gameplay_run_failed, gameplay_run_passed,
+    grade_from_code, grade_to_code, gs_score_entry_from_cached, is_better_itg,
+    lua_chart_submit_allowed, machine_leaderboard_entries, machine_replay_entries,
+    merge_arrowcloud_score_slot, merge_local_fail, parse_score_file_name,
+    player_leaderboard_cache_key, promote_quint_grade, score_file_shard, score_to_grade,
+    scorebox_snapshot, should_replace_cached_gs_score, update_local_score_index,
+};
+use groovestats::{GrooveStatsSubmitPlayerJob, groovestats_judgment_counts};
+pub use groovestats::{
+    get_groovestats_submit_event_progress_for_side, get_groovestats_submit_record_banner_for_side,
+    get_groovestats_submit_ui_status_for_side, groovestats_eval_state_from_gameplay,
+    groovestats_next_retry_is_auto, groovestats_next_retry_remaining_secs,
+    retry_groovestats_submit, submit_groovestats_payloads_from_gameplay,
+    tick_groovestats_auto_retries,
+};
+pub use itl::{
+    ensure_itl_wheel_caches_loaded, get_cached_itl_score_for_side, get_cached_itl_score_for_song,
+    get_cached_itl_self_score_for_side, get_cached_itl_tournament_overall_ranks_for_side,
+    get_cached_itl_tournament_rank_for_side, get_or_fetch_itl_self_score_for_side,
+    get_or_fetch_itl_tournament_rank_for_side, import_itl_json,
+    is_itl_song_folder_unlocked_for_side, is_itl_song_folder_unlocked_with_profile,
+    is_itl_unlocks_pack, itl_eval_state_from_gameplay, itl_points_for_chart,
+    save_itl_data_from_gameplay, seed_session_itl_unlock_folders,
+    seed_session_online_itl_self_rank, seed_session_online_itl_self_score,
+    should_warn_cmod_for_itl_chart,
+};
 
 // --- GrooveStats grade cache (on-disk + network-fetched) ---
 
@@ -99,14 +103,13 @@ static GS_SCORE_CACHE: std::sync::LazyLock<Mutex<GsScoreCacheState>> =
     std::sync::LazyLock::new(|| Mutex::new(GsScoreCacheState::default()));
 
 fn gs_scores_dir_for_profile(profile_id: &str) -> PathBuf {
-    PathBuf::from("save/profiles")
-        .join(profile_id)
+    profile::local_profile_dir_for_id(profile_id)
         .join("scores")
         .join("gs")
 }
 
 fn gs_scores_dir_for_profile_and_hash(profile_id: &str, chart_hash: &str) -> PathBuf {
-    gs_scores_dir_for_profile(profile_id).join(shard2_for_hash(chart_hash))
+    gs_scores_dir_for_profile(profile_id).join(score_file_shard(chart_hash))
 }
 
 fn gs_score_index_path_for_profile(profile_id: &str) -> PathBuf {
@@ -115,11 +118,20 @@ fn gs_score_index_path_for_profile(profile_id: &str) -> PathBuf {
 
 fn load_gs_score_index(path: &Path) -> Option<HashMap<String, CachedScore>> {
     let bytes = fs::read(path).ok()?;
-    let (by_chart, _) = bincode::decode_from_slice::<HashMap<String, CachedScore>, _>(
+    let (mut by_chart, _) = bincode::decode_from_slice::<HashMap<String, CachedScore>, _>(
         &bytes,
         bincode::config::standard(),
     )
     .ok()?;
+    let mut changed = false;
+    for score in by_chart.values_mut() {
+        let fixed = fix_gs_cached_score(*score);
+        changed |= fixed != *score;
+        *score = fixed;
+    }
+    if changed {
+        save_gs_score_index(path, &by_chart);
+    }
     Some(by_chart)
 }
 
@@ -176,9 +188,35 @@ fn ensure_gs_score_cache_loaded_for_profile(profile_id: &str) {
         .or_insert(disk_cache);
 }
 
+fn get_cached_local_score_for_profile(profile_id: &str, chart_hash: &str) -> Option<CachedScore> {
+    if profile_id.trim().is_empty() {
+        return None;
+    }
+    ensure_local_score_cache_loaded(profile_id);
+    LOCAL_SCORE_CACHE
+        .lock()
+        .unwrap()
+        .loaded_profiles
+        .get(profile_id)
+        .and_then(|idx| idx.best_itg.get(chart_hash).copied())
+}
+
+fn get_cached_gs_score_for_profile(profile_id: &str, chart_hash: &str) -> Option<CachedScore> {
+    if profile_id.trim().is_empty() {
+        return None;
+    }
+    ensure_gs_score_cache_loaded_for_profile(profile_id);
+    GS_SCORE_CACHE
+        .lock()
+        .unwrap()
+        .loaded_profiles
+        .get(profile_id)
+        .and_then(|scores| scores.get(chart_hash).copied())
+}
+
 pub fn get_cached_gs_score_for_side(
     chart_hash: &str,
-    side: profile::PlayerSide,
+    side: profile_data::PlayerSide,
 ) -> Option<CachedScore> {
     let profile_id = profile::active_local_profile_id_for_side(side)?;
     ensure_gs_score_cache_loaded_for_profile(&profile_id);
@@ -204,6 +242,7 @@ fn cached_gs_chart_hashes_for_profile(profile_id: &str) -> HashSet<String> {
 }
 
 fn set_cached_gs_score_for_profile(profile_id: &str, chart_hash: String, score: CachedScore) {
+    let score = fix_gs_cached_score(score);
     debug!("Caching GrooveStats score {score:?} for chart hash {chart_hash}");
     ensure_gs_score_cache_loaded_for_profile(profile_id);
     let snapshot = {
@@ -217,20 +256,179 @@ fn set_cached_gs_score_for_profile(profile_id: &str, chart_hash: String, score: 
     save_gs_score_index(&gs_score_index_path_for_profile(profile_id), &snapshot);
 }
 
+// --- ArrowCloud score cache (on-disk, all 3 leaderboards per chart) ---
+
+#[derive(Default)]
+struct AcScoreCacheState {
+    loaded_profiles: HashMap<String, HashMap<String, ArrowCloudScores>>,
+}
+
+static AC_SCORE_CACHE: std::sync::LazyLock<Mutex<AcScoreCacheState>> =
+    std::sync::LazyLock::new(|| Mutex::new(AcScoreCacheState::default()));
+
+fn ac_scores_dir_for_profile(profile_id: &str) -> PathBuf {
+    profile::local_profile_dir_for_id(profile_id)
+        .join("scores")
+        .join("ac")
+}
+
+fn ac_score_index_path_for_profile(profile_id: &str) -> PathBuf {
+    ac_scores_dir_for_profile(profile_id).join("index.bin")
+}
+
+fn load_ac_score_index(path: &Path) -> Option<HashMap<String, ArrowCloudScores>> {
+    let bytes = fs::read(path).ok()?;
+    let (by_chart, _) = bincode::decode_from_slice::<HashMap<String, ArrowCloudScores>, _>(
+        &bytes,
+        bincode::config::standard(),
+    )
+    .ok()?;
+    Some(by_chart)
+}
+
+fn save_ac_score_index(path: &Path, by_chart: &HashMap<String, ArrowCloudScores>) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if let Err(e) = fs::create_dir_all(parent) {
+        warn!("Failed to create AC score index dir {parent:?}: {e}");
+        return;
+    }
+    let Ok(buf) = bincode::encode_to_vec(by_chart, bincode::config::standard()) else {
+        warn!("Failed to encode AC score index at {path:?}");
+        return;
+    };
+    let tmp_path = path.with_extension("tmp");
+    if let Err(e) = fs::write(&tmp_path, buf) {
+        warn!("Failed to write AC score index temp file {tmp_path:?}: {e}");
+        return;
+    }
+    if let Err(e) = fs::rename(&tmp_path, path) {
+        warn!("Failed to commit AC score index file {path:?}: {e}");
+        let _ = fs::remove_file(&tmp_path);
+    }
+}
+
+fn ensure_ac_score_cache_loaded_for_profile(profile_id: &str) {
+    let needs_load = {
+        let state = AC_SCORE_CACHE.lock().unwrap();
+        !state.loaded_profiles.contains_key(profile_id)
+    };
+    if !needs_load {
+        return;
+    }
+    let index_path = ac_score_index_path_for_profile(profile_id);
+    let disk_cache = load_ac_score_index(&index_path).unwrap_or_default();
+    let mut state = AC_SCORE_CACHE.lock().unwrap();
+    state
+        .loaded_profiles
+        .entry(profile_id.to_string())
+        .or_insert(disk_cache);
+}
+
+fn get_cached_ac_scores_for_profile(
+    profile_id: &str,
+    chart_hash: &str,
+) -> Option<ArrowCloudScores> {
+    if profile_id.trim().is_empty() {
+        return None;
+    }
+    ensure_ac_score_cache_loaded_for_profile(profile_id);
+    AC_SCORE_CACHE
+        .lock()
+        .unwrap()
+        .loaded_profiles
+        .get(profile_id)
+        .and_then(|m| m.get(chart_hash).copied())
+}
+
+/// Public side-aware accessor for the wheel/gameplay layer to read AC scores.
+pub fn get_cached_ac_scores_for_side(
+    chart_hash: &str,
+    side: profile_data::PlayerSide,
+) -> Option<ArrowCloudScores> {
+    let profile_id = profile::active_local_profile_id_for_side(side)?;
+    get_cached_ac_scores_for_profile(&profile_id, chart_hash)
+}
+
+fn cached_ac_chart_hashes_with_itg_for_profile(profile_id: &str) -> HashSet<String> {
+    if profile_id.trim().is_empty() {
+        return HashSet::new();
+    }
+    ensure_ac_score_cache_loaded_for_profile(profile_id);
+    AC_SCORE_CACHE
+        .lock()
+        .unwrap()
+        .loaded_profiles
+        .get(profile_id)
+        .map_or_else(HashSet::new, |scores| {
+            scores
+                .iter()
+                .filter_map(|(hash, ac)| ac.itg.is_some().then(|| hash.clone()))
+                .collect()
+        })
+}
+
+/// Bulk-write multiple AC score entries with a single index save.
+fn set_cached_ac_scores_for_profile_bulk(
+    profile_id: &str,
+    entries: impl IntoIterator<Item = (String, ArrowCloudScores)>,
+) {
+    ensure_ac_score_cache_loaded_for_profile(profile_id);
+    let snapshot = {
+        let mut state = AC_SCORE_CACHE.lock().unwrap();
+        let Some(map) = state.loaded_profiles.get_mut(profile_id) else {
+            return;
+        };
+        for (hash, scores) in entries {
+            map.insert(hash, scores);
+        }
+        map.clone()
+    };
+    save_ac_score_index(&ac_score_index_path_for_profile(profile_id), &snapshot);
+}
+
+/// Update the AC cache after a successful score submit.
+///
+/// Builds an `ArrowCloudScores` from the gameplay-computed ITG / EX / HardEX
+/// percents and merges it with the existing cached entry, keeping the higher
+/// percent per leaderboard so a worse follow-up play doesn't overwrite a
+/// better stored score (parity with [`cache_gs_score_for_profile`]).
+pub(super) fn cache_arrowcloud_scores_from_submit(
+    profile_id: &str,
+    chart_hash: &str,
+    itg_percent: f64,
+    ex_percent: f64,
+    hard_ex_percent: f64,
+    is_fail: bool,
+    submitted_at: chrono::DateTime<chrono::Utc>,
+) {
+    let new_scores = ArrowCloudScores {
+        itg: arrowcloud_score_from_submit_percent(itg_percent, is_fail, submitted_at.clone()),
+        ex: arrowcloud_score_from_submit_percent(ex_percent, is_fail, submitted_at.clone()),
+        hard_ex: arrowcloud_score_from_submit_percent(
+            hard_ex_percent,
+            is_fail,
+            submitted_at.clone(),
+        ),
+    };
+
+    ensure_ac_score_cache_loaded_for_profile(profile_id);
+    let merged = {
+        let mut state = AC_SCORE_CACHE.lock().unwrap();
+        let Some(map) = state.loaded_profiles.get_mut(profile_id) else {
+            return;
+        };
+        let entry = map.entry(chart_hash.to_string()).or_default();
+        merge_arrowcloud_score_slot(&mut entry.itg, new_scores.itg);
+        merge_arrowcloud_score_slot(&mut entry.ex, new_scores.ex);
+        merge_arrowcloud_score_slot(&mut entry.hard_ex, new_scores.hard_ex);
+        map.clone()
+    };
+    save_ac_score_index(&ac_score_index_path_for_profile(profile_id), &merged);
+}
+
 // --- Local score cache (on-disk, one file per play) ---
-
-#[derive(Clone, Copy, Debug, Encode, Decode)]
-struct BestScalar {
-    grade: Grade,
-    percent: f64,
-}
-
-#[derive(Debug, Default, Clone, Encode, Decode)]
-struct LocalScoreIndex {
-    best_itg: HashMap<String, CachedScore>,
-    best_ex: HashMap<String, BestScalar>,
-    best_hard_ex: HashMap<String, BestScalar>,
-}
 
 #[derive(Default)]
 struct LocalScoreCacheState {
@@ -256,8 +454,7 @@ static MACHINE_LOCAL_SCORE_CACHE: std::sync::LazyLock<Mutex<MachineLocalScoreCac
     std::sync::LazyLock::new(|| Mutex::new(MachineLocalScoreCacheState::default()));
 
 fn local_scores_root_for_profile(profile_id: &str) -> PathBuf {
-    PathBuf::from("save/profiles")
-        .join(profile_id)
+    profile::local_profile_dir_for_id(profile_id)
         .join("scores")
         .join("local")
 }
@@ -268,10 +465,7 @@ fn local_score_index_path_for_profile(profile_id: &str) -> PathBuf {
 
 fn load_local_score_index_file(path: &Path) -> Option<LocalScoreIndex> {
     let bytes = fs::read(path).ok()?;
-    let (index, _) =
-        bincode::decode_from_slice::<LocalScoreIndex, _>(&bytes, bincode::config::standard())
-            .ok()?;
-    Some(index)
+    decode_local_score_index(&bytes)
 }
 
 fn save_local_score_index_file(path: &Path, index: &LocalScoreIndex) {
@@ -282,7 +476,7 @@ fn save_local_score_index_file(path: &Path, index: &LocalScoreIndex) {
         warn!("Failed to create local score index dir {parent:?}: {e}");
         return;
     }
-    let Ok(buf) = bincode::encode_to_vec(index, bincode::config::standard()) else {
+    let Some(buf) = encode_local_score_index(index) else {
         warn!("Failed to encode local score index at {path:?}");
         return;
     };
@@ -339,25 +533,11 @@ pub fn total_songs_played_for_profile(profile_id: &str) -> u32 {
     total
 }
 
-pub fn total_songs_played_for_side(side: profile::PlayerSide) -> u32 {
+pub fn total_songs_played_for_side(side: profile_data::PlayerSide) -> u32 {
     let Some(profile_id) = profile::active_local_profile_id_for_side(side) else {
         return 0;
     };
     total_songs_played_for_profile(&profile_id)
-}
-
-#[inline(always)]
-fn parse_local_score_filename(name: &str) -> Option<(&str, i64)> {
-    if !name.ends_with(".bin") {
-        return None;
-    }
-    let base = &name[..name.len().saturating_sub(4)];
-    let idx_dash = base.rfind('-')?;
-    if idx_dash == 0 {
-        return None;
-    }
-    let played_at_ms = base[(idx_dash + 1)..].parse::<i64>().ok()?;
-    Some((&base[..idx_dash], played_at_ms))
 }
 
 fn collect_recent_plays_in_dir(dir: &Path, latest_by_chart: &mut HashMap<String, i64>) {
@@ -372,7 +552,7 @@ fn collect_recent_plays_in_dir(dir: &Path, latest_by_chart: &mut HashMap<String,
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        let Some((chart_hash, played_at_ms)) = parse_local_score_filename(name) else {
+        let Some((chart_hash, played_at_ms)) = parse_score_file_name(name) else {
             continue;
         };
         match latest_by_chart.get_mut(chart_hash) {
@@ -404,7 +584,7 @@ fn collect_recent_plays_in_root(root: &Path, latest_by_chart: &mut HashMap<Strin
 /// Returns chart hashes ordered by latest local play time (most recent first),
 /// aggregated across all local profiles.
 pub fn recent_played_chart_hashes_for_machine() -> Vec<String> {
-    let profiles_root = PathBuf::from("save/profiles");
+    let profiles_root = dirs::app_dirs().profiles_root();
     let Ok(read_dir) = fs::read_dir(&profiles_root) else {
         return Vec::new();
     };
@@ -444,7 +624,7 @@ fn collect_play_counts_in_dir(dir: &Path, counts_by_chart: &mut HashMap<String, 
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        let Some((chart_hash, _played_at_ms)) = parse_local_score_filename(name) else {
+        let Some((chart_hash, _played_at_ms)) = parse_score_file_name(name) else {
             continue;
         };
         counts_by_chart
@@ -470,7 +650,7 @@ fn collect_play_counts_in_root(root: &Path, counts_by_chart: &mut HashMap<String
 /// Returns `(chart_hash, play_count)` pairs ordered by play count descending,
 /// aggregated across all local profiles.
 pub fn played_chart_counts_for_machine() -> Vec<(String, u32)> {
-    let profiles_root = PathBuf::from("save/profiles");
+    let profiles_root = dirs::app_dirs().profiles_root();
     let Ok(read_dir) = fs::read_dir(&profiles_root) else {
         return Vec::new();
     };
@@ -492,29 +672,41 @@ pub fn played_chart_counts_for_machine() -> Vec<(String, u32)> {
     ranked
 }
 
-#[inline(always)]
-fn shard2_for_hash(hash: &str) -> &str {
-    if hash.len() >= 2 { &hash[..2] } else { "00" }
+/// Returns chart hashes ordered by latest local play time for a single profile.
+pub fn recent_played_chart_hashes_for_profile(profile_id: &str) -> Vec<String> {
+    let local_root = local_scores_root_for_profile(profile_id);
+    if !local_root.is_dir() {
+        return Vec::new();
+    }
+
+    let mut latest_by_chart: HashMap<String, i64> = HashMap::new();
+    collect_recent_plays_in_root(&local_root, &mut latest_by_chart);
+
+    let mut ranked: Vec<(i64, String)> = latest_by_chart
+        .into_iter()
+        .map(|(chart_hash, played_at_ms)| (played_at_ms, chart_hash))
+        .collect();
+    ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    ranked
+        .into_iter()
+        .map(|(_, chart_hash)| chart_hash)
+        .collect()
 }
 
-#[inline(always)]
-fn is_better_itg(new: &CachedScore, old: &CachedScore) -> bool {
-    match (old.grade == Grade::Failed, new.grade == Grade::Failed) {
-        (true, false) => return true,
-        (false, true) => return false,
-        _ => {}
+/// Returns `(chart_hash, play_count)` pairs for a single profile, ordered by
+/// play count descending.
+pub fn played_chart_counts_for_profile(profile_id: &str) -> Vec<(String, u32)> {
+    let local_root = local_scores_root_for_profile(profile_id);
+    if !local_root.is_dir() {
+        return Vec::new();
     }
-    new.score_percent > old.score_percent
-}
 
-#[inline(always)]
-fn is_better_scalar(new: BestScalar, old: BestScalar) -> bool {
-    match (old.grade == Grade::Failed, new.grade == Grade::Failed) {
-        (true, false) => return true,
-        (false, true) => return false,
-        _ => {}
-    }
-    new.percent > old.percent
+    let mut counts_by_chart: HashMap<String, u32> = HashMap::new();
+    collect_play_counts_in_root(&local_root, &mut counts_by_chart);
+
+    let mut ranked: Vec<(String, u32)> = counts_by_chart.into_iter().collect();
+    ranked.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked
 }
 
 fn ensure_local_score_cache_loaded(profile_id: &str) {
@@ -545,9 +737,7 @@ fn ensure_local_score_cache_loaded(profile_id: &str) {
 }
 
 fn profile_initials_for_id(profile_id: &str) -> Option<String> {
-    let ini_path = PathBuf::from("save/profiles")
-        .join(profile_id)
-        .join("profile.ini");
+    let ini_path = profile::local_profile_dir_for_id(profile_id).join("profile.ini");
     if !ini_path.is_file() {
         return None;
     }
@@ -556,8 +746,8 @@ fn profile_initials_for_id(profile_id: &str) -> Option<String> {
         return None;
     }
     let s = ini.get("userprofile", "PlayerInitials")?;
-    let s = s.trim();
-    (!s.is_empty()).then_some(s.to_string())
+    let s = profile_data::sanitize_player_initials(&s);
+    (!s.is_empty()).then_some(s)
 }
 
 fn ensure_machine_local_score_cache_loaded() {
@@ -579,7 +769,7 @@ fn ensure_machine_local_score_cache_loaded() {
                 Some(existing) => {
                     if is_better_itg(&score, &existing.score) {
                         existing.score = score;
-                        existing.initials = initials.clone();
+                        existing.initials.clone_from(&initials);
                     }
                 }
                 None => {
@@ -610,18 +800,20 @@ fn ensure_machine_local_score_cache_loaded() {
 pub fn prewarm_select_music_score_caches() {
     let started = Instant::now();
 
-    let p1_profile_id = profile::active_local_profile_id_for_side(profile::PlayerSide::P1);
-    let p2_profile_id = profile::active_local_profile_id_for_side(profile::PlayerSide::P2);
+    let p1_profile_id = profile::active_local_profile_id_for_side(profile_data::PlayerSide::P1);
+    let p2_profile_id = profile::active_local_profile_id_for_side(profile_data::PlayerSide::P2);
 
     if let Some(profile_id) = p1_profile_id.as_deref() {
         ensure_local_score_cache_loaded(profile_id);
         ensure_gs_score_cache_loaded_for_profile(profile_id);
+        ensure_ac_score_cache_loaded_for_profile(profile_id);
     }
     if let Some(profile_id) = p2_profile_id.as_deref()
         && p1_profile_id.as_deref() != Some(profile_id)
     {
         ensure_local_score_cache_loaded(profile_id);
         ensure_gs_score_cache_loaded_for_profile(profile_id);
+        ensure_ac_score_cache_loaded_for_profile(profile_id);
     }
 
     ensure_machine_local_score_cache_loaded();
@@ -654,23 +846,9 @@ fn update_machine_cache_if_loaded(chart_hash: &str, score: CachedScore, initials
     }
 }
 
-pub fn get_cached_score_for_side(
-    chart_hash: &str,
-    side: profile::PlayerSide,
-) -> Option<CachedScore> {
-    let local = get_cached_local_score_for_side(chart_hash, side);
-    let gs = get_cached_gs_score_for_side(chart_hash, side);
-    match (local, gs) {
-        (None, None) => None,
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (Some(a), Some(b)) => Some(if is_better_itg(&a, &b) { a } else { b }),
-    }
-}
-
 pub fn get_cached_local_score_for_side(
     chart_hash: &str,
-    side: profile::PlayerSide,
+    side: profile_data::PlayerSide,
 ) -> Option<CachedScore> {
     let profile_id = profile::active_local_profile_id_for_side(side)?;
     ensure_local_score_cache_loaded(&profile_id);
@@ -682,19 +860,156 @@ pub fn get_cached_local_score_for_side(
         .and_then(|idx| idx.best_itg.get(chart_hash).copied())
 }
 
-#[inline(always)]
-pub fn is_gs_get_scores_service_allowed() -> bool {
-    if !crate::config::get().enable_groovestats {
-        return false;
+pub fn get_cached_score_for_side(
+    chart_hash: &str,
+    side: profile_data::PlayerSide,
+) -> Option<CachedScore> {
+    let profile_id = profile::active_local_profile_id_for_side(side)?;
+    get_cached_score_with_profile(chart_hash, &profile_id)
+}
+
+/// Like [`get_cached_score_for_side`] but takes a precomputed profile id so the
+/// song wheel can resolve the active profile once per side per frame instead of
+/// three times per slot (local + gs + ac each re-resolved the active id and
+/// allocated a `String`).
+pub fn get_cached_score_with_profile(chart_hash: &str, profile_id: &str) -> Option<CachedScore> {
+    let local = get_cached_local_score_for_profile(profile_id, chart_hash);
+    let gs = get_cached_gs_score_for_profile(profile_id, chart_hash);
+    let ac = get_cached_ac_scores_for_profile(profile_id, chart_hash)
+        .and_then(|s| s.itg)
+        .map(|ac| ac.to_cached_score());
+    // Merge by picking the "best ITG" entry; failed scores win when their
+    // numeric percent matches a cached non-failed score (parity with prior
+    // local+gs merge semantics).
+    [local, gs, ac].into_iter().flatten().reduce(|a, b| {
+        failed_score_override(&a, &b).unwrap_or_else(|| if is_better_itg(&a, &b) { a } else { b })
+    })
+}
+
+pub struct HeldScoreCaches {
+    local: std::sync::MutexGuard<'static, LocalScoreCacheState>,
+    gs: std::sync::MutexGuard<'static, GsScoreCacheState>,
+    ac: std::sync::MutexGuard<'static, AcScoreCacheState>,
+}
+
+impl HeldScoreCaches {
+    /// Resolve the merged "best ITG" score for `chart_hash` under `profile_id`,
+    /// reading the already-held cache maps. Identical merge semantics to
+    /// [`get_cached_score_with_profile`].
+    pub fn merged(&self, profile_id: &str, chart_hash: &str) -> Option<CachedScore> {
+        if profile_id.trim().is_empty() {
+            return None;
+        }
+        let local = self
+            .local
+            .loaded_profiles
+            .get(profile_id)
+            .and_then(|idx| idx.best_itg.get(chart_hash).copied());
+        let gs = self
+            .gs
+            .loaded_profiles
+            .get(profile_id)
+            .and_then(|m| m.get(chart_hash).copied());
+        let ac = self
+            .ac
+            .loaded_profiles
+            .get(profile_id)
+            .and_then(|m| m.get(chart_hash).copied())
+            .and_then(|s| s.itg)
+            .map(|ac| ac.to_cached_score());
+        [local, gs, ac].into_iter().flatten().reduce(|a, b| {
+            failed_score_override(&a, &b)
+                .unwrap_or_else(|| if is_better_itg(&a, &b) { a } else { b })
+        })
     }
-    matches!(
-        network::get_status(),
-        network::ConnectionStatus::Connected(services) if services.get_scores
-    )
+}
+
+pub fn ensure_score_caches_loaded(profile_id: &str) {
+    if profile_id.trim().is_empty() {
+        return;
+    }
+    ensure_local_score_cache_loaded(profile_id);
+    ensure_gs_score_cache_loaded_for_profile(profile_id);
+    ensure_ac_score_cache_loaded_for_profile(profile_id);
+}
+
+pub fn lock_score_caches() -> HeldScoreCaches {
+    HeldScoreCaches {
+        local: LOCAL_SCORE_CACHE.lock().unwrap(),
+        gs: GS_SCORE_CACHE.lock().unwrap(),
+        ac: AC_SCORE_CACHE.lock().unwrap(),
+    }
+}
+
+/// Test/bench helper: seed the in-memory local ITG score cache for a profile
+/// without touching disk. Lets benchmarks exercise the wheel grade/lamp render
+/// path deterministically.
+pub fn seed_session_local_itg_score(profile_id: &str, chart_hash: &str, score: CachedScore) {
+    ensure_local_score_cache_loaded(profile_id);
+    LOCAL_SCORE_CACHE
+        .lock()
+        .unwrap()
+        .loaded_profiles
+        .entry(profile_id.to_string())
+        .or_default()
+        .best_itg
+        .insert(chart_hash.to_string(), score);
+}
+
+/// Test/bench helper: seed the in-memory GrooveStats grade cache for a profile
+/// without touching disk. See [`seed_session_local_itg_score`].
+pub fn seed_session_gs_score(profile_id: &str, chart_hash: &str, score: CachedScore) {
+    ensure_gs_score_cache_loaded_for_profile(profile_id);
+    GS_SCORE_CACHE
+        .lock()
+        .unwrap()
+        .loaded_profiles
+        .entry(profile_id.to_string())
+        .or_default()
+        .insert(chart_hash.to_string(), score);
+}
+
+fn get_cached_local_scalar_score_for_side(
+    chart_hash: &str,
+    side: profile_data::PlayerSide,
+    hard_ex: bool,
+) -> Option<LocalScalarScore> {
+    let profile_id = profile::active_local_profile_id_for_side(side)?;
+    ensure_local_score_cache_loaded(&profile_id);
+    let state = LOCAL_SCORE_CACHE.lock().unwrap();
+    let index = state.loaded_profiles.get(&profile_id)?;
+    let best = if hard_ex {
+        index.best_hard_ex.get(chart_hash)
+    } else {
+        index.best_ex.get(chart_hash)
+    }?;
+    Some(LocalScalarScore {
+        percent: best.percent,
+        is_fail: best.grade == Grade::Failed,
+    })
+}
+
+pub fn get_cached_local_ex_score_for_side(
+    chart_hash: &str,
+    side: profile_data::PlayerSide,
+) -> Option<LocalScalarScore> {
+    get_cached_local_scalar_score_for_side(chart_hash, side, false)
+}
+
+pub fn get_cached_local_hard_ex_score_for_side(
+    chart_hash: &str,
+    side: profile_data::PlayerSide,
+) -> Option<LocalScalarScore> {
+    get_cached_local_scalar_score_for_side(chart_hash, side, true)
 }
 
 #[inline(always)]
-pub fn is_gs_active_for_side(side: profile::PlayerSide) -> bool {
+pub fn is_gs_get_scores_service_allowed() -> bool {
+    crate::config::get().enable_groovestats
+}
+
+#[inline(always)]
+pub fn is_gs_active_for_side(side: profile_data::PlayerSide) -> bool {
     if !is_gs_get_scores_service_allowed() || !profile::is_session_side_joined(side) {
         return false;
     }
@@ -714,114 +1029,6 @@ pub fn get_machine_record_local(chart_hash: &str) -> Option<(String, CachedScore
 }
 
 // --- On-disk GrooveStats score storage ---
-
-#[derive(Debug, Clone, Encode, Decode)]
-struct GsScoreEntryV1 {
-    score_percent: f64,
-    grade_code: u8,
-    lamp_index: Option<u8>,
-    username: String,
-    fetched_at_ms: i64,
-}
-
-#[derive(Debug, Clone, Encode, Decode)]
-struct GsScoreEntry {
-    score_percent: f64,
-    grade_code: u8,
-    lamp_index: Option<u8>,
-    lamp_judge_count: Option<u8>,
-    username: String,
-    fetched_at_ms: i64,
-}
-
-const fn grade_to_code(g: Grade) -> u8 {
-    match g {
-        Grade::Quint => 0,
-        Grade::Tier01 => 1,
-        Grade::Tier02 => 2,
-        Grade::Tier03 => 3,
-        Grade::Tier04 => 4,
-        Grade::Tier05 => 5,
-        Grade::Tier06 => 6,
-        Grade::Tier07 => 7,
-        Grade::Tier08 => 8,
-        Grade::Tier09 => 9,
-        Grade::Tier10 => 10,
-        Grade::Tier11 => 11,
-        Grade::Tier12 => 12,
-        Grade::Tier13 => 13,
-        Grade::Tier14 => 14,
-        Grade::Tier15 => 15,
-        Grade::Tier16 => 16,
-        Grade::Tier17 => 17,
-        Grade::Failed => 18,
-    }
-}
-
-const fn grade_from_code(code: u8) -> Grade {
-    match code {
-        0 => Grade::Quint,
-        1 => Grade::Tier01,
-        2 => Grade::Tier02,
-        3 => Grade::Tier03,
-        4 => Grade::Tier04,
-        5 => Grade::Tier05,
-        6 => Grade::Tier06,
-        7 => Grade::Tier07,
-        8 => Grade::Tier08,
-        9 => Grade::Tier09,
-        10 => Grade::Tier10,
-        11 => Grade::Tier11,
-        12 => Grade::Tier12,
-        13 => Grade::Tier13,
-        14 => Grade::Tier14,
-        15 => Grade::Tier15,
-        16 => Grade::Tier16,
-        17 => Grade::Tier17,
-        _ => Grade::Failed,
-    }
-}
-
-fn entry_from_cached(score: CachedScore, username: &str, fetched_at_ms: i64) -> GsScoreEntry {
-    GsScoreEntry {
-        score_percent: score.score_percent,
-        grade_code: grade_to_code(score.grade),
-        lamp_index: score.lamp_index,
-        lamp_judge_count: score.lamp_judge_count,
-        username: username.to_string(),
-        fetched_at_ms,
-    }
-}
-
-fn cached_from_entry(entry: &GsScoreEntry) -> CachedScore {
-    CachedScore {
-        grade: grade_from_code(entry.grade_code),
-        score_percent: entry.score_percent,
-        lamp_index: entry.lamp_index,
-        lamp_judge_count: entry.lamp_judge_count,
-    }
-}
-
-fn decode_gs_score_entry(bytes: &[u8]) -> Option<GsScoreEntry> {
-    if let Ok((entry, _)) =
-        bincode::decode_from_slice::<GsScoreEntry, _>(bytes, bincode::config::standard())
-    {
-        return Some(entry);
-    }
-    if let Ok((v1, _)) =
-        bincode::decode_from_slice::<GsScoreEntryV1, _>(bytes, bincode::config::standard())
-    {
-        return Some(GsScoreEntry {
-            score_percent: v1.score_percent,
-            grade_code: v1.grade_code,
-            lamp_index: v1.lamp_index,
-            lamp_judge_count: None,
-            username: v1.username,
-            fetched_at_ms: v1.fetched_at_ms,
-        });
-    }
-    None
-}
 
 fn scan_gs_scores_dir(dir: &Path, best_by_chart: &mut HashMap<String, CachedScore>) {
     let Ok(read_dir) = fs::read_dir(dir) else {
@@ -854,11 +1061,11 @@ fn scan_gs_scores_dir(dir: &Path, best_by_chart: &mut HashMap<String, CachedScor
         let Some(entry) = decode_gs_score_entry(&bytes) else {
             continue;
         };
-        let cached = cached_from_entry(&entry);
+        let cached = cached_score_from_gs_entry(&entry);
 
         match best_by_chart.get_mut(chart_hash) {
             Some(existing) => {
-                if cached.score_percent > existing.score_percent {
+                if is_better_itg(&cached, existing) {
                     *existing = cached;
                 }
             }
@@ -936,7 +1143,7 @@ fn append_gs_score_on_disk_for_profile(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    let new_entry = entry_from_cached(score, username, fetched_at_ms);
+    let new_entry = gs_score_entry_from_cached(score, username, fetched_at_ms);
 
     let epsilon = 1e-9_f64;
     for existing in &entries {
@@ -960,133 +1167,23 @@ fn append_gs_score_on_disk_for_profile(
     let file_name = format!("{chart_hash}-{fetched_at_ms}.bin");
     let path = dir.join(file_name);
 
-    match bincode::encode_to_vec(&new_entry, bincode::config::standard()) {
-        Ok(buf) => {
+    match encode_gs_score_entry(&new_entry) {
+        Some(buf) => {
             if let Err(e) = fs::write(&path, buf) {
                 warn!("Failed to write GrooveStats score file {path:?}: {e}");
             } else {
                 debug!("Stored GrooveStats score on disk for chart {chart_hash} at {path:?}");
             }
         }
-        Err(e) => {
-            warn!("Failed to encode GrooveStats score for chart {chart_hash}: {e}");
+        None => {
+            warn!("Failed to encode GrooveStats score for chart {chart_hash}");
         }
     }
 }
 
 // --- On-disk local score storage (one file per play) ---
 
-const LOCAL_SCORE_VERSION_V1: u16 = 1;
-
-#[derive(Debug, Clone, Copy, Encode, Decode)]
-struct LocalReplayEdgeV1 {
-    event_music_time: f32,
-    lane: u8,
-    pressed: bool,
-    // 0 = Keyboard, 1 = Gamepad
-    source: u8,
-}
-
-#[derive(Debug, Clone, Encode, Decode)]
-struct LocalScoreEntryHeaderV1 {
-    version: u16,
-    played_at_ms: i64,
-    music_rate: f32,
-    score_percent: f64,
-    grade_code: u8,
-    lamp_index: Option<u8>,
-    lamp_judge_count: Option<u8>,
-    ex_score_percent: f64,
-    hard_ex_score_percent: f64,
-    // Fantastic, Excellent, Great, Decent, WayOff, Miss (row judgments)
-    judgment_counts: [u32; 6],
-    holds_held: u32,
-    holds_total: u32,
-    rolls_held: u32,
-    rolls_total: u32,
-    mines_avoided: u32,
-    mines_total: u32,
-    hands_achieved: u32,
-    fail_time: Option<f32>,
-    beat0_time_seconds: f32,
-}
-
-#[derive(Debug, Clone, Encode, Decode)]
-struct LocalScoreEntryV1 {
-    version: u16,
-    played_at_ms: i64,
-    music_rate: f32,
-    score_percent: f64,
-    grade_code: u8,
-    lamp_index: Option<u8>,
-    lamp_judge_count: Option<u8>,
-    ex_score_percent: f64,
-    hard_ex_score_percent: f64,
-    judgment_counts: [u32; 6],
-    holds_held: u32,
-    holds_total: u32,
-    rolls_held: u32,
-    rolls_total: u32,
-    mines_avoided: u32,
-    mines_total: u32,
-    hands_achieved: u32,
-    fail_time: Option<f32>,
-    beat0_time_seconds: f32,
-    replay: Vec<LocalReplayEdgeV1>,
-}
-
-#[inline(always)]
-fn local_lamp_judge_count(count: u32) -> Option<u8> {
-    if (1..=9).contains(&count) {
-        Some(count as u8)
-    } else {
-        None
-    }
-}
-
-fn compute_local_lamp(counts: [u32; 6], grade: Grade) -> (Option<u8>, Option<u8>) {
-    if grade == Grade::Failed {
-        return (None, None);
-    }
-    if grade == Grade::Quint {
-        return (Some(0), None);
-    }
-
-    let excellent = counts[1];
-    let great = counts[2];
-    let decent = counts[3];
-    let wayoff = counts[4];
-    let miss = counts[5];
-
-    if miss == 0 && wayoff == 0 && decent == 0 && great == 0 && excellent == 0 {
-        return (Some(1), None);
-    }
-    if miss == 0 && wayoff == 0 && decent == 0 && great == 0 {
-        return (Some(2), local_lamp_judge_count(excellent));
-    }
-    if miss == 0 && wayoff == 0 && decent == 0 {
-        return (Some(3), local_lamp_judge_count(great));
-    }
-    if miss == 0 && wayoff == 0 {
-        return (Some(4), local_lamp_judge_count(decent));
-    }
-    (None, None)
-}
-
-fn decode_local_score_header(bytes: &[u8]) -> Option<LocalScoreEntryHeaderV1> {
-    let Ok((h, _)) = bincode::decode_from_slice::<LocalScoreEntryHeaderV1, _>(
-        bytes,
-        bincode::config::standard(),
-    ) else {
-        return None;
-    };
-    if h.version != LOCAL_SCORE_VERSION_V1 {
-        return None;
-    }
-    Some(h)
-}
-
-fn read_local_score_header(path: &Path) -> Option<LocalScoreEntryHeaderV1> {
+fn read_local_score_header(path: &Path) -> Option<LocalScoreHeader> {
     // Local score files include replay data; for indexing we only need the prefix.
     // A 1KiB prefix comfortably covers the fixed header fields.
     let file = fs::File::open(path).ok()?;
@@ -1097,15 +1194,9 @@ fn read_local_score_header(path: &Path) -> Option<LocalScoreEntryHeaderV1> {
     decode_local_score_header(&buf)
 }
 
-fn read_local_score_entry(path: &Path) -> Option<LocalScoreEntryV1> {
+fn read_local_score_entry(path: &Path) -> Option<LocalScoreEntry> {
     let bytes = fs::read(path).ok()?;
-    let (entry, _) =
-        bincode::decode_from_slice::<LocalScoreEntryV1, _>(&bytes, bincode::config::standard())
-            .ok()?;
-    if entry.version != LOCAL_SCORE_VERSION_V1 {
-        return None;
-    }
-    Some(entry)
+    decode_local_score_entry(&bytes)
 }
 
 fn scan_local_scores_dir(dir: &Path, index: &mut LocalScoreIndex) {
@@ -1121,70 +1212,15 @@ fn scan_local_scores_dir(dir: &Path, index: &mut LocalScoreIndex) {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if !name.ends_with(".bin") {
-            continue;
-        }
-        let base = &name[..name.len().saturating_sub(4)];
-        let Some(idx_dash) = base.rfind('-') else {
+        let Some((chart_hash, _played_at_ms)) = parse_score_file_name(name) else {
             continue;
         };
-        if idx_dash == 0 {
-            continue;
-        }
-        let chart_hash = &base[..idx_dash];
 
         let Some(h) = read_local_score_header(&path) else {
             continue;
         };
 
-        let grade = grade_from_code(h.grade_code);
-        let cached = CachedScore {
-            grade,
-            score_percent: h.score_percent,
-            lamp_index: h.lamp_index,
-            lamp_judge_count: h.lamp_judge_count,
-        };
-
-        match index.best_itg.get_mut(chart_hash) {
-            Some(existing) => {
-                if is_better_itg(&cached, existing) {
-                    *existing = cached;
-                }
-            }
-            None => {
-                index.best_itg.insert(chart_hash.to_string(), cached);
-            }
-        }
-
-        let ex = BestScalar {
-            grade,
-            percent: h.ex_score_percent,
-        };
-        match index.best_ex.get_mut(chart_hash) {
-            Some(existing) => {
-                if is_better_scalar(ex, *existing) {
-                    *existing = ex;
-                }
-            }
-            None => {
-                index.best_ex.insert(chart_hash.to_string(), ex);
-            }
-        }
-
-        let hard_ex = BestScalar {
-            grade,
-            percent: h.hard_ex_score_percent,
-        };
-        match index.best_hard_ex.get_mut(chart_hash) {
-            Some(existing) => {
-                if is_better_scalar(hard_ex, *existing) {
-                    *existing = hard_ex;
-                }
-            }
-            None => {
-                index.best_hard_ex.insert(chart_hash.to_string(), hard_ex);
-            }
-        }
+        update_local_score_index(index, chart_hash, &h);
     }
 }
 
@@ -1215,71 +1251,17 @@ fn load_local_score_index(root: &Path) -> LocalScoreIndex {
     index
 }
 
-fn update_local_index_with_header(
-    idx: &mut LocalScoreIndex,
-    chart_hash: &str,
-    h: &LocalScoreEntryHeaderV1,
-) {
-    let grade = grade_from_code(h.grade_code);
-    let cached = CachedScore {
-        grade,
-        score_percent: h.score_percent,
-        lamp_index: h.lamp_index,
-        lamp_judge_count: h.lamp_judge_count,
-    };
-    match idx.best_itg.get_mut(chart_hash) {
-        Some(existing) => {
-            if is_better_itg(&cached, existing) {
-                *existing = cached;
-            }
-        }
-        None => {
-            idx.best_itg.insert(chart_hash.to_string(), cached);
-        }
-    }
-
-    let ex = BestScalar {
-        grade,
-        percent: h.ex_score_percent,
-    };
-    match idx.best_ex.get_mut(chart_hash) {
-        Some(existing) => {
-            if is_better_scalar(ex, *existing) {
-                *existing = ex;
-            }
-        }
-        None => {
-            idx.best_ex.insert(chart_hash.to_string(), ex);
-        }
-    }
-
-    let hard_ex = BestScalar {
-        grade,
-        percent: h.hard_ex_score_percent,
-    };
-    match idx.best_hard_ex.get_mut(chart_hash) {
-        Some(existing) => {
-            if is_better_scalar(hard_ex, *existing) {
-                *existing = hard_ex;
-            }
-        }
-        None => {
-            idx.best_hard_ex.insert(chart_hash.to_string(), hard_ex);
-        }
-    }
-}
-
 fn append_local_score_on_disk(
     profile_id: &str,
     profile_initials: &str,
     chart_hash: &str,
-    entry: &mut LocalScoreEntryV1,
-) {
-    let shard = shard2_for_hash(chart_hash);
+    entry: &mut LocalScoreEntry,
+) -> bool {
+    let shard = score_file_shard(chart_hash);
     let dir = local_scores_root_for_profile(profile_id).join(shard);
     if let Err(e) = fs::create_dir_all(&dir) {
         warn!("Failed to create local scores dir {dir:?}: {e}");
-        return;
+        return false;
     }
 
     // Avoid collisions: keep the GS-like "<hash>-<ms>.bin" filename shape.
@@ -1292,46 +1274,26 @@ fn append_local_score_on_disk(
     entry.played_at_ms = played_at_ms;
 
     let tmp_path = dir.join(format!(".{chart_hash}-{played_at_ms}.tmp"));
-    let Ok(buf) = bincode::encode_to_vec(&*entry, bincode::config::standard()) else {
+    let Some(buf) = encode_local_score_entry(entry) else {
         warn!("Failed to encode local score for chart {chart_hash}");
-        return;
+        return false;
     };
     if let Err(e) = fs::write(&tmp_path, buf) {
         warn!("Failed to write local score temp file {tmp_path:?}: {e}");
-        return;
+        return false;
     }
     if let Err(e) = fs::rename(&tmp_path, &path) {
         warn!("Failed to commit local score file {path:?}: {e}");
         let _ = fs::remove_file(&tmp_path);
-        return;
+        return false;
     }
 
     // Update in-memory cache if it's already loaded for this profile.
-    let header = LocalScoreEntryHeaderV1 {
-        version: entry.version,
-        played_at_ms: entry.played_at_ms,
-        music_rate: entry.music_rate,
-        score_percent: entry.score_percent,
-        grade_code: entry.grade_code,
-        lamp_index: entry.lamp_index,
-        lamp_judge_count: entry.lamp_judge_count,
-        ex_score_percent: entry.ex_score_percent,
-        hard_ex_score_percent: entry.hard_ex_score_percent,
-        judgment_counts: entry.judgment_counts,
-        holds_held: entry.holds_held,
-        holds_total: entry.holds_total,
-        rolls_held: entry.rolls_held,
-        rolls_total: entry.rolls_total,
-        mines_avoided: entry.mines_avoided,
-        mines_total: entry.mines_total,
-        hands_achieved: entry.hands_achieved,
-        fail_time: entry.fail_time,
-        beat0_time_seconds: entry.beat0_time_seconds,
-    };
+    let header = entry.header();
     let loaded_snapshot = {
         let mut state = LOCAL_SCORE_CACHE.lock().unwrap();
         if let Some(idx) = state.loaded_profiles.get_mut(profile_id) {
-            update_local_index_with_header(idx, chart_hash, &header);
+            update_local_score_index(idx, chart_hash, &header);
             Some(idx.clone())
         } else {
             None
@@ -1342,58 +1304,92 @@ fn append_local_score_on_disk(
     } else {
         let index_path = local_score_index_path_for_profile(profile_id);
         let mut index = load_local_score_index_file(&index_path).unwrap_or_default();
-        update_local_index_with_header(&mut index, chart_hash, &header);
+        update_local_score_index(&mut index, chart_hash, &header);
         save_local_score_index_file(&index_path, &index);
     }
 
-    let cached = CachedScore {
-        grade: grade_from_code(header.grade_code),
-        score_percent: header.score_percent,
-        lamp_index: header.lamp_index,
-        lamp_judge_count: header.lamp_judge_count,
-    };
+    let cached = cached_score_from_local_header(&header);
     update_machine_cache_if_loaded(chart_hash, cached, profile_initials);
+    true
 }
 
-fn judgment_counts_arr(p: &gameplay::PlayerRuntime) -> [u32; 6] {
+/// Write a batch of imported local scores for `profile_id`. Each tuple is the
+/// DeadSync chart `short_hash` and the play to record. Returns `(written,
+/// canceled)`: the number of plays successfully written to disk, and whether the
+/// loop stopped early because `should_cancel` returned `true`.
+///
+/// This reuses the same per-play write path as live gameplay, so the per-profile
+/// best index and any loaded in-memory caches stay correct.
+///
+/// `on_progress(done, total)` is invoked after each play is processed (whether or
+/// not it was written), so a caller can drive a progress bar over the disk-write
+/// phase, which dominates import time for large histories. `should_cancel()` is
+/// polled before each write so a long import can be aborted promptly. Pass no-op
+/// closures when progress / cancellation aren't needed.
+pub fn import_local_scores<F, C>(
+    profile_id: &str,
+    profile_initials: &str,
+    scores: &mut [(String, LocalScoreEntry)],
+    mut on_progress: F,
+    should_cancel: C,
+) -> (usize, bool)
+where
+    F: FnMut(usize, usize),
+    C: Fn() -> bool,
+{
+    let total = scores.len();
+    let mut written = 0usize;
+    for (idx, (chart_hash, entry)) in scores.iter_mut().enumerate() {
+        if should_cancel() {
+            return (written, true);
+        }
+        if append_local_score_on_disk(profile_id, profile_initials, chart_hash, entry) {
+            written += 1;
+        }
+        on_progress(idx + 1, total);
+    }
+    (written, false)
+}
+
+fn judgment_counts_arr(p: &PlayerRuntime) -> [u32; 6] {
     p.judgment_counts
 }
 
-fn replay_edges_for_player(gs: &gameplay::State, player: usize) -> Vec<LocalReplayEdgeV1> {
-    if player >= gs.num_players {
+fn replay_edges_for_player(gs: &GameplayCoreState, player: usize) -> Vec<LocalReplayEdge> {
+    if player >= gs.num_players() {
         return Vec::new();
     }
 
-    let (col_start, col_end) = if gs.num_players <= 1 {
-        (0usize, gs.num_cols)
+    let (col_start, col_end) = if gs.num_players() <= 1 {
+        (0usize, gs.num_cols())
     } else {
-        let start = player.saturating_mul(gs.cols_per_player);
-        (start, start.saturating_add(gs.cols_per_player))
+        let start = player.saturating_mul(gs.cols_per_player());
+        (start, start.saturating_add(gs.cols_per_player()))
     };
 
     let mut out = Vec::new();
-    out.reserve(gs.replay_edges.len().min(4096));
-    for e in &gs.replay_edges {
+    let replay_edges = gs.recorded_replay_edges();
+    out.reserve(replay_edges.len().min(4096));
+    for e in replay_edges {
         let lane = e.lane_index as usize;
-        if lane < col_start || lane >= col_end || !e.event_music_time.is_finite() {
+        if lane < col_start
+            || lane >= col_end
+            || deadsync_core::song_time::song_time_ns_invalid(e.event_music_time_ns)
+        {
             continue;
         }
-        let source = match e.source {
-            InputSource::Keyboard => 0,
-            InputSource::Gamepad => 1,
-        };
-        out.push(LocalReplayEdgeV1 {
-            event_music_time: e.event_music_time,
-            lane: (lane - col_start) as u8,
-            pressed: e.pressed,
-            source,
-        });
+        out.push(LocalReplayEdge::new(
+            e.event_music_time_ns,
+            (lane - col_start) as u8,
+            e.pressed,
+            e.source,
+        ));
     }
     out
 }
 
-pub fn save_local_scores_from_gameplay(gs: &gameplay::State) {
-    if gs.autoplay_used {
+pub fn save_local_scores_from_gameplay(gs: &GameplayCoreState) {
+    if gs.autoplay_used() {
         debug!("Skipping local score save: autoplay was used during this stage.");
         return;
     }
@@ -1406,20 +1402,12 @@ pub fn save_local_scores_from_gameplay(gs: &gameplay::State) {
     // Parameter retained for parity with Simply Love helpers; currently unused.
     let mines_disabled = false;
 
-    for player_idx in 0..gs.num_players {
-        if !gs.score_valid[player_idx] {
-            debug!(
-                "Skipping local score save for player {}: ranking-invalid modifiers were used.",
-                player_idx + 1
-            );
-            continue;
-        }
-
-        let side = if gs.num_players >= 2 {
+    for player_idx in 0..gs.num_players() {
+        let side = if gs.num_players() >= 2 {
             if player_idx == 0 {
-                profile::PlayerSide::P1
+                profile_data::PlayerSide::P1
             } else {
-                profile::PlayerSide::P2
+                profile_data::PlayerSide::P2
             }
         } else {
             profile::get_session_player_side()
@@ -1428,65 +1416,90 @@ pub fn save_local_scores_from_gameplay(gs: &gameplay::State) {
         let Some(profile_id) = profile::active_local_profile_id_for_side(side) else {
             continue;
         };
+        if !gs.score_valid_for_player(player_idx) {
+            let reasons = score_invalid_reason_lines_for_profile(
+                &gs.charts()[player_idx],
+                &gs.profiles()[player_idx],
+                gs.music_rate(),
+            );
+            let detail = if reasons.is_empty() {
+                "ranking-invalid modifiers were used".to_string()
+            } else {
+                reasons.join("; ")
+            };
+            debug!(
+                "Skipping local score save for player {}: {}.",
+                player_idx + 1,
+                detail
+            );
+            continue;
+        }
 
-        let chart_hash = gs.charts[player_idx].short_hash.as_str();
-        let p = &gs.players[player_idx];
+        let chart_hash = gs.charts()[player_idx].short_hash.as_str();
+        let p = &gs.players()[player_idx];
+        let totals = gs.display_totals_for_player(player_idx);
 
         let score_percent = judgment::calculate_itg_score_percent_from_counts(
             &p.scoring_counts,
             p.holds_held_for_score,
             p.rolls_held_for_score,
             p.mines_hit_for_score,
-            gs.possible_grade_points[player_idx],
+            totals.possible_grade_points,
         );
 
-        let mut grade = if p.is_failing || !gs.song_completed_naturally {
-            Grade::Failed
-        } else {
+        let mut grade = if gameplay_run_passed(
+            gs.song_completed_naturally(),
+            p.is_failing,
+            p.life,
+            p.fail_time.is_some(),
+        ) {
             score_to_grade(score_percent * 10000.0)
+        } else {
+            Grade::Failed
         };
 
-        let (start, end) = gs.note_ranges[player_idx];
-        let notes = &gs.notes[start..end];
-        let note_times = &gs.note_time_cache[start..end];
-        let hold_end_times = &gs.hold_end_time_cache[start..end];
+        let (start, end) = gs.note_range_for_player(player_idx);
+        let notes = &gs.notes()[start..end];
+        let note_times = &gs.note_time_cache_ns()[start..end];
+        let hold_end_times = &gs.hold_end_time_cache_ns()[start..end];
 
         let ex_score_percent = judgment::calculate_ex_score_from_notes(
             notes,
             note_times,
             hold_end_times,
-            gs.total_steps[player_idx],
-            gs.holds_total[player_idx],
-            gs.rolls_total[player_idx],
-            gs.mines_total[player_idx],
-            p.fail_time,
+            totals.total_steps,
+            totals.holds_total,
+            totals.rolls_total,
+            totals.mines_total,
+            p.fail_time
+                .map(deadsync_core::song_time::song_time_ns_from_seconds),
             mines_disabled,
         );
         let hard_ex_score_percent = judgment::calculate_hard_ex_score_from_notes(
             notes,
             note_times,
             hold_end_times,
-            gs.total_steps[player_idx],
-            gs.holds_total[player_idx],
-            gs.rolls_total[player_idx],
-            gs.mines_total[player_idx],
-            p.fail_time,
+            totals.total_steps,
+            totals.holds_total,
+            totals.rolls_total,
+            totals.mines_total,
+            p.fail_time
+                .map(deadsync_core::song_time::song_time_ns_from_seconds),
             mines_disabled,
         );
 
-        // Simply Love: show Quint (Grade_Tier00) if EX score is exactly 100.00.
-        if grade != Grade::Failed && ex_score_percent >= 100.0 {
-            grade = Grade::Quint;
-        }
+        // Quint comes from the achieved result, not the active UI display mode.
+        grade = promote_quint_grade(grade, ex_score_percent);
 
         let counts = judgment_counts_arr(p);
-        let (lamp_index, lamp_judge_count) = compute_local_lamp(counts, grade);
+        let white_fantastics = Some(gs.live_window_counts(player_idx).w1);
+        let (lamp_index, lamp_judge_count) = compute_local_lamp(counts, grade, white_fantastics);
         let replay = replay_edges_for_player(gs, player_idx);
 
-        let mut entry = LocalScoreEntryV1 {
-            version: LOCAL_SCORE_VERSION_V1,
+        let mut entry = LocalScoreEntry {
+            version: LOCAL_SCORE_VERSION,
             played_at_ms: now_ms,
-            music_rate: gs.music_rate,
+            music_rate: gs.music_rate(),
             score_percent,
             grade_code: grade_to_code(grade),
             lamp_index,
@@ -1495,832 +1508,53 @@ pub fn save_local_scores_from_gameplay(gs: &gameplay::State) {
             hard_ex_score_percent,
             judgment_counts: counts,
             holds_held: p.holds_held,
-            holds_total: gs.holds_total[player_idx],
+            holds_total: totals.holds_total,
             rolls_held: p.rolls_held,
-            rolls_total: gs.rolls_total[player_idx],
+            rolls_total: totals.rolls_total,
             mines_avoided: p.mines_avoided,
-            mines_total: gs.mines_total[player_idx],
+            mines_total: totals.mines_total,
             hands_achieved: p.hands_achieved,
             fail_time: p.fail_time,
-            beat0_time_seconds: gs.timing_players[player_idx].get_time_for_beat(0.0),
+            beat0_time_ns: gs
+                .timing_for_player(player_idx)
+                .map(|timing| timing.get_time_for_beat_ns(0.0))
+                .unwrap_or(0),
             replay,
         };
 
         append_local_score_on_disk(
             &profile_id,
-            gs.player_profiles[player_idx].player_initials.as_str(),
+            gs.profiles()[player_idx].player_initials.as_str(),
             chart_hash,
             &mut entry,
         );
     }
 }
 
-const ARROWCLOUD_BODY_VERSION: &str = "1.4";
-const ARROWCLOUD_ENGINE_NAME: &str = "DeadSync";
-const ARROWCLOUD_ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
-const ARROWCLOUD_SUBMIT_BASE_URL: &str = "https://api.arrowcloud.dance";
-const ARROWCLOUD_LIFEBAR_POINTS: usize = 100;
-const ARROWCLOUD_ACCEL_NAMES: [&str; 5] = ["Boost", "Brake", "Wave", "Expand", "Boomerang"];
-const ARROWCLOUD_EFFECT_NAMES: [&str; 10] = [
-    "Drunk",
-    "Dizzy",
-    "Confusion",
-    "Big",
-    "Flip",
-    "Invert",
-    "Tornado",
-    "Tipsy",
-    "Bumpy",
-    "Beat",
-];
-const ARROWCLOUD_APPEARANCE_NAMES: [&str; 5] = ["Hidden", "Sudden", "Stealth", "Blink", "R.Vanish"];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ArrowCloudSubmitUiStatus {
-    Submitting,
-    Submitted,
-    SubmitFailed,
-    TimedOut,
-}
-
-#[derive(Debug, Clone)]
-struct ArrowCloudSubmitUiEntry {
-    chart_hash: String,
-    token: u64,
-    status: ArrowCloudSubmitUiStatus,
-}
-
-static ARROWCLOUD_SUBMIT_UI_STATUS: std::sync::LazyLock<
-    Mutex<[Option<ArrowCloudSubmitUiEntry>; 2]>,
-> = std::sync::LazyLock::new(|| Mutex::new(std::array::from_fn(|_| None)));
-static ARROWCLOUD_SUBMIT_UI_TOKEN: AtomicU64 = AtomicU64::new(1);
-
 #[inline(always)]
-const fn arrowcloud_side_ix(side: profile::PlayerSide) -> usize {
-    match side {
-        profile::PlayerSide::P1 => 0,
-        profile::PlayerSide::P2 => 1,
-    }
-}
-
-#[inline(always)]
-fn arrowcloud_reset_submit_ui_status(side: profile::PlayerSide, chart_hash: &str) {
-    let hash = chart_hash.trim();
-    if hash.is_empty() {
-        return;
-    }
-    let mut state = ARROWCLOUD_SUBMIT_UI_STATUS.lock().unwrap();
-    let slot = &mut state[arrowcloud_side_ix(side)];
-    if slot
-        .as_ref()
-        .is_some_and(|entry| entry.chart_hash.eq_ignore_ascii_case(hash))
-    {
-        *slot = None;
-    }
-}
-
-#[inline(always)]
-fn arrowcloud_set_submit_ui_status(
-    side: profile::PlayerSide,
-    chart_hash: &str,
-    token: u64,
-    status: ArrowCloudSubmitUiStatus,
-) {
-    let hash = chart_hash.trim();
-    if hash.is_empty() {
-        return;
-    }
-    let mut state = ARROWCLOUD_SUBMIT_UI_STATUS.lock().unwrap();
-    state[arrowcloud_side_ix(side)] = Some(ArrowCloudSubmitUiEntry {
-        chart_hash: hash.to_string(),
-        token,
-        status,
-    });
-}
-
-#[inline(always)]
-fn arrowcloud_update_submit_ui_status_if_token(
-    side: profile::PlayerSide,
-    chart_hash: &str,
-    token: u64,
-    status: ArrowCloudSubmitUiStatus,
-) {
-    let mut state = ARROWCLOUD_SUBMIT_UI_STATUS.lock().unwrap();
-    let Some(entry) = state[arrowcloud_side_ix(side)].as_mut() else {
-        return;
-    };
-    if entry.token != token || !entry.chart_hash.eq_ignore_ascii_case(chart_hash) {
-        return;
-    }
-    entry.status = status;
-}
-
-#[inline(always)]
-fn arrowcloud_next_submit_ui_token() -> u64 {
-    ARROWCLOUD_SUBMIT_UI_TOKEN.fetch_add(1, AtomicOrdering::Relaxed)
-}
-
-pub fn get_arrowcloud_submit_ui_status_for_side(
-    chart_hash: &str,
-    side: profile::PlayerSide,
-) -> Option<ArrowCloudSubmitUiStatus> {
-    let hash = chart_hash.trim();
-    if hash.is_empty() {
-        return None;
-    }
-    ARROWCLOUD_SUBMIT_UI_STATUS.lock().unwrap()[arrowcloud_side_ix(side)]
-        .as_ref()
-        .filter(|entry| entry.chart_hash.eq_ignore_ascii_case(hash))
-        .map(|entry| entry.status)
-}
-
-#[derive(Debug, Serialize)]
-struct ArrowCloudSpeed {
-    value: f64,
-    #[serde(rename = "type")]
-    speed_type: &'static str,
-}
-
-#[derive(Debug, Serialize)]
-struct ArrowCloudModifiers {
-    #[serde(rename = "visualDelay")]
-    visual_delay: i32,
-    acceleration: Vec<String>,
-    appearance: Vec<String>,
-    effect: Vec<String>,
-    mini: i32,
-    turn: String,
-    #[serde(rename = "disabledWindows")]
-    disabled_windows: String,
-    speed: ArrowCloudSpeed,
-    perspective: String,
-    noteskin: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    scroll: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct ArrowCloudRadar {
-    #[serde(rename = "Holds")]
-    holds: [u32; 2],
-    #[serde(rename = "Mines")]
-    mines: [u32; 2],
-    #[serde(rename = "Rolls")]
-    rolls: [u32; 2],
-}
-
-#[derive(Debug, Serialize)]
-struct ArrowCloudLifePoint {
-    x: f64,
-    y: f64,
-}
-
-#[derive(Debug, Serialize)]
-struct ArrowCloudNpsPoint {
-    x: f64,
-    y: f64,
-    measure: u32,
-    nps: f64,
-}
-
-#[derive(Debug, Serialize)]
-struct ArrowCloudNpsInfo {
-    #[serde(rename = "peakNPS")]
-    peak_nps: f64,
-    points: Vec<ArrowCloudNpsPoint>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(untagged)]
-enum ArrowCloudTimingOffset {
-    Seconds(f64),
-    Miss(&'static str),
-}
-
-type ArrowCloudTimingDatum = (f64, ArrowCloudTimingOffset);
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ArrowCloudJudgmentCounts {
-    fantastic_plus: u32,
-    fantastic: u32,
-    excellent: u32,
-    great: u32,
-    decent: u32,
-    way_off: u32,
-    miss: u32,
-    total_steps: u32,
-    holds_held: u32,
-    total_holds: u32,
-    mines_hit: u32,
-    total_mines: u32,
-    rolls_held: u32,
-    total_rolls: u32,
-}
-
-#[derive(Debug, Serialize)]
-struct ArrowCloudPayload {
-    #[serde(rename = "songName")]
-    song_name: String,
-    artist: String,
-    pack: String,
-    length: String,
-    hash: String,
-    #[serde(rename = "timingData")]
-    timing_data: Vec<ArrowCloudTimingDatum>,
-    difficulty: u32,
-    stepartist: String,
-    radar: ArrowCloudRadar,
-    #[serde(rename = "judgmentCounts")]
-    judgment_counts: ArrowCloudJudgmentCounts,
-    #[serde(rename = "npsInfo")]
-    nps_info: ArrowCloudNpsInfo,
-    #[serde(rename = "lifebarInfo")]
-    lifebar_info: Vec<ArrowCloudLifePoint>,
-    modifiers: ArrowCloudModifiers,
-    #[serde(rename = "musicRate")]
-    music_rate: f64,
-    #[serde(rename = "usedAutoplay")]
-    used_autoplay: bool,
-    passed: bool,
-    #[serde(rename = "bodyVersion")]
-    body_version: &'static str,
-    #[serde(rename = "_arrowCloudBodyVersion")]
-    arrow_cloud_body_version: &'static str,
-    #[serde(rename = "_engineName")]
-    engine_name: &'static str,
-    #[serde(rename = "_engineVersion")]
-    engine_version: &'static str,
-}
-
-#[derive(Debug)]
-struct ArrowCloudSubmitJob {
-    side: profile::PlayerSide,
-    api_key: String,
-    token: u64,
-    payload: ArrowCloudPayload,
-}
-
-#[derive(Debug)]
-struct ArrowCloudSubmitError {
-    status: ArrowCloudSubmitUiStatus,
-    message: String,
-}
-
-#[inline(always)]
-fn gameplay_side_for_player(gs: &gameplay::State, player_idx: usize) -> profile::PlayerSide {
-    if gs.num_players >= 2 {
-        if player_idx == 0 {
-            profile::PlayerSide::P1
-        } else {
-            profile::PlayerSide::P2
-        }
+pub(super) fn gameplay_side_for_player(
+    gs: &GameplayCoreState,
+    player_idx: usize,
+) -> profile_data::PlayerSide {
+    if gs.num_players() >= 2 {
+        profile_data::player_side_for_index(player_idx)
     } else {
         profile::get_session_player_side()
     }
 }
 
 #[inline(always)]
-fn arrowcloud_format_length(seconds: f32) -> String {
-    if !seconds.is_finite() || seconds <= 0.0 {
-        return "0:00".to_string();
-    }
-    let total = seconds.floor() as i64;
-    if total >= 3600 {
-        format!(
-            "{}:{:02}:{:02}",
-            total / 3600,
-            (total % 3600) / 60,
-            total % 60
-        )
-    } else {
-        format!("{}:{:02}", total / 60, total % 60)
-    }
-}
-
-#[inline(always)]
-fn arrowcloud_mask_labels_u8(mask: u8, names: &[&str]) -> Vec<String> {
-    let mut out = Vec::new();
-    for (i, name) in names.iter().enumerate() {
-        if (mask & (1u8 << i)) != 0 {
-            out.push((*name).to_string());
-        }
-    }
-    out
-}
-
-#[inline(always)]
-fn arrowcloud_mask_labels_u16(mask: u16, names: &[&str]) -> Vec<String> {
-    let mut out = Vec::new();
-    for (i, name) in names.iter().enumerate() {
-        if (mask & (1u16 << i)) != 0 {
-            out.push((*name).to_string());
-        }
-    }
-    out
-}
-
-#[inline(always)]
-fn arrowcloud_turn_label(turn: profile::TurnOption) -> &'static str {
-    match turn {
-        profile::TurnOption::None => "None",
-        profile::TurnOption::Mirror => "Mirror",
-        profile::TurnOption::Left => "Left",
-        profile::TurnOption::Right => "Right",
-        profile::TurnOption::LRMirror => "LR-Mirror",
-        profile::TurnOption::UDMirror => "UD-Mirror",
-        profile::TurnOption::Shuffle
-        | profile::TurnOption::Blender
-        | profile::TurnOption::Random => "Shuffle",
-    }
-}
-
-#[inline(always)]
-fn arrowcloud_scroll_label(scroll: profile::ScrollOption) -> Option<String> {
-    if scroll.contains(profile::ScrollOption::Reverse) {
-        Some("Reverse".to_string())
-    } else if scroll.contains(profile::ScrollOption::Split) {
-        Some("Split".to_string())
-    } else if scroll.contains(profile::ScrollOption::Alternate) {
-        Some("Alternate".to_string())
-    } else if scroll.contains(profile::ScrollOption::Cross) {
-        Some("Cross".to_string())
-    } else if scroll.contains(profile::ScrollOption::Centered) {
-        Some("Centered".to_string())
-    } else {
-        None
-    }
-}
-
-#[inline(always)]
-fn arrowcloud_speed_payload(speed: crate::game::scroll::ScrollSpeedSetting) -> ArrowCloudSpeed {
-    match speed {
-        crate::game::scroll::ScrollSpeedSetting::CMod(v) => ArrowCloudSpeed {
-            value: v as f64,
-            speed_type: "C",
-        },
-        crate::game::scroll::ScrollSpeedSetting::MMod(v) => ArrowCloudSpeed {
-            value: v as f64,
-            speed_type: "M",
-        },
-        crate::game::scroll::ScrollSpeedSetting::XMod(v) => ArrowCloudSpeed {
-            value: ((v as f64) * 100.0).round() / 100.0,
-            speed_type: "X",
-        },
-    }
-}
-
-#[inline(always)]
-fn arrowcloud_modifiers(profile: &Profile) -> ArrowCloudModifiers {
-    ArrowCloudModifiers {
-        visual_delay: profile.visual_delay_ms,
-        acceleration: arrowcloud_mask_labels_u8(
-            profile::normalize_accel_effects_mask(profile.accel_effects_active_mask),
-            &ARROWCLOUD_ACCEL_NAMES,
-        ),
-        appearance: arrowcloud_mask_labels_u8(
-            profile::normalize_appearance_effects_mask(profile.appearance_effects_active_mask),
-            &ARROWCLOUD_APPEARANCE_NAMES,
-        ),
-        effect: arrowcloud_mask_labels_u16(
-            profile::normalize_visual_effects_mask(profile.visual_effects_active_mask),
-            &ARROWCLOUD_EFFECT_NAMES,
-        ),
-        mini: profile.mini_percent.clamp(-100, 150),
-        turn: arrowcloud_turn_label(profile.turn_option).to_string(),
-        disabled_windows: "None".to_string(),
-        speed: arrowcloud_speed_payload(profile.scroll_speed),
-        perspective: profile.perspective.to_string(),
-        noteskin: profile.noteskin.as_str().to_string(),
-        scroll: arrowcloud_scroll_label(profile.scroll_option),
-    }
-}
-
-#[inline(always)]
-fn arrowcloud_life_lerp_at(life_history: &[(f32, f32)], sample_time: f32) -> f32 {
-    let Some(&(_, first_life)) = life_history.first() else {
-        return 0.0;
-    };
-    if life_history.len() == 1 {
-        return first_life.clamp(0.0, 1.0);
-    }
-
-    let later_ix = life_history.partition_point(|&(t, _)| t <= sample_time);
-    let earlier_ix = later_ix.saturating_sub(1).min(life_history.len() - 1);
-    let (earlier_t, earlier_life) = life_history[earlier_ix];
-    if later_ix >= life_history.len() {
-        return earlier_life.clamp(0.0, 1.0);
-    }
-
-    let (later_t, later_life) = life_history[later_ix];
-    let dt = later_t - earlier_t;
-    if dt.abs() <= f32::EPSILON {
-        return earlier_life.clamp(0.0, 1.0);
-    }
-    let alpha = ((sample_time - earlier_t) / dt).clamp(0.0, 1.0);
-    (earlier_life + (later_life - earlier_life) * alpha).clamp(0.0, 1.0)
-}
-
-#[inline(always)]
-fn arrowcloud_lifebar_points(gs: &gameplay::State, player_idx: usize) -> Vec<ArrowCloudLifePoint> {
-    let life_history = gs.players[player_idx].life_history.as_slice();
-    if life_history.is_empty() {
-        return Vec::new();
-    }
-    let (start, end) = gs.note_ranges[player_idx];
-    let note_times = &gs.note_time_cache[start..end];
-    let first_second = gs.density_graph_first_second.min(0.0);
-    let last_second = gs.density_graph_last_second.max(first_second);
-    let chart_start_second = note_times
-        .iter()
-        .copied()
-        .find(|t| t.is_finite())
-        .unwrap_or(first_second);
-    let duration = (last_second - first_second).max(0.0);
-    let step = duration / ARROWCLOUD_LIFEBAR_POINTS as f32;
-
-    let mut out = Vec::with_capacity(ARROWCLOUD_LIFEBAR_POINTS);
-    for i in 0..ARROWCLOUD_LIFEBAR_POINTS {
-        let x = chart_start_second + (i as f32 * step);
-        out.push(ArrowCloudLifePoint {
-            x: x as f64,
-            y: arrowcloud_life_lerp_at(life_history, x) as f64,
-        });
-    }
-    out
-}
-
-#[inline(always)]
-fn arrowcloud_timing_data_from_scatter(
-    scatter: &[crate::game::timing::ScatterPoint],
-) -> Vec<ArrowCloudTimingDatum> {
-    let mut out = Vec::with_capacity(scatter.len());
-    for point in scatter {
-        if !point.time_sec.is_finite() {
-            continue;
-        }
-        let value = if let Some(offset_ms) = point.offset_ms {
-            if !offset_ms.is_finite() {
-                continue;
-            }
-            ArrowCloudTimingOffset::Seconds((offset_ms / 1000.0) as f64)
-        } else {
-            ArrowCloudTimingOffset::Miss("Miss")
-        };
-        out.push((point.time_sec as f64, value));
-    }
-    out
-}
-
-#[inline(always)]
-fn arrowcloud_timing_data(gs: &gameplay::State, player_idx: usize) -> Vec<ArrowCloudTimingDatum> {
-    let (start, end) = gs.note_ranges[player_idx];
-    let notes = &gs.notes[start..end];
-    let note_times = &gs.note_time_cache[start..end];
-    let col_offset = player_idx.saturating_mul(gs.cols_per_player);
-    let scatter = crate::game::timing::build_scatter_points(
-        notes,
-        note_times,
-        col_offset,
-        gs.cols_per_player,
-        &gs.mini_indicator_stream_segments[player_idx],
-    );
-    arrowcloud_timing_data_from_scatter(&scatter)
-}
-
-#[inline(always)]
-fn arrowcloud_nps_info(gs: &gameplay::State, player_idx: usize) -> ArrowCloudNpsInfo {
-    let chart = gs.charts[player_idx].as_ref();
-    let first_second = gs.density_graph_first_second.min(0.0);
-    let last_second = gs.density_graph_last_second.max(first_second);
-    let peak_nps = if chart.max_nps.is_finite() && chart.max_nps > 0.0 {
-        chart.max_nps
-    } else {
-        0.0
-    };
-
-    let mut points = Vec::with_capacity(chart.measure_nps_vec.len());
-    let mut started = false;
-    for (measure, nps) in chart.measure_nps_vec.iter().copied().enumerate() {
-        if !nps.is_finite() {
-            continue;
-        }
-        if nps > 0.0 {
-            started = true;
-        }
-        if !started {
-            continue;
-        }
-        let t = chart.timing.get_time_for_beat((measure as f32) * 4.0);
-        let x = if last_second > first_second {
-            ((t - first_second) / (last_second - first_second)).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let y = if peak_nps > 0.0 {
-            (nps / peak_nps).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        points.push(ArrowCloudNpsPoint {
-            x: x as f64,
-            y: y as f64,
-            measure: measure as u32,
-            nps,
-        });
-    }
-
-    ArrowCloudNpsInfo { peak_nps, points }
-}
-
-#[inline(always)]
-fn arrowcloud_judgment_counts(gs: &gameplay::State, player_idx: usize) -> ArrowCloudJudgmentCounts {
-    let player = &gs.players[player_idx];
-    let counts = player.judgment_counts;
-    let windows = gs.live_window_counts[player_idx];
-    let fantastic_total = counts[judgment::judge_grade_ix(judgment::JudgeGrade::Fantastic)];
-    let fantastic_plus = windows.w0;
-    let fantastic = fantastic_total.saturating_sub(fantastic_plus);
-    let excellent = counts[judgment::judge_grade_ix(judgment::JudgeGrade::Excellent)];
-    let great = counts[judgment::judge_grade_ix(judgment::JudgeGrade::Great)];
-    let decent = counts[judgment::judge_grade_ix(judgment::JudgeGrade::Decent)];
-    let way_off = counts[judgment::judge_grade_ix(judgment::JudgeGrade::WayOff)];
-    let miss = counts[judgment::judge_grade_ix(judgment::JudgeGrade::Miss)];
-    let mut total_steps = 0u32;
-    for count in counts {
-        total_steps = total_steps.saturating_add(count);
-    }
-
-    ArrowCloudJudgmentCounts {
-        fantastic_plus,
-        fantastic,
-        excellent,
-        great,
-        decent,
-        way_off,
-        miss,
-        total_steps,
-        holds_held: player.holds_held,
-        total_holds: gs.holds_total[player_idx],
-        mines_hit: player.mines_hit,
-        total_mines: gs.mines_total[player_idx],
-        rolls_held: player.rolls_held,
-        total_rolls: gs.rolls_total[player_idx],
-    }
-}
-
-#[inline(always)]
-fn arrowcloud_payload_for_player(
-    gs: &gameplay::State,
-    player_idx: usize,
-) -> Option<ArrowCloudPayload> {
-    if player_idx >= gs.num_players {
-        return None;
-    }
-    let chart = gs.charts[player_idx].as_ref();
-    let profile = &gs.player_profiles[player_idx];
-    let player = &gs.players[player_idx];
-    let pack = gs.pack_group.trim().to_string();
-    let song_name = gs.song.display_full_title(true);
-    let music_rate = if gs.music_rate.is_finite() && gs.music_rate > 0.0 {
-        gs.music_rate as f64
-    } else {
-        1.0
-    };
-    let passed = !player.is_failing && gs.song_completed_naturally;
-
-    Some(ArrowCloudPayload {
-        song_name,
-        artist: gs.song.artist.clone(),
-        pack,
-        length: arrowcloud_format_length(gs.song.music_length_seconds),
-        hash: chart.short_hash.clone(),
-        timing_data: arrowcloud_timing_data(gs, player_idx),
-        difficulty: chart.meter,
-        stepartist: chart.step_artist.clone(),
-        radar: ArrowCloudRadar {
-            holds: [player.holds_held, gs.holds_total[player_idx]],
-            mines: [player.mines_avoided, gs.mines_total[player_idx]],
-            rolls: [player.rolls_held, gs.rolls_total[player_idx]],
-        },
-        judgment_counts: arrowcloud_judgment_counts(gs, player_idx),
-        nps_info: arrowcloud_nps_info(gs, player_idx),
-        lifebar_info: arrowcloud_lifebar_points(gs, player_idx),
-        modifiers: arrowcloud_modifiers(profile),
-        music_rate,
-        used_autoplay: gs.autoplay_used,
-        passed,
-        body_version: ARROWCLOUD_BODY_VERSION,
-        arrow_cloud_body_version: ARROWCLOUD_BODY_VERSION,
-        engine_name: ARROWCLOUD_ENGINE_NAME,
-        engine_version: ARROWCLOUD_ENGINE_VERSION,
-    })
-}
-
-#[inline(always)]
-fn arrowcloud_submit_url(chart_hash: &str) -> Option<String> {
-    let hash = chart_hash.trim();
-    if hash.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "{}/v1/chart/{hash}/play",
-        ARROWCLOUD_SUBMIT_BASE_URL.trim_end_matches('/')
-    ))
-}
-
-#[inline(always)]
-fn arrowcloud_log_snippet(text: &str) -> String {
-    const MAX_LOG_CHARS: usize = 256;
-    if text.is_empty() {
-        return String::new();
-    }
-    let mut out = String::with_capacity(text.len().min(MAX_LOG_CHARS));
-    for ch in text.chars().take(MAX_LOG_CHARS) {
-        out.push(ch);
-    }
-    out
-}
-
-fn submit_arrowcloud_payload(
-    side: profile::PlayerSide,
-    api_key: &str,
-    payload: &ArrowCloudPayload,
-) -> Result<(), ArrowCloudSubmitError> {
-    let api_key = api_key.trim();
-    if api_key.is_empty() {
-        return Err(ArrowCloudSubmitError {
-            status: ArrowCloudSubmitUiStatus::SubmitFailed,
-            message: "missing ArrowCloud API key".to_string(),
-        });
-    }
-    let Some(url) = arrowcloud_submit_url(payload.hash.as_str()) else {
-        return Err(ArrowCloudSubmitError {
-            status: ArrowCloudSubmitUiStatus::SubmitFailed,
-            message: "missing chart hash".to_string(),
-        });
-    };
-
-    let bearer = format!("Bearer {api_key}");
-    let agent = network::get_agent();
-    let response = agent
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .header("Authorization", &bearer)
-        .send_json(payload)
-        .map_err(|e| {
-            let msg = format!("network error: {e}");
-            let lower = msg.to_ascii_lowercase();
-            ArrowCloudSubmitError {
-                status: if lower.contains("timeout") || lower.contains("timed out") {
-                    ArrowCloudSubmitUiStatus::TimedOut
-                } else {
-                    ArrowCloudSubmitUiStatus::SubmitFailed
-                },
-                message: msg,
-            }
-        })?;
-    let status = response.status();
-    let status_code = status.as_u16();
-    let body = response.into_body().read_to_string().unwrap_or_default();
-    if status.is_success() {
-        let snippet = arrowcloud_log_snippet(body.as_str());
-        if !snippet.is_empty() {
-            debug!(
-                "ArrowCloud submit success for {:?} ({}) status={} body='{}'",
-                side,
-                payload.hash,
-                status_code,
-                snippet.as_str()
-            );
-        } else {
-            debug!(
-                "ArrowCloud submit success for {:?} ({}) status={}",
-                side, payload.hash, status_code
-            );
-        }
-        return Ok(());
-    }
-
-    let snippet = arrowcloud_log_snippet(body.as_str());
-    let status_kind = if status_code == 408 || status_code == 504 {
-        ArrowCloudSubmitUiStatus::TimedOut
-    } else {
-        ArrowCloudSubmitUiStatus::SubmitFailed
-    };
-    if snippet.is_empty() {
-        Err(ArrowCloudSubmitError {
-            status: status_kind,
-            message: format!("HTTP {status_code}"),
-        })
-    } else {
-        Err(ArrowCloudSubmitError {
-            status: status_kind,
-            message: format!("HTTP {status_code}: {}", snippet.as_str()),
-        })
-    }
-}
-
-pub fn submit_arrowcloud_payloads_from_gameplay(gs: &gameplay::State) {
-    for player_idx in 0..gs.num_players.min(gameplay::MAX_PLAYERS) {
-        let side = gameplay_side_for_player(gs, player_idx);
-        let chart_hash = gs.charts[player_idx].short_hash.as_str();
-        arrowcloud_reset_submit_ui_status(side, chart_hash);
-    }
-
-    let cfg = crate::config::get();
-    if !cfg.enable_arrowcloud || gs.num_players == 0 {
-        return;
-    }
-    if gs.autoplay_used {
-        debug!("Skipping ArrowCloud submit: autoplay/replay was used.");
-        return;
-    }
-    if gs.course_display_totals.is_some() && !cfg.autosubmit_course_scores_individually {
-        debug!("Skipping ArrowCloud submit: course per-song autosubmit is disabled.");
-        return;
-    }
-    if let network::ArrowCloudConnectionStatus::Error(msg) = network::get_arrowcloud_status() {
-        warn!("Skipping ArrowCloud submit due to connection status error: {msg}");
-        return;
-    }
-
-    let mut jobs = Vec::with_capacity(gs.num_players.min(gameplay::MAX_PLAYERS));
-    for player_idx in 0..gs.num_players.min(gameplay::MAX_PLAYERS) {
-        if !gs.score_valid[player_idx] {
-            debug!(
-                "Skipping ArrowCloud submit for player {}: ranking-invalid modifiers were used.",
-                player_idx + 1
-            );
-            continue;
-        }
-
-        let side = gameplay_side_for_player(gs, player_idx);
-        let api_key = gs.player_profiles[player_idx].arrowcloud_api_key.trim();
-        if api_key.is_empty() {
-            continue;
-        }
-        let Some(payload) = arrowcloud_payload_for_player(gs, player_idx) else {
-            continue;
-        };
-        if !payload.passed {
-            debug!(
-                "Skipping ArrowCloud submit for {:?} ({}) : song was not passed.",
-                side, payload.hash
-            );
-            continue;
-        }
-        let token = arrowcloud_next_submit_ui_token();
-        arrowcloud_set_submit_ui_status(
-            side,
-            payload.hash.as_str(),
-            token,
-            ArrowCloudSubmitUiStatus::Submitting,
-        );
-        jobs.push(ArrowCloudSubmitJob {
-            side,
-            api_key: api_key.to_string(),
-            token,
-            payload,
-        });
-    }
-    if jobs.is_empty() {
-        return;
-    }
-
-    std::thread::spawn(move || {
-        for job in jobs {
-            match submit_arrowcloud_payload(job.side, &job.api_key, &job.payload) {
-                Ok(()) => arrowcloud_update_submit_ui_status_if_token(
-                    job.side,
-                    job.payload.hash.as_str(),
-                    job.token,
-                    ArrowCloudSubmitUiStatus::Submitted,
-                ),
-                Err(err) => {
-                    arrowcloud_update_submit_ui_status_if_token(
-                        job.side,
-                        job.payload.hash.as_str(),
-                        job.token,
-                        err.status,
-                    );
-                    warn!(
-                        "ArrowCloud submit failed for {:?} ({}) : {}",
-                        job.side, job.payload.hash, err.message
-                    );
-                }
-            }
-        }
-    });
-}
-
 pub fn save_local_summary_score_for_side(
     chart_hash: &str,
-    side: profile::PlayerSide,
+    side: profile_data::PlayerSide,
     music_rate: f32,
     summary: &stage_stats::PlayerStageSummary,
 ) {
     if chart_hash.trim().is_empty() {
+        return;
+    }
+    if summary.disqualified {
+        debug!("Skipping local summary score save: run was disqualified.");
         return;
     }
     if !summary.score_valid {
@@ -2347,9 +1581,10 @@ pub fn save_local_summary_score_for_side(
         summary.window_counts.w5,
         summary.window_counts.miss,
     ];
-    let (lamp_index, lamp_judge_count) = compute_local_lamp(counts, summary.grade);
-    let mut entry = LocalScoreEntryV1 {
-        version: LOCAL_SCORE_VERSION_V1,
+    let (lamp_index, lamp_judge_count) =
+        compute_local_lamp(counts, summary.grade, Some(summary.window_counts.w1));
+    let mut entry = LocalScoreEntry {
+        version: LOCAL_SCORE_VERSION,
         played_at_ms: now_ms,
         music_rate: if music_rate.is_finite() && music_rate > 0.0 {
             music_rate
@@ -2371,7 +1606,7 @@ pub fn save_local_summary_score_for_side(
         mines_total: 0,
         hands_achieved: 0,
         fail_time: (summary.grade == Grade::Failed).then_some(0.0),
-        beat0_time_seconds: 0.0,
+        beat0_time_ns: 0,
         replay: Vec::new(),
     };
     append_local_score_on_disk(
@@ -2384,81 +1619,24 @@ pub fn save_local_summary_score_for_side(
 
 // --- API Response Structs ---
 
-#[derive(Debug, Clone)]
-pub struct LeaderboardEntry {
-    pub rank: u32,
-    pub name: String,
-    pub machine_tag: Option<String>,
-    pub score: f64, // 0..10000
-    pub date: String,
-    pub is_rival: bool,
-    pub is_self: bool,
-    pub is_fail: bool,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct ReplayEdge {
-    pub event_music_time: f32,
-    pub lane_index: u8,
-    pub pressed: bool,
-    pub source: InputSource,
-}
-
-#[derive(Debug, Clone)]
-pub struct MachineReplayEntry {
-    pub rank: u32,
-    pub name: String,
-    pub score: f64, // 0..10000
-    pub date: String,
-    pub is_fail: bool,
-    pub replay_beat0_time_seconds: f32,
-    pub replay: Vec<ReplayEdge>,
-}
-
-#[derive(Debug, Clone)]
-pub struct LeaderboardPane {
-    pub name: String,
-    pub entries: Vec<LeaderboardEntry>,
-    pub is_ex: bool,
-    pub disabled: bool,
-}
-
-impl LeaderboardPane {
-    #[inline(always)]
-    pub fn is_groovestats(&self) -> bool {
-        self.name.eq_ignore_ascii_case("GrooveStats")
-    }
-
-    #[inline(always)]
-    pub fn is_arrowcloud(&self) -> bool {
-        self.name.eq_ignore_ascii_case("ArrowCloud")
-    }
-
-    #[inline(always)]
-    pub fn is_hard_ex(&self) -> bool {
-        self.is_arrowcloud()
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct PlayerLeaderboardData {
-    pub panes: Vec<LeaderboardPane>,
-}
-
-#[derive(Debug, Clone)]
-pub struct CachedPlayerLeaderboardData {
-    pub loading: bool,
-    pub data: Option<PlayerLeaderboardData>,
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct PlayerLeaderboardCacheKey {
-    chart_hash: String,
-    api_key: String,
-    arrowcloud_api_key: String,
-    include_arrowcloud: bool,
-    show_ex_score: bool,
+pub fn scorebox_profile_snapshot(
+    player_profile: &profile_data::Profile,
+    side_joined: bool,
+    persistent_profile_id: Option<String>,
+) -> GameplayScoreboxProfileSnapshot {
+    let cfg = crate::config::get();
+    scorebox_snapshot(
+        player_profile.display_scorebox,
+        player_profile.show_ex_score,
+        side_joined,
+        cfg.enable_groovestats,
+        cfg.enable_arrowcloud,
+        cfg.auto_populate_gs_scores,
+        player_profile.groovestats_api_key.as_str(),
+        player_profile.arrowcloud_api_key.as_str(),
+        player_profile.groovestats_username.as_str(),
+        persistent_profile_id,
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -2477,208 +1655,53 @@ struct PlayerLeaderboardCacheEntry {
 
 #[derive(Default)]
 struct PlayerLeaderboardCacheState {
-    by_key: HashMap<PlayerLeaderboardCacheKey, PlayerLeaderboardCacheEntry>,
-    in_flight: HashSet<PlayerLeaderboardCacheKey>,
+    by_key: hashbrown::HashMap<PlayerLeaderboardCacheKey, PlayerLeaderboardCacheEntry>,
+    in_flight: HashMap<PlayerLeaderboardCacheKey, usize>,
+    pending_refresh: HashMap<PlayerLeaderboardCacheKey, usize>,
+    invalidated_after: HashMap<PlayerLeaderboardCacheKey, Instant>,
 }
 
 static PLAYER_LEADERBOARD_CACHE: std::sync::LazyLock<Mutex<PlayerLeaderboardCacheState>> =
     std::sync::LazyLock::new(|| Mutex::new(PlayerLeaderboardCacheState::default()));
 
 const PLAYER_LEADERBOARD_ERROR_RETRY_INTERVAL: Duration = Duration::from_secs(10);
-const ARROWCLOUD_LEADERBOARDS_BASE_URL: &str = "https://api.arrowcloud.dance";
-const ARROWCLOUD_HARD_EX_MIN_PER_PAGE: usize = 16;
 
-#[derive(Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-struct LeaderboardsApiResponse {
-    player1: Option<LeaderboardApiPlayer>,
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-struct ArrowCloudLeaderboardsApiResponse {
-    #[serde(default)]
-    leaderboards: Vec<ArrowCloudLeaderboardPane>,
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-struct ArrowCloudLeaderboardPane {
-    #[serde(default)]
-    r#type: String,
-    #[serde(default)]
-    scores: Vec<ArrowCloudLeaderboardEntry>,
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-struct ArrowCloudLeaderboardEntry {
-    #[serde(default, deserialize_with = "de_u32_from_string_or_number")]
-    rank: u32,
-    #[serde(default, deserialize_with = "de_f64_from_string_or_number")]
-    score: f64, // 0..100
-    #[serde(default)]
-    alias: String,
-    #[serde(default)]
-    date: String,
-    #[serde(default)]
-    is_rival: bool,
-    #[serde(default)]
-    is_self: bool,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum U32OrString {
-    U32(u32),
-    F64(f64),
-    String(String),
-}
-
-fn de_u32_from_string_or_number<'de, D>(deserializer: D) -> Result<u32, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    match Option::<U32OrString>::deserialize(deserializer)? {
-        Some(U32OrString::U32(v)) => Ok(v),
-        Some(U32OrString::F64(v)) => Ok(v.max(0.0).floor() as u32),
-        Some(U32OrString::String(text)) => Ok(text.trim().parse::<u32>().unwrap_or(0)),
-        None => Ok(0),
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum F64OrString {
-    F64(f64),
-    String(String),
-}
-
-fn de_f64_from_string_or_number<'de, D>(deserializer: D) -> Result<f64, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    match Option::<F64OrString>::deserialize(deserializer)? {
-        Some(F64OrString::F64(v)) => Ok(v),
-        Some(F64OrString::String(text)) => Ok(text.trim().parse::<f64>().unwrap_or(0.0)),
-        None => Ok(0.0),
-    }
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-struct LeaderboardApiPlayer {
-    #[serde(default)]
-    is_ranked: bool,
-    #[serde(rename = "gsLeaderboard", default)]
-    gs_leaderboard: Vec<LeaderboardApiEntry>,
-    #[serde(rename = "exLeaderboard", default)]
-    ex_leaderboard: Vec<LeaderboardApiEntry>,
-    rpg: Option<LeaderboardEventData>,
-    itl: Option<LeaderboardEventData>,
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-struct LeaderboardEventData {
-    #[serde(default)]
-    name: String,
-    #[serde(rename = "rpgLeaderboard", default)]
-    rpg_leaderboard: Vec<LeaderboardApiEntry>,
-    #[serde(rename = "itlLeaderboard", default)]
-    itl_leaderboard: Vec<LeaderboardApiEntry>,
-}
-
-#[derive(Deserialize, Debug, Clone)]
-#[serde(rename_all = "camelCase")]
-struct LeaderboardApiEntry {
-    #[serde(default)]
-    rank: u32,
-    #[serde(default)]
-    name: String,
-    #[serde(default)]
-    machine_tag: Option<String>,
-    #[serde(default)]
-    score: f64, // 0..10000
-    #[serde(default)]
-    date: String,
-    #[serde(default)]
-    is_rival: bool,
-    #[serde(default)]
-    is_self: bool,
-    #[serde(default)]
-    is_fail: bool,
-    #[serde(default)]
-    comments: Option<String>,
-}
-
-fn leaderboard_entries_from_api(entries: Vec<LeaderboardApiEntry>) -> Vec<LeaderboardEntry> {
-    let mut out = Vec::with_capacity(entries.len());
-    for entry in entries {
-        out.push(LeaderboardEntry {
-            rank: entry.rank,
-            name: entry.name,
-            machine_tag: entry.machine_tag,
-            score: entry.score,
-            date: entry.date,
-            is_rival: entry.is_rival,
-            is_self: entry.is_self,
-            is_fail: entry.is_fail,
-        });
-    }
-    out
-}
-
-fn push_leaderboard_pane(
-    out: &mut Vec<LeaderboardPane>,
-    name: &str,
-    entries: Vec<LeaderboardApiEntry>,
-    is_ex: bool,
-) {
-    if entries.is_empty() {
-        return;
-    }
-    out.push(LeaderboardPane {
-        name: name.to_string(),
-        entries: leaderboard_entries_from_api(entries),
-        is_ex,
-        disabled: false,
-    });
-}
-
-struct FetchedPlayerLeaderboards {
-    data: PlayerLeaderboardData,
-    gs_entries: Vec<LeaderboardApiEntry>,
+#[inline(always)]
+fn should_keep_newer_player_leaderboard_entry(
+    entry: Option<&PlayerLeaderboardCacheEntry>,
+    request_started_at: Instant,
+) -> bool {
+    entry.is_some_and(|entry| entry.refreshed_at > request_started_at)
 }
 
 #[inline(always)]
-const fn cached_failed_gs_score() -> CachedScore {
-    CachedScore {
-        grade: Grade::Failed,
-        score_percent: 0.0,
-        lamp_index: None,
-        lamp_judge_count: None,
-    }
+fn player_leaderboard_request_was_invalidated(
+    invalidated_after: Option<Instant>,
+    request_started_at: Instant,
+) -> bool {
+    invalidated_after.is_some_and(|invalidated_after| request_started_at <= invalidated_after)
 }
 
 #[inline(always)]
-fn cached_score_from_gs(
-    score_10000: f64,
-    comments: Option<&str>,
+fn submit_record_banner(
+    player: &GrooveStatsSubmitPlayerJob,
+    response: &GrooveStatsSubmitApiPlayer,
+) -> Option<GrooveStatsSubmitRecordBanner> {
+    groovestats_api::submit_record_banner_from_api(
+        response,
+        player.username.as_str(),
+        player.show_ex_score,
+    )
+}
+
+fn chart_stats_for_imported_score(
+    score: &ImportedPlayerScore,
     chart_hash: &str,
-    is_fail: bool,
-) -> CachedScore {
-    if is_fail {
-        return cached_failed_gs_score();
-    }
-    let lamp_index = compute_lamp_index(score_10000, comments, chart_hash);
-    let lamp_judge_count = compute_lamp_judge_count(lamp_index, comments);
-    CachedScore {
-        grade: score_to_grade(score_10000),
-        score_percent: score_10000 / 10000.0,
-        lamp_index,
-        lamp_judge_count,
-    }
+) -> Option<GsLampChartStats> {
+    score
+        .needs_chart_stats()
+        .then(|| find_chart_stats_for_hash(chart_hash))
+        .flatten()
 }
 
 fn cache_gs_score_for_profile(
@@ -2686,7 +1709,14 @@ fn cache_gs_score_for_profile(
     chart_hash: &str,
     score: CachedScore,
     username: &str,
+    proves_nonquint_ex: bool,
 ) {
+    let score = fix_gs_cached_score(score);
+    if let Some(existing) = get_cached_gs_score_for_profile(profile_id, chart_hash)
+        && !should_replace_cached_gs_score(&score, &existing, proves_nonquint_ex)
+    {
+        return;
+    }
     set_cached_gs_score_for_profile(profile_id, chart_hash.to_string(), score);
     if !username.trim().is_empty() {
         append_gs_score_on_disk_for_profile(profile_id, chart_hash, score, username);
@@ -2697,128 +1727,32 @@ fn cache_gs_score_from_leaderboard(
     profile_id: &str,
     username: &str,
     chart_hash: &str,
-    gs_entries: &[LeaderboardApiEntry],
+    imported: Option<ImportedPlayerScore>,
 ) {
-    let self_entry = gs_entries.iter().find(|entry| entry.is_self).or_else(|| {
-        gs_entries
-            .iter()
-            .find(|entry| entry.name.eq_ignore_ascii_case(username))
-    });
-    let Some(entry) = self_entry else {
-        set_cached_gs_score_for_profile(
-            profile_id,
-            chart_hash.to_string(),
-            cached_failed_gs_score(),
-        );
+    let Some(mut imported) = imported else {
+        // Select Music and gameplay scoreboxes fetch shallow leaderboard pages.
+        // If the page does not include the player's row, do not clobber an
+        // existing cached GS score and make the wheel fall back to local data.
         return;
     };
-    let score = cached_score_from_gs(
-        entry.score,
-        entry.comments.as_deref(),
-        chart_hash,
-        entry.is_fail,
+    imported = merge_local_fail(
+        imported,
+        get_cached_local_score_for_profile(profile_id, chart_hash),
     );
-    cache_gs_score_for_profile(profile_id, chart_hash, score, username);
-}
-
-#[inline(always)]
-fn arrowcloud_lb_type_is_hard_ex(lb_type: &str) -> bool {
-    if lb_type.is_empty() {
-        return false;
-    }
-    let mut compact = String::with_capacity(lb_type.len());
-    for ch in lb_type.chars() {
-        if ch.is_ascii_alphanumeric() {
-            compact.push(ch.to_ascii_lowercase());
-        }
-    }
-    compact == "hardex" || compact == "hex"
-}
-
-fn arrowcloud_entries_from_api(entries: Vec<ArrowCloudLeaderboardEntry>) -> Vec<LeaderboardEntry> {
-    let mut out = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let score = if entry.score.is_finite() {
-            (entry.score * 100.0).clamp(0.0, 10000.0)
-        } else {
-            0.0
-        };
-        out.push(LeaderboardEntry {
-            rank: entry.rank,
-            name: entry.alias,
-            machine_tag: None,
-            score,
-            date: entry.date,
-            is_rival: entry.is_rival,
-            is_self: entry.is_self,
-            is_fail: false,
-        });
-    }
-    out
-}
-
-fn fetch_arrowcloud_hard_ex_pane(
-    chart_hash: &str,
-    api_key: &str,
-    max_entries: usize,
-) -> Result<Option<LeaderboardPane>, Box<dyn Error + Send + Sync>> {
-    let chart_hash = chart_hash.trim();
-    let api_key = api_key.trim();
-    if chart_hash.is_empty() || api_key.is_empty() {
-        return Ok(None);
-    }
-
-    // ArrowCloud may return self/rival entries outside the top ranks.
-    // Pull a wider page so scorebox views can always include those rows.
-    let max_entries = max_entries.max(1).max(ARROWCLOUD_HARD_EX_MIN_PER_PAGE);
-    let max_entries = max_entries.to_string();
-    let api_url = format!(
-        "{}/v1/chart/{chart_hash}/leaderboards",
-        ARROWCLOUD_LEADERBOARDS_BASE_URL.trim_end_matches('/')
-    );
-    let bearer = format!("Bearer {api_key}");
-    let response = network::get_agent()
-        .get(&api_url)
-        .header("Authorization", &bearer)
-        .header("x-api-key-player-1", api_key)
-        .query("page", "1")
-        .query("perPage", max_entries.as_str())
-        .call()?;
-
-    if response.status() != 200 {
-        return Err(format!(
-            "ArrowCloud leaderboard API returned status {}",
-            response.status()
-        )
-        .into());
-    }
-
-    let decoded: ArrowCloudLeaderboardsApiResponse = response.into_body().read_json()?;
-    let hard_ex = decoded
-        .leaderboards
-        .into_iter()
-        .find(|pane| arrowcloud_lb_type_is_hard_ex(pane.r#type.as_str()));
-    let Some(hard_ex) = hard_ex else {
-        return Ok(None);
-    };
-    if hard_ex.scores.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(LeaderboardPane {
-        name: "ArrowCloud".to_string(),
-        entries: arrowcloud_entries_from_api(hard_ex.scores),
-        is_ex: false,
-        disabled: false,
-    }))
+    let proves_nonquint_ex = imported.ex_evidence.proves_nonquint();
+    let stats = chart_stats_for_imported_score(&imported, chart_hash);
+    let score = cached_score_from_imported_player_score(imported, stats);
+    cache_gs_score_for_profile(profile_id, chart_hash, score, username, proves_nonquint_ex);
 }
 
 fn fetch_player_leaderboards_internal(
     chart_hash: &str,
     api_key: &str,
+    username: &str,
     arrowcloud_api_key: Option<&str>,
     show_ex_score: bool,
     max_entries: usize,
-) -> Result<FetchedPlayerLeaderboards, Box<dyn Error + Send + Sync>> {
+) -> Result<groovestats_api::FetchedPlayerLeaderboards, Box<dyn Error + Send + Sync>> {
     if chart_hash.trim().is_empty() {
         return Err("Missing chart hash for leaderboard request.".into());
     }
@@ -2826,103 +1760,40 @@ fn fetch_player_leaderboards_internal(
         return Err("Missing GrooveStats API key for leaderboard request.".into());
     }
 
-    let max_entries = max_entries.max(1);
-    let max_entries_str = max_entries.to_string();
-    let agent = network::get_agent();
-    let api_url = network::groovestats_player_leaderboards_url();
-    let response = agent
-        .get(&api_url)
-        .header("x-api-key-player-1", api_key)
-        .query("chartHashP1", chart_hash)
-        .query("maxLeaderboardResults", &max_entries_str)
-        .call()?;
-
-    if response.status() != 200 {
-        return Err(format!("Leaderboard API returned status {}", response.status()).into());
+    let combined = groovestats_api::fetch_combined_player_leaderboards(
+        active_groovestats_service(),
+        api_key,
+        username,
+        chart_hash,
+        arrowcloud_api_key,
+        show_ex_score,
+        max_entries,
+    )
+    .map_err(|error| boxed_request_error("Leaderboard API", error))?;
+    if let Some(error) = combined.arrowcloud_error {
+        warn!(
+            "ArrowCloud leaderboard fetch failed for chart {}: {}",
+            chart_hash, error
+        );
     }
 
-    let decoded: LeaderboardsApiResponse = response.into_body().read_json()?;
-    let mut panes = Vec::with_capacity(5);
-    let mut gs_entries = Vec::new();
-    if let Some(player) = decoded.player1 {
-        let LeaderboardApiPlayer {
-            is_ranked: _is_ranked,
-            gs_leaderboard,
-            ex_leaderboard,
-            rpg,
-            itl,
-        } = player;
-
-        gs_entries = gs_leaderboard.clone();
-        if show_ex_score {
-            push_leaderboard_pane(&mut panes, "GrooveStats", ex_leaderboard, true);
-            push_leaderboard_pane(&mut panes, "GrooveStats", gs_leaderboard, false);
-        } else {
-            push_leaderboard_pane(&mut panes, "GrooveStats", gs_leaderboard, false);
-            push_leaderboard_pane(&mut panes, "GrooveStats", ex_leaderboard, true);
-        }
-
-        if let Some(rpg) = rpg
-            && !rpg.rpg_leaderboard.is_empty()
-        {
-            let name = if rpg.name.trim().is_empty() {
-                "RPG"
-            } else {
-                rpg.name.as_str()
-            };
-            push_leaderboard_pane(&mut panes, name, rpg.rpg_leaderboard, false);
-        }
-        if let Some(itl) = itl
-            && !itl.itl_leaderboard.is_empty()
-        {
-            let name = if itl.name.trim().is_empty() {
-                "ITL"
-            } else {
-                itl.name.as_str()
-            };
-            push_leaderboard_pane(&mut panes, name, itl.itl_leaderboard, true);
-        }
-    }
-
-    if let Some(arrowcloud_api_key) = arrowcloud_api_key {
-        match fetch_arrowcloud_hard_ex_pane(chart_hash, arrowcloud_api_key, max_entries) {
-            Ok(Some(pane)) => panes.insert(2.min(panes.len()), pane),
-            Ok(None) => {}
-            Err(error) => warn!(
-                "ArrowCloud H.EX leaderboard fetch failed for chart {}: {}",
-                chart_hash, error
-            ),
-        }
-    }
-
-    Ok(FetchedPlayerLeaderboards {
-        data: PlayerLeaderboardData { panes },
-        gs_entries,
-    })
+    Ok(combined.fetched)
 }
 
 #[inline(always)]
 const fn loading_player_leaderboard_snapshot() -> CachedPlayerLeaderboardData {
-    CachedPlayerLeaderboardData {
-        loading: true,
-        data: None,
-        error: None,
-    }
+    CachedPlayerLeaderboardData::loading()
 }
 
 #[inline(always)]
 fn cache_snapshot_from_entry(entry: &PlayerLeaderboardCacheEntry) -> CachedPlayerLeaderboardData {
     match &entry.value {
-        PlayerLeaderboardCacheValue::Ready(data) => CachedPlayerLeaderboardData {
-            loading: false,
-            data: Some(data.clone()),
-            error: None,
-        },
-        PlayerLeaderboardCacheValue::Error(error) => CachedPlayerLeaderboardData {
-            loading: false,
-            data: None,
-            error: Some(error.clone()),
-        },
+        PlayerLeaderboardCacheValue::Ready(data) => {
+            CachedPlayerLeaderboardData::ready(data.clone())
+        }
+        PlayerLeaderboardCacheValue::Error(error) => {
+            CachedPlayerLeaderboardData::error(error.clone())
+        }
     }
 }
 
@@ -2954,78 +1825,348 @@ fn should_fetch_player_leaderboard_entry(
     }
 }
 
-fn get_or_fetch_player_leaderboards_for_side_inner(
+#[inline(always)]
+fn should_rerun_in_flight_player_leaderboard_fetch(
+    in_flight_max_entries: usize,
+    requested_max_entries: usize,
+    refresh_cached: bool,
+) -> bool {
+    refresh_cached || requested_max_entries > in_flight_max_entries
+}
+
+#[inline(always)]
+fn queue_player_leaderboard_refresh(
+    pending_refresh: &mut HashMap<PlayerLeaderboardCacheKey, usize>,
+    key: &PlayerLeaderboardCacheKey,
+    requested_max_entries: usize,
+) {
+    pending_refresh
+        .entry(key.clone())
+        .and_modify(|max_entries| *max_entries = (*max_entries).max(requested_max_entries))
+        .or_insert(requested_max_entries);
+}
+
+fn spawn_player_leaderboard_fetch(
+    key: PlayerLeaderboardCacheKey,
+    gs_username: String,
+    persistent_profile_id: Option<String>,
+    auto_profile_id: Option<String>,
+    should_auto_populate: bool,
+    requested_max_entries: usize,
+) {
+    std::thread::spawn(move || {
+        let request_started_at = Instant::now();
+        let fetched = fetch_player_leaderboards_internal(
+            &key.chart_hash,
+            &key.api_key,
+            gs_username.as_str(),
+            if key.include_arrowcloud {
+                Some(key.arrowcloud_api_key.as_str())
+            } else {
+                None
+            },
+            key.show_ex_score,
+            requested_max_entries,
+        );
+        let refresh_finished_at = Instant::now();
+        let mut queued_refresh = None;
+        let mut queued_key = None;
+        let mut queued_gs_username = None;
+        let mut queued_persistent_profile_id = None;
+        let mut queued_auto_profile_id = None;
+        let mut fetched_itl_self = None;
+        let mut fetched_imported_score = None;
+
+        {
+            let mut cache = PLAYER_LEADERBOARD_CACHE.lock().unwrap();
+            cache.in_flight.remove(&key);
+            let request_invalidated = player_leaderboard_request_was_invalidated(
+                cache.invalidated_after.get(&key).copied(),
+                request_started_at,
+            );
+
+            if !request_invalidated {
+                match fetched {
+                    Ok(fetched) => {
+                        if !should_keep_newer_player_leaderboard_entry(
+                            cache.by_key.get(&key),
+                            request_started_at,
+                        ) {
+                            let groovestats_api::FetchedPlayerLeaderboards {
+                                data,
+                                imported_score,
+                                itl_self_found,
+                            } = fetched;
+                            if itl_self_found {
+                                fetched_itl_self = Some((data.itl_self_score, data.itl_self_rank));
+                            }
+                            if should_auto_populate && auto_profile_id.is_some() {
+                                fetched_imported_score = imported_score;
+                            }
+                            cache.by_key.insert(
+                                key.clone(),
+                                PlayerLeaderboardCacheEntry {
+                                    value: PlayerLeaderboardCacheValue::Ready(data),
+                                    max_entries: requested_max_entries,
+                                    refreshed_at: refresh_finished_at,
+                                    retry_after: None,
+                                },
+                            );
+                            cache.invalidated_after.remove(&key);
+                        }
+                    }
+                    Err(error) => {
+                        if !should_keep_newer_player_leaderboard_entry(
+                            cache.by_key.get(&key),
+                            request_started_at,
+                        ) {
+                            if let Some(entry) = cache.by_key.get_mut(&key)
+                                && matches!(entry.value, PlayerLeaderboardCacheValue::Ready(_))
+                            {
+                                // Keep stale data visible on refresh failures, but back off retries.
+                                entry.refreshed_at = refresh_finished_at;
+                                entry.retry_after = Some(
+                                    refresh_finished_at + PLAYER_LEADERBOARD_ERROR_RETRY_INTERVAL,
+                                );
+                            } else {
+                                cache.by_key.insert(
+                                    key.clone(),
+                                    PlayerLeaderboardCacheEntry {
+                                        value: PlayerLeaderboardCacheValue::Error(
+                                            error.to_string(),
+                                        ),
+                                        max_entries: requested_max_entries,
+                                        refreshed_at: refresh_finished_at,
+                                        retry_after: Some(
+                                            refresh_finished_at
+                                                + PLAYER_LEADERBOARD_ERROR_RETRY_INTERVAL,
+                                        ),
+                                    },
+                                );
+                            }
+                            cache.invalidated_after.remove(&key);
+                        }
+                    }
+                }
+            }
+
+            if let Some(next_max_entries) = cache.pending_refresh.remove(&key) {
+                cache.in_flight.insert(key.clone(), next_max_entries);
+                queued_refresh = Some(next_max_entries);
+                queued_key = Some(key.clone());
+                queued_gs_username = Some(gs_username.clone());
+                queued_persistent_profile_id = Some(persistent_profile_id.clone());
+                queued_auto_profile_id = Some(auto_profile_id.clone());
+            }
+        }
+
+        // Keep score/ITL cache writes outside PLAYER_LEADERBOARD_CACHE. The wheel
+        // can hold score-cache guards while probing leaderboard rank state.
+        if let Some((itl_self_score, itl_self_rank)) = fetched_itl_self {
+            itl::set_cached_online_self_score(
+                persistent_profile_id.as_deref(),
+                key.api_key.as_str(),
+                key.chart_hash.as_str(),
+                itl_self_score,
+            );
+            itl::set_cached_online_self_rank(
+                persistent_profile_id.as_deref(),
+                key.api_key.as_str(),
+                key.chart_hash.as_str(),
+                itl_self_rank,
+            );
+        }
+        if let Some(imported_score) = fetched_imported_score
+            && let Some(profile_id) = auto_profile_id.as_deref()
+        {
+            cache_gs_score_from_leaderboard(
+                profile_id,
+                gs_username.as_str(),
+                key.chart_hash.as_str(),
+                Some(imported_score),
+            );
+        }
+
+        if let (
+            Some(next_max_entries),
+            Some(next_key),
+            Some(next_gs_username),
+            Some(next_persistent_profile_id),
+            Some(next_auto_profile_id),
+        ) = (
+            queued_refresh,
+            queued_key,
+            queued_gs_username,
+            queued_persistent_profile_id,
+            queued_auto_profile_id,
+        ) {
+            spawn_player_leaderboard_fetch(
+                next_key,
+                next_gs_username,
+                next_persistent_profile_id,
+                next_auto_profile_id,
+                should_auto_populate,
+                next_max_entries,
+            );
+        }
+    });
+}
+
+#[inline(always)]
+fn player_leaderboard_profile_snapshot_for_side(
+    side: profile_data::PlayerSide,
+) -> GameplayScoreboxProfileSnapshot {
+    let cfg = crate::config::get();
+    let (
+        display_scorebox,
+        show_ex_score,
+        groovestats_api_key,
+        arrowcloud_api_key,
+        groovestats_username,
+    ) = profile::scorebox_fields_for_side(side);
+    scorebox_snapshot(
+        display_scorebox,
+        show_ex_score,
+        profile::is_session_side_joined(side),
+        cfg.enable_groovestats,
+        cfg.enable_arrowcloud,
+        cfg.auto_populate_gs_scores,
+        groovestats_api_key.as_str(),
+        arrowcloud_api_key.as_str(),
+        groovestats_username.as_str(),
+        profile::active_local_profile_id_for_side(side),
+    )
+}
+
+fn get_cached_player_leaderboard_itl_self_rank_for_side(
     chart_hash: &str,
-    side: profile::PlayerSide,
+    side: profile_data::PlayerSide,
+) -> Option<u32> {
+    let profile_snapshot = player_leaderboard_profile_snapshot_for_side(side);
+    get_cached_player_leaderboard_itl_self_rank_with(chart_hash, &profile_snapshot)
+}
+
+/// Borrowed view of [`PlayerLeaderboardCacheKey`] for allocation-free cache
+/// probes from the per-frame song-wheel rank lookup. Mirrors the field order
+/// and the gate of `player_leaderboard_cache_key` so it hashes and compares
+/// identically to the owned key without allocating the three key strings.
+#[derive(Hash)]
+struct PlayerLeaderboardCacheKeyRef<'a> {
+    chart_hash: &'a str,
+    api_key: &'a str,
+    arrowcloud_api_key: &'a str,
+    include_arrowcloud: bool,
+    show_ex_score: bool,
+}
+
+impl<'a> PlayerLeaderboardCacheKeyRef<'a> {
+    fn for_lookup(
+        chart_hash: &'a str,
+        snapshot: &'a GameplayScoreboxProfileSnapshot,
+    ) -> Option<Self> {
+        let chart_hash = chart_hash.trim();
+        if chart_hash.is_empty() || !snapshot.gs_active {
+            return None;
+        }
+        Some(Self {
+            chart_hash,
+            api_key: snapshot.api_key(),
+            arrowcloud_api_key: snapshot.arrowcloud_api_key(),
+            include_arrowcloud: snapshot.include_arrowcloud(),
+            show_ex_score: snapshot.show_ex_score,
+        })
+    }
+}
+
+impl hashbrown::Equivalent<PlayerLeaderboardCacheKey> for PlayerLeaderboardCacheKeyRef<'_> {
+    fn equivalent(&self, key: &PlayerLeaderboardCacheKey) -> bool {
+        self.chart_hash == key.chart_hash
+            && self.api_key == key.api_key
+            && self.arrowcloud_api_key == key.arrowcloud_api_key
+            && self.include_arrowcloud == key.include_arrowcloud
+            && self.show_ex_score == key.show_ex_score
+    }
+}
+
+fn get_cached_player_leaderboard_itl_self_rank_with(
+    chart_hash: &str,
+    profile_snapshot: &GameplayScoreboxProfileSnapshot,
+) -> Option<u32> {
+    let kref = PlayerLeaderboardCacheKeyRef::for_lookup(chart_hash, profile_snapshot)?;
+    let cache = PLAYER_LEADERBOARD_CACHE.lock().unwrap();
+    let entry = cache.by_key.get(&kref)?;
+    let PlayerLeaderboardCacheValue::Ready(data) = &entry.value else {
+        return None;
+    };
+    data.itl_self_rank
+}
+
+pub struct ItlWheelSideContext {
+    profile_id: Option<std::sync::Arc<str>>,
+    api_key: String,
+    leaderboard_snapshot: GameplayScoreboxProfileSnapshot,
+}
+
+impl ItlWheelSideContext {
+    pub fn for_side(
+        side: profile_data::PlayerSide,
+        profile_id: Option<std::sync::Arc<str>>,
+    ) -> Self {
+        Self {
+            profile_id,
+            api_key: profile::groovestats_api_key_for_side(side),
+            leaderboard_snapshot: player_leaderboard_profile_snapshot_for_side(side),
+        }
+    }
+
+    /// Cached local ITL score for a song (reads the per-profile ITL file cache).
+    /// Assumes [`ensure_itl_wheel_caches_loaded`] ran for this side this frame.
+    pub fn cached_local_itl_score(
+        &self,
+        song: &deadsync_chart::SongData,
+    ) -> Option<deadsync_score::CachedItlScore> {
+        itl::get_cached_itl_score_for_song_assume_loaded(song, self.profile_id.as_deref())
+    }
+
+    /// Cached online ITL self EX score for a chart hash, in integer hundredths
+    /// of a percent (e.g. `9912` = 99.12%).
+    pub fn cached_self_ex_score(&self, chart_hash: &str) -> Option<u32> {
+        itl::get_cached_itl_self_score_for_key_assume_loaded(
+            chart_hash,
+            self.profile_id.as_deref(),
+            &self.api_key,
+        )
+    }
+
+    /// Cached ITL tournament rank for a chart hash: prefers the player
+    /// leaderboard cache, falling back to the online self-rank cache.
+    pub fn cached_tournament_rank(&self, chart_hash: &str) -> Option<u32> {
+        get_cached_player_leaderboard_itl_self_rank_with(chart_hash, &self.leaderboard_snapshot)
+            .or_else(|| {
+                itl::get_cached_online_itl_self_rank_for_key_assume_loaded(
+                    chart_hash,
+                    self.profile_id.as_deref(),
+                    &self.api_key,
+                )
+            })
+    }
+}
+
+fn get_or_fetch_player_leaderboards_for_profile_inner(
+    chart_hash: &str,
+    profile_snapshot: &GameplayScoreboxProfileSnapshot,
     max_entries: usize,
     refresh_cached: bool,
 ) -> Option<CachedPlayerLeaderboardData> {
-    let cfg = crate::config::get();
-    if !cfg.enable_groovestats {
-        return None;
-    }
     let chart_hash = chart_hash.trim();
     if chart_hash.is_empty() || max_entries == 0 {
         return None;
     }
-    if !profile::is_session_side_joined(side) {
-        return None;
-    }
-
-    let side_profile = profile::get_for_side(side);
-    let gs_api_key = side_profile.groovestats_api_key.trim();
-    if gs_api_key.is_empty() {
-        return None;
-    }
-    let arrowcloud_api_key = side_profile.arrowcloud_api_key.trim().to_string();
-    let include_arrowcloud = cfg.enable_arrowcloud
-        && !arrowcloud_api_key.is_empty()
-        && matches!(
-            network::get_arrowcloud_status(),
-            network::ArrowCloudConnectionStatus::Connected
-        );
-    let auto_populate = cfg.auto_populate_gs_scores;
-    let auto_profile_id = if auto_populate {
-        profile::active_local_profile_id_for_side(side)
-    } else {
-        None
-    };
-    let auto_username = side_profile.groovestats_username.trim().to_string();
-    let should_auto_populate =
-        auto_populate && auto_profile_id.is_some() && !auto_username.is_empty();
-
-    let key = PlayerLeaderboardCacheKey {
-        chart_hash: chart_hash.to_string(),
-        api_key: gs_api_key.to_string(),
-        arrowcloud_api_key,
-        include_arrowcloud,
-        show_ex_score: side_profile.show_ex_score,
-    };
-    let cached_snapshot = {
-        let cache = PLAYER_LEADERBOARD_CACHE.lock().unwrap();
-        cache.by_key.get(&key).map(cache_snapshot_from_entry)
-    };
-
-    match network::get_status() {
-        network::ConnectionStatus::Pending => {
-            return Some(cached_snapshot.unwrap_or_else(loading_player_leaderboard_snapshot));
-        }
-        network::ConnectionStatus::Connected(services) if !services.get_scores => {
-            return Some(cached_snapshot.unwrap_or(CachedPlayerLeaderboardData {
-                loading: false,
-                data: None,
-                error: Some("Disabled".to_string()),
-            }));
-        }
-        network::ConnectionStatus::Error(error) => {
-            return Some(cached_snapshot.unwrap_or(CachedPlayerLeaderboardData {
-                loading: false,
-                data: None,
-                error: Some(error),
-            }));
-        }
-        _ => {}
-    }
+    let key = player_leaderboard_cache_key(chart_hash, profile_snapshot)?;
+    let gs_username = profile_snapshot.gs_username().to_string();
+    let persistent_profile_id = profile_snapshot.persistent_profile_id().map(str::to_string);
+    let auto_profile_id = profile_snapshot.auto_profile_id().map(str::to_string);
+    let should_auto_populate = profile_snapshot.should_auto_populate();
 
     let mut should_spawn = false;
     let mut requested_max_entries = max_entries;
@@ -3041,76 +2182,36 @@ fn get_or_fetch_player_leaderboards_for_side_inner(
             loading_player_leaderboard_snapshot()
         };
 
-        if !cache.in_flight.contains(&key)
-            && should_fetch_player_leaderboard_entry(entry, requested_max_entries, refresh_cached)
-        {
-            cache.in_flight.insert(key.clone());
-            should_spawn = true;
+        if should_fetch_player_leaderboard_entry(entry, requested_max_entries, refresh_cached) {
+            if let Some(in_flight_max_entries) = cache.in_flight.get(&key).copied() {
+                if should_rerun_in_flight_player_leaderboard_fetch(
+                    in_flight_max_entries,
+                    requested_max_entries,
+                    refresh_cached,
+                ) {
+                    queue_player_leaderboard_refresh(
+                        &mut cache.pending_refresh,
+                        &key,
+                        requested_max_entries,
+                    );
+                }
+            } else {
+                cache.in_flight.insert(key.clone(), requested_max_entries);
+                should_spawn = true;
+            }
         }
         snapshot
     };
 
     if should_spawn {
-        std::thread::spawn(move || {
-            let fetched = fetch_player_leaderboards_internal(
-                &key.chart_hash,
-                &key.api_key,
-                if key.include_arrowcloud {
-                    Some(key.arrowcloud_api_key.as_str())
-                } else {
-                    None
-                },
-                key.show_ex_score,
-                requested_max_entries,
-            );
-            let refresh_finished_at = Instant::now();
-            let mut cache = PLAYER_LEADERBOARD_CACHE.lock().unwrap();
-            cache.in_flight.remove(&key);
-
-            match fetched {
-                Ok(fetched) => {
-                    if should_auto_populate && let Some(profile_id) = auto_profile_id.as_deref() {
-                        cache_gs_score_from_leaderboard(
-                            profile_id,
-                            auto_username.as_str(),
-                            key.chart_hash.as_str(),
-                            fetched.gs_entries.as_slice(),
-                        );
-                    }
-                    cache.by_key.insert(
-                        key,
-                        PlayerLeaderboardCacheEntry {
-                            value: PlayerLeaderboardCacheValue::Ready(fetched.data),
-                            max_entries: requested_max_entries,
-                            refreshed_at: refresh_finished_at,
-                            retry_after: None,
-                        },
-                    );
-                }
-                Err(error) => {
-                    if let Some(entry) = cache.by_key.get_mut(&key)
-                        && matches!(entry.value, PlayerLeaderboardCacheValue::Ready(_))
-                    {
-                        // Keep stale data visible on refresh failures, but back off retries.
-                        entry.refreshed_at = refresh_finished_at;
-                        entry.retry_after =
-                            Some(refresh_finished_at + PLAYER_LEADERBOARD_ERROR_RETRY_INTERVAL);
-                    } else {
-                        cache.by_key.insert(
-                            key,
-                            PlayerLeaderboardCacheEntry {
-                                value: PlayerLeaderboardCacheValue::Error(error.to_string()),
-                                max_entries: requested_max_entries,
-                                refreshed_at: refresh_finished_at,
-                                retry_after: Some(
-                                    refresh_finished_at + PLAYER_LEADERBOARD_ERROR_RETRY_INTERVAL,
-                                ),
-                            },
-                        );
-                    }
-                }
-            }
-        });
+        spawn_player_leaderboard_fetch(
+            key,
+            gs_username,
+            persistent_profile_id,
+            auto_profile_id,
+            should_auto_populate,
+            requested_max_entries,
+        );
     }
 
     Some(snapshot)
@@ -3118,41 +2219,92 @@ fn get_or_fetch_player_leaderboards_for_side_inner(
 
 pub fn get_or_fetch_player_leaderboards_for_side(
     chart_hash: &str,
-    side: profile::PlayerSide,
+    side: profile_data::PlayerSide,
     max_entries: usize,
 ) -> Option<CachedPlayerLeaderboardData> {
-    get_or_fetch_player_leaderboards_for_side_inner(chart_hash, side, max_entries, false)
+    let profile_snapshot = player_leaderboard_profile_snapshot_for_side(side);
+    get_or_fetch_player_leaderboards_for_profile_inner(
+        chart_hash,
+        &profile_snapshot,
+        max_entries,
+        false,
+    )
+}
+
+pub fn get_or_fetch_player_leaderboards_for_profile(
+    chart_hash: &str,
+    profile_snapshot: &GameplayScoreboxProfileSnapshot,
+    max_entries: usize,
+) -> Option<CachedPlayerLeaderboardData> {
+    get_or_fetch_player_leaderboards_for_profile_inner(
+        chart_hash,
+        profile_snapshot,
+        max_entries,
+        false,
+    )
 }
 
 pub fn refresh_player_leaderboards_for_side(
     chart_hash: &str,
-    side: profile::PlayerSide,
+    side: profile_data::PlayerSide,
     max_entries: usize,
 ) -> Option<CachedPlayerLeaderboardData> {
-    get_or_fetch_player_leaderboards_for_side_inner(chart_hash, side, max_entries, true)
-}
-#[derive(Debug)]
-struct MachineLeaderboardPlay {
-    initials: String,
-    score_percent: f64,
-    played_at_ms: i64,
-    is_fail: bool,
-}
-
-#[derive(Debug)]
-struct MachineReplayPlay {
-    initials: String,
-    score_percent: f64,
-    played_at_ms: i64,
-    is_fail: bool,
-    replay_beat0_time_seconds: f32,
-    replay: Vec<LocalReplayEdgeV1>,
+    let profile_snapshot = player_leaderboard_profile_snapshot_for_side(side);
+    get_or_fetch_player_leaderboards_for_profile_inner(
+        chart_hash,
+        &profile_snapshot,
+        max_entries,
+        true,
+    )
 }
 
+pub fn invalidate_player_leaderboards_for_side(chart_hash: &str, side: profile_data::PlayerSide) {
+    let chart_hash = chart_hash.trim();
+    if chart_hash.is_empty() {
+        return;
+    }
+    let side_profile = profile::get_for_side(side);
+    let gs_api_key = side_profile.groovestats_api_key.trim();
+    if gs_api_key.is_empty() {
+        return;
+    }
+
+    itl::set_cached_online_self_score(
+        profile::active_local_profile_id_for_side(side).as_deref(),
+        gs_api_key,
+        chart_hash,
+        None,
+    );
+    itl::set_cached_online_self_rank(
+        profile::active_local_profile_id_for_side(side).as_deref(),
+        gs_api_key,
+        chart_hash,
+        None,
+    );
+
+    let invalidated_at = Instant::now();
+    let mut cache = PLAYER_LEADERBOARD_CACHE.lock().unwrap();
+    let matching_keys: HashSet<PlayerLeaderboardCacheKey> = cache
+        .by_key
+        .keys()
+        .chain(cache.in_flight.keys())
+        .chain(cache.pending_refresh.keys())
+        .chain(cache.invalidated_after.keys())
+        .filter(|key| key.api_key == gs_api_key && key.chart_hash.eq_ignore_ascii_case(chart_hash))
+        .cloned()
+        .collect();
+    for key in matching_keys {
+        cache.by_key.remove(&key);
+        cache.in_flight.remove(&key);
+        cache.pending_refresh.remove(&key);
+        cache.invalidated_after.insert(key, invalidated_at);
+    }
+}
 fn push_machine_leaderboard_from_dir(
     dir: &Path,
     chart_hash: &str,
-    initials: &str,
+    name: &str,
+    machine_tag: Option<&str>,
     out: &mut Vec<MachineLeaderboardPlay>,
 ) {
     let Ok(read_dir) = fs::read_dir(dir) else {
@@ -3164,10 +2316,10 @@ fn push_machine_leaderboard_from_dir(
         if !path.is_file() {
             continue;
         }
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        let Some((file_hash, played_at_ms)) = parse_local_score_filename(name) else {
+        let Some((file_hash, played_at_ms)) = parse_score_file_name(file_name) else {
             continue;
         };
         if file_hash != chart_hash {
@@ -3177,7 +2329,8 @@ fn push_machine_leaderboard_from_dir(
             continue;
         };
         out.push(MachineLeaderboardPlay {
-            initials: initials.to_string(),
+            name: name.to_string(),
+            machine_tag: machine_tag.map(str::to_string),
             score_percent: h.score_percent,
             played_at_ms,
             is_fail: grade_from_code(h.grade_code) == Grade::Failed || h.fail_time.is_some(),
@@ -3203,7 +2356,7 @@ fn push_machine_replays_from_dir(
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        let Some((file_hash, played_at_ms)) = parse_local_score_filename(name) else {
+        let Some((file_hash, played_at_ms)) = parse_score_file_name(name) else {
             continue;
         };
         if file_hash != chart_hash {
@@ -3217,17 +2370,10 @@ fn push_machine_replays_from_dir(
             score_percent: full.score_percent,
             played_at_ms,
             is_fail: grade_from_code(full.grade_code) == Grade::Failed || full.fail_time.is_some(),
-            replay_beat0_time_seconds: full.beat0_time_seconds,
+            replay_beat0_time_ns: full.beat0_time_ns,
             replay: full.replay,
         });
     }
-}
-
-fn local_score_date_string(played_at_ms: i64) -> String {
-    let Some(dt) = Local.timestamp_millis_opt(played_at_ms).single() else {
-        return String::new();
-    };
-    dt.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 pub fn get_machine_leaderboard_local(
@@ -3243,39 +2389,50 @@ pub fn get_machine_leaderboard_local(
         let initials =
             profile_initials_for_id(&profile_meta.id).unwrap_or_else(|| "----".to_string());
         let root = local_scores_root_for_profile(&profile_meta.id);
-        push_machine_leaderboard_from_dir(&root, chart_hash, &initials, &mut plays);
-        let shard_dir = root.join(shard2_for_hash(chart_hash));
-        push_machine_leaderboard_from_dir(&shard_dir, chart_hash, &initials, &mut plays);
+        push_machine_leaderboard_from_dir(&root, chart_hash, &initials, None, &mut plays);
+        let shard_dir = root.join(score_file_shard(chart_hash));
+        push_machine_leaderboard_from_dir(&shard_dir, chart_hash, &initials, None, &mut plays);
     }
 
-    plays.sort_by(|a, b| {
-        b.score_percent
-            .partial_cmp(&a.score_percent)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| b.played_at_ms.cmp(&a.played_at_ms))
-            .then_with(|| a.initials.cmp(&b.initials))
-    });
+    machine_leaderboard_entries(plays, max_entries)
+}
 
-    let take_len = max_entries.min(plays.len());
-    let mut out = Vec::with_capacity(take_len);
-    for (i, play) in plays.into_iter().take(take_len).enumerate() {
-        out.push(LeaderboardEntry {
-            rank: (i as u32).saturating_add(1),
-            name: play.initials,
-            machine_tag: None,
-            score: (play.score_percent * 10000.0).round(),
-            date: local_score_date_string(play.played_at_ms),
-            is_rival: false,
-            is_self: false,
-            is_fail: play.is_fail,
-        });
+pub fn get_machine_leaderboard_local_with_names(
+    chart_hash: &str,
+    max_entries: usize,
+) -> Vec<LeaderboardEntry> {
+    if chart_hash.trim().is_empty() || max_entries == 0 {
+        return Vec::new();
     }
-    out
+
+    let mut plays: Vec<MachineLeaderboardPlay> = Vec::new();
+    for profile_meta in profile::scan_local_profiles() {
+        let initials =
+            profile_initials_for_id(&profile_meta.id).unwrap_or_else(|| "----".to_string());
+        let root = local_scores_root_for_profile(&profile_meta.id);
+        push_machine_leaderboard_from_dir(
+            &root,
+            chart_hash,
+            profile_meta.display_name.as_str(),
+            Some(initials.as_str()),
+            &mut plays,
+        );
+        let shard_dir = root.join(score_file_shard(chart_hash));
+        push_machine_leaderboard_from_dir(
+            &shard_dir,
+            chart_hash,
+            profile_meta.display_name.as_str(),
+            Some(initials.as_str()),
+            &mut plays,
+        );
+    }
+
+    machine_leaderboard_entries(plays, max_entries)
 }
 
 pub fn get_personal_leaderboard_local_for_side(
     chart_hash: &str,
-    side: profile::PlayerSide,
+    side: profile_data::PlayerSide,
     max_entries: usize,
 ) -> Vec<LeaderboardEntry> {
     if chart_hash.trim().is_empty() || max_entries == 0 {
@@ -3287,35 +2444,13 @@ pub fn get_personal_leaderboard_local_for_side(
 
     let initials = profile_initials_for_id(&profile_id).unwrap_or_else(|| "----".to_string());
     let root = local_scores_root_for_profile(&profile_id);
-    let shard_dir = root.join(shard2_for_hash(chart_hash));
+    let shard_dir = root.join(score_file_shard(chart_hash));
 
     let mut plays: Vec<MachineLeaderboardPlay> = Vec::new();
-    push_machine_leaderboard_from_dir(&root, chart_hash, &initials, &mut plays);
-    push_machine_leaderboard_from_dir(&shard_dir, chart_hash, &initials, &mut plays);
+    push_machine_leaderboard_from_dir(&root, chart_hash, &initials, None, &mut plays);
+    push_machine_leaderboard_from_dir(&shard_dir, chart_hash, &initials, None, &mut plays);
 
-    plays.sort_by(|a, b| {
-        b.score_percent
-            .partial_cmp(&a.score_percent)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| b.played_at_ms.cmp(&a.played_at_ms))
-            .then_with(|| a.initials.cmp(&b.initials))
-    });
-
-    let take_len = max_entries.min(plays.len());
-    let mut out = Vec::with_capacity(take_len);
-    for (i, play) in plays.into_iter().take(take_len).enumerate() {
-        out.push(LeaderboardEntry {
-            rank: (i as u32).saturating_add(1),
-            name: play.initials,
-            machine_tag: None,
-            score: (play.score_percent * 10000.0).round(),
-            date: local_score_date_string(play.played_at_ms),
-            is_rival: false,
-            is_self: false,
-            is_fail: play.is_fail,
-        });
-    }
-    out
+    machine_leaderboard_entries(plays, max_entries)
 }
 
 pub fn get_machine_replays_local(chart_hash: &str, max_entries: usize) -> Vec<MachineReplayEntry> {
@@ -3329,113 +2464,24 @@ pub fn get_machine_replays_local(chart_hash: &str, max_entries: usize) -> Vec<Ma
             profile_initials_for_id(&profile_meta.id).unwrap_or_else(|| "----".to_string());
         let root = local_scores_root_for_profile(&profile_meta.id);
         push_machine_replays_from_dir(&root, chart_hash, &initials, &mut plays);
-        let shard_dir = root.join(shard2_for_hash(chart_hash));
+        let shard_dir = root.join(score_file_shard(chart_hash));
         push_machine_replays_from_dir(&shard_dir, chart_hash, &initials, &mut plays);
     }
 
-    plays.sort_by(|a, b| {
-        b.score_percent
-            .partial_cmp(&a.score_percent)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| b.played_at_ms.cmp(&a.played_at_ms))
-            .then_with(|| a.initials.cmp(&b.initials))
-    });
-
-    let take_len = max_entries.min(plays.len());
-    let mut out = Vec::with_capacity(take_len);
-    for (i, play) in plays.into_iter().take(take_len).enumerate() {
-        let mut replay = Vec::with_capacity(play.replay.len());
-        for edge in play.replay {
-            if !edge.event_music_time.is_finite() {
-                continue;
-            }
-            let source = if edge.source == 1 {
-                InputSource::Gamepad
-            } else {
-                InputSource::Keyboard
-            };
-            replay.push(ReplayEdge {
-                event_music_time: edge.event_music_time,
-                lane_index: edge.lane,
-                pressed: edge.pressed,
-                source,
-            });
-        }
-        out.push(MachineReplayEntry {
-            rank: (i as u32).saturating_add(1),
-            name: play.initials,
-            score: (play.score_percent * 10000.0).round(),
-            date: local_score_date_string(play.played_at_ms),
-            is_fail: play.is_fail,
-            replay_beat0_time_seconds: play.replay_beat0_time_seconds,
-            replay,
-        });
-    }
-    out
+    machine_replay_entries(plays, max_entries)
 }
 
-// --- ITG PercentScore weights (mirror Simply Love SL_Init.lua, ITG mode) ---
-const DP_W1: i32 = 5;
-const DP_W2: i32 = 4;
-const DP_W3: i32 = 2;
-const DP_W4: i32 = 0;
-const DP_W5: i32 = -6;
-const DP_MISS: i32 = -12;
-const DP_HELD: i32 = 5;
-
-#[derive(Debug, Default, Clone, Copy)]
-struct ParsedCommentCounts {
-    w: u32,
-    e: u32,
-    g: u32,
-    d: u32,
-    wo: u32,
-    m: u32,
-}
-
-fn parse_comment_counts(comment: &str) -> ParsedCommentCounts {
-    let mut counts = ParsedCommentCounts::default();
-    for part in comment.split(',') {
-        let s = part.trim();
-        if s.is_empty() {
-            continue;
-        }
-
-        let mut value: u32 = 0;
-        let mut idx = 0usize;
-        for (i, ch) in s.char_indices() {
-            if let Some(d) = ch.to_digit(10) {
-                value = value.saturating_mul(10).saturating_add(d);
-                idx = i + ch.len_utf8();
-            } else {
-                break;
-            }
-        }
-        if value == 0 {
-            continue;
-        }
-
-        let suffix = s[idx..].trim().to_ascii_lowercase();
-        match suffix.as_str() {
-            "w" => counts.w = value,
-            "e" => counts.e = value,
-            "g" => counts.g = value,
-            "d" => counts.d = value,
-            "wo" => counts.wo = value,
-            "m" => counts.m = value,
-            _ => {}
-        }
-    }
-    counts
-}
-
-fn find_chart_stats_for_hash(chart_hash: &str) -> Option<rssp::stats::ArrowStats> {
+fn find_chart_stats_for_hash(chart_hash: &str) -> Option<GsLampChartStats> {
     let cache = get_song_cache();
     for pack in cache.iter() {
         for song in &pack.songs {
             for chart in &song.charts {
                 if chart.short_hash == chart_hash {
-                    return Some(chart.stats.clone());
+                    return Some(GsLampChartStats {
+                        total_steps: chart.stats.total_steps,
+                        holds: chart.stats.holds,
+                        rolls: chart.stats.rolls,
+                    });
                 }
             }
         }
@@ -3443,383 +2489,23 @@ fn find_chart_stats_for_hash(chart_hash: &str) -> Option<rssp::stats::ArrowStats
     None
 }
 
-fn compute_lamp_index(score: f64, comment: Option<&str>, chart_hash: &str) -> Option<u8> {
-    let score_percent = score / 10000.0;
-
-    // Perfect 100%: always at least a W1 full combo lamp.
-    // Use a very small epsilon so only true 100.00% (score == 10000) hits this,
-    // not 99.95% (score == 9995) or similar edge cases.
-    if (score_percent - 1.0).abs() <= 1e-9 {
-        debug!(
-            "GrooveStats lamp: hash={} score={:.4}% -> Quad lamp (W1 FC, no DP check needed)",
-            chart_hash,
-            score_percent * 100.0
-        );
-        return Some(1);
-    }
-
-    let comment = if let Some(c) = comment {
-        c
-    } else {
-        debug!(
-            "GrooveStats lamp: hash={} score={:.4}% -> no lamp (no GrooveStats comment available)",
-            chart_hash,
-            score_percent * 100.0
-        );
-        return None;
-    };
-    let counts = parse_comment_counts(comment);
-
-    // Any explicit Miss or Way Off disqualifies lamps immediately.
-    if counts.m > 0 || counts.wo > 0 {
-        return None;
-    }
-
-    let stats = if let Some(s) = find_chart_stats_for_hash(chart_hash) {
-        s
-    } else {
-        debug!(
-            "GrooveStats lamp: hash={} score={:.4}% comment=\"{}\" -> no lamp (chart stats not found for hash)",
-            chart_hash,
-            score_percent * 100.0,
-            comment
-        );
-        return None;
-    };
-    let taps_rows = stats.total_steps as i32;
-    let holds = stats.holds as i32;
-    let rolls = stats.rolls as i32;
-
-    if taps_rows <= 0 {
-        debug!(
-            "GrooveStats lamp: hash={} score={:.4}% comment=\"{}\" -> no lamp (taps_rows <= 0, taps_rows={})",
-            chart_hash,
-            score_percent * 100.0,
-            comment,
-            taps_rows
-        );
-        return None;
-    }
-
-    // Reconstruct W1 count as "everything not explicitly listed".
-    let non_w1_from_suffixes = counts.e + counts.g + counts.d + counts.wo + counts.m + counts.w;
-    let inferred_w1 = if (non_w1_from_suffixes as i32) > taps_rows {
-        0
-    } else {
-        (taps_rows as u32).saturating_sub(counts.e + counts.g + counts.d + counts.wo + counts.m)
-    };
-    let w1_total = counts.w.max(inferred_w1);
-
-    // Dance Points from tap judgments (rows) only, per ITG PercentScoreWeight.
-    let dp_taps: i32 = (w1_total as i32) * DP_W1
-        + (counts.e as i32) * DP_W2
-        + (counts.g as i32) * DP_W3
-        + (counts.d as i32) * DP_W4
-        + (counts.wo as i32) * DP_W5
-        + (counts.m as i32) * DP_MISS;
-
-    // Holds + rolls assumed fully held for the "no hidden errors" hypothesis.
-    let dp_hold_roll: i32 = (holds + rolls) * DP_HELD;
-
-    // Maximum possible DP if every tap was W1 and all holds/rolls fully held.
-    let dp_possible_max: i32 = (taps_rows * DP_W1 + dp_hold_roll).max(1);
-    let dp_expect_no_hidden_errors: i32 = dp_taps + dp_hold_roll;
-
-    let dp_expect_frac = f64::from(dp_expect_no_hidden_errors) / f64::from(dp_possible_max);
-    let dp_diff = (score_percent - dp_expect_frac).abs();
-    let dp_consistent = dp_diff <= 0.0005;
-
-    if !dp_consistent {
-        // There must have been extra DP loss (e.g., dropped holds or hit mines).
-        debug!(
-            "GrooveStats lamp: hash={} score={:.4}% comment=\"{}\" -> DP mismatch: score%={:.5} vs no-hidden-errors%={:.5} (Δ={:.6}); \
-taps_rows={} holds={} rolls={} counts[w={}, e={}, g={}, d={}, wo={}, m={}] -> no lamp",
-            chart_hash,
-            score_percent * 100.0,
-            comment,
-            score_percent * 100.0,
-            dp_expect_frac * 100.0,
-            dp_diff * 100.0,
-            taps_rows,
-            holds,
-            rolls,
-            counts.w,
-            counts.e,
-            counts.g,
-            counts.d,
-            counts.wo,
-            counts.m
-        );
-        return None;
-    }
-
-    // At this point, we know there were no hidden hold/mine mistakes.
-    // Classify the lamp tier, mirroring Simply Love's StageAward semantics.
-    if counts.g == 0 && counts.d == 0 && counts.wo == 0 && counts.m == 0 {
-        // Only W1/W2 present (and W1 reconstructed) => W2 full combo (FEC).
-        if counts.e > 0 || w1_total > 0 {
-            debug!(
-                "GrooveStats lamp: hash={} score={:.4}% comment=\"{}\" -> DP ok (no hidden errors). \
-taps_rows={} holds={} rolls={} counts[w={}, e={}, g={}, d={}, wo={}, m={}] -> lamp=FEC (index=2)",
-                chart_hash,
-                score_percent * 100.0,
-                comment,
-                taps_rows,
-                holds,
-                rolls,
-                w1_total,
-                counts.e,
-                counts.g,
-                counts.d,
-                counts.wo,
-                counts.m
-            );
-            return Some(2);
-        }
-    }
-
-    if counts.d == 0 && counts.wo == 0 && counts.m == 0 {
-        // At least one Great, but no Decents/WayOff/Miss => W3 full combo.
-        if counts.g > 0 {
-            debug!(
-                "GrooveStats lamp: hash={} score={:.4}% comment=\"{}\" -> DP ok (no hidden errors). \
-taps_rows={} holds={} rolls={} counts[w={}, e={}, g={}, d={}, wo={}, m={}] -> lamp=W3 FC (index=3)",
-                chart_hash,
-                score_percent * 100.0,
-                comment,
-                taps_rows,
-                holds,
-                rolls,
-                w1_total,
-                counts.e,
-                counts.g,
-                counts.d,
-                counts.wo,
-                counts.m
-            );
-            return Some(3);
-        }
-    }
-
-    // No WayOff/Miss and DP-consistent => at worst a W4 full combo.
-    if counts.wo == 0 && counts.m == 0 {
-        debug!(
-            "GrooveStats lamp: hash={} score={:.4}% comment=\"{}\" -> DP ok (no hidden errors). \
-taps_rows={} holds={} rolls={} counts[w={}, e={}, g={}, d={}, wo={}, m={}] -> lamp=W4 FC (index=4)",
-            chart_hash,
-            score_percent * 100.0,
-            comment,
-            taps_rows,
-            holds,
-            rolls,
-            w1_total,
-            counts.e,
-            counts.g,
-            counts.d,
-            counts.wo,
-            counts.m
-        );
-        return Some(4);
-    }
-
-    None
-}
-
-fn compute_lamp_judge_count(lamp_index: Option<u8>, comment: Option<&str>) -> Option<u8> {
-    let lamp_index = lamp_index?;
-    let comment = comment?;
-    let counts = parse_comment_counts(comment);
-
-    // zmod-style single-digit overlay:
-    // - lamp 2 shows #W2
-    // - lamp 3 shows #W3
-    // (lamp 1 would show FA+ blue W1 count, which we don't track yet)
-    let count = match lamp_index {
-        2 => counts.e,
-        3 => counts.g,
-        _ => return None,
-    };
-    if (1..=9).contains(&count) {
-        Some(count as u8)
-    } else {
-        None
-    }
-}
-
-// --- Grade Calculation ---
-
-pub fn score_to_grade(score: f64) -> Grade {
-    let percent = score / 10000.0;
-    if percent >= 1.00 {
-        Grade::Tier01
-    }
-    // Note: We don't have enough info to detect Quints (W0) yet.
-    else if percent >= 0.99 {
-        Grade::Tier02
-    }
-    // three-stars
-    else if percent >= 0.98 {
-        Grade::Tier03
-    }
-    // two-stars
-    else if percent >= 0.96 {
-        Grade::Tier04
-    }
-    // one-star
-    else if percent >= 0.94 {
-        Grade::Tier05
-    }
-    // s-plus
-    else if percent >= 0.92 {
-        Grade::Tier06
-    }
-    // s
-    else if percent >= 0.89 {
-        Grade::Tier07
-    }
-    // s-minus
-    else if percent >= 0.86 {
-        Grade::Tier08
-    }
-    // a-plus
-    else if percent >= 0.83 {
-        Grade::Tier09
-    }
-    // a
-    else if percent >= 0.80 {
-        Grade::Tier10
-    }
-    // a-minus
-    else if percent >= 0.76 {
-        Grade::Tier11
-    }
-    // b-plus
-    else if percent >= 0.72 {
-        Grade::Tier12
-    }
-    // b
-    else if percent >= 0.68 {
-        Grade::Tier13
-    }
-    // b-minus
-    else if percent >= 0.64 {
-        Grade::Tier14
-    }
-    // c-plus
-    else if percent >= 0.60 {
-        Grade::Tier15
-    }
-    // c
-    else if percent >= 0.55 {
-        Grade::Tier16
-    }
-    // c-minus
-    else {
-        Grade::Tier17
-    } // d
-    // Grade::Failed is not score-based; it's determined by gameplay failure (e.g., lifebar empty),
-    // which is not yet implemented. This function will never return Grade::Failed.
-}
-
 // --- Public Fetch Function ---
 
 const SCORE_IMPORT_RATE_LIMIT_PER_SECOND: u32 = 3;
 const SCORE_IMPORT_REQUEST_INTERVAL: Duration = Duration::from_millis(334);
 const SCORE_IMPORT_PROGRESS_LOG_EVERY: usize = 100;
-const SCORE_IMPORT_GS_BASE_URL: &str = "https://api.groovestats.com";
-const SCORE_IMPORT_BS_BASE_URL: &str = "https://boogiestats.andr.host";
-const SCORE_IMPORT_AC_BASE_URL: &str = "https://api.arrowcloud.dance";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScoreImportEndpoint {
-    GrooveStats,
-    BoogieStats,
-    ArrowCloud,
-}
-
-impl ScoreImportEndpoint {
-    #[inline(always)]
-    pub const fn display_name(self) -> &'static str {
-        match self {
-            Self::GrooveStats => "GrooveStats",
-            Self::BoogieStats => "BoogieStats",
-            Self::ArrowCloud => "ArrowCloud",
-        }
-    }
-
-    #[inline(always)]
-    pub const fn requires_username(self) -> bool {
-        !matches!(self, Self::ArrowCloud)
-    }
-
-    fn player_leaderboards_url(self) -> String {
-        let base = match self {
-            Self::GrooveStats => SCORE_IMPORT_GS_BASE_URL,
-            Self::BoogieStats => SCORE_IMPORT_BS_BASE_URL,
-            Self::ArrowCloud => SCORE_IMPORT_AC_BASE_URL,
-        };
-        format!("{}/player-leaderboards.php", base.trim_end_matches('/'))
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct ScoreBulkImportSummary {
-    pub requested_charts: usize,
-    pub imported_scores: usize,
-    pub missing_scores: usize,
-    pub failed_requests: usize,
-    pub rate_limit_per_second: u32,
-    pub elapsed_seconds: f32,
-    pub canceled: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct ScoreImportProgress {
-    pub processed_charts: usize,
-    pub total_charts: usize,
-    pub imported_scores: usize,
-    pub missing_scores: usize,
-    pub failed_requests: usize,
-    pub detail: String,
-}
-
-fn score_import_api_key_for_endpoint<'a>(
-    endpoint: ScoreImportEndpoint,
-    profile: &'a Profile,
-) -> &'a str {
-    match endpoint {
-        ScoreImportEndpoint::GrooveStats | ScoreImportEndpoint::BoogieStats => {
-            profile.groovestats_api_key.trim()
-        }
-        ScoreImportEndpoint::ArrowCloud => profile.arrowcloud_api_key.trim(),
-    }
-}
-
-fn score_entry_matches_profile(
-    entry: &LeaderboardApiEntry,
-    endpoint: ScoreImportEndpoint,
-    username: &str,
-) -> bool {
-    if entry.is_self {
-        return true;
-    }
-    if endpoint.requires_username() {
-        return entry.name.eq_ignore_ascii_case(username);
-    }
-    false
-}
 
 fn fetch_player_score_from_endpoint(
     endpoint: ScoreImportEndpoint,
     profile: &Profile,
     chart_hash: &str,
-) -> Result<Option<CachedScore>, Box<dyn Error + Send + Sync>> {
+) -> Result<CachedScoreImportResult, Box<dyn Error + Send + Sync>> {
     let chart_hash = chart_hash.trim();
     if chart_hash.is_empty() {
         return Err("Missing chart hash for score request.".into());
     }
 
-    let api_key = score_import_api_key_for_endpoint(endpoint, profile);
+    let api_key = profile.score_import_api_key(endpoint);
     if api_key.is_empty() {
         return Err(format!(
             "{} API key is missing in profile configuration.",
@@ -3827,7 +2513,7 @@ fn fetch_player_score_from_endpoint(
         )
         .into());
     }
-    let username = profile.groovestats_username.trim();
+    let username = profile.score_import_username(endpoint);
     if endpoint.requires_username() && username.is_empty() {
         return Err(format!(
             "{} username is missing in profile configuration.",
@@ -3836,64 +2522,47 @@ fn fetch_player_score_from_endpoint(
         .into());
     }
 
-    let agent = network::get_agent();
-    let api_url = endpoint.player_leaderboards_url();
-    let response = agent
-        .get(&api_url)
-        .header("x-api-key-player-1", api_key)
-        .query("chartHashP1", chart_hash)
-        .call()?;
-
-    if response.status() != 200 {
-        return Err(format!("API returned status {}", response.status()).into());
-    }
-
-    let decoded: LeaderboardsApiResponse = response.into_body().read_json()?;
-    let score_opt = decoded
-        .player1
-        .map_or_else(Vec::new, |p1| p1.gs_leaderboard)
-        .into_iter()
-        .find(|entry| score_entry_matches_profile(entry, endpoint, username))
-        .map(|entry| {
-            cached_score_from_gs(
-                entry.score,
-                entry.comments.as_deref(),
-                chart_hash,
-                entry.is_fail,
-            )
-        });
-
-    Ok(score_opt)
-}
-
-fn fetch_player_score_from_api(
-    profile: &Profile,
-    chart_hash: &str,
-) -> Result<Option<CachedScore>, Box<dyn Error + Send + Sync>> {
-    let endpoint = if crate::core::network::is_boogiestats_active() {
-        ScoreImportEndpoint::BoogieStats
-    } else {
-        ScoreImportEndpoint::GrooveStats
-    };
-    fetch_player_score_from_endpoint(endpoint, profile, chart_hash)
+    let imported =
+        groovestats_api::fetch_player_score_import_result(endpoint, api_key, username, chart_hash)
+            .map_err(|error| boxed_request_error("API", error))?;
+    let stats = imported
+        .score
+        .as_ref()
+        .and_then(|score| chart_stats_for_imported_score(score, chart_hash));
+    Ok(cached_score_import_result_from_imported(imported, stats))
 }
 
 fn collect_chart_hashes_for_import(
-    pack_group_filter: Option<&str>,
+    pack_groups_filter: &[String],
     profile_id: &str,
     only_missing_gs_scores: bool,
-) -> Vec<String> {
-    let filter_norm = pack_group_filter
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(str::to_ascii_lowercase);
+) -> Vec<(String, Vec<String>)> {
     let existing_scores = if only_missing_gs_scores {
         cached_gs_chart_hashes_for_profile(profile_id)
     } else {
         HashSet::new()
     };
+    collect_chart_hashes_per_pack_for_import(pack_groups_filter, &existing_scores)
+}
 
-    let mut chart_hashes = Vec::new();
+/// Per-pack chart-hash collection for score import.
+///
+/// Returns a vector of `(pack_display_name, chart_hashes)` pairs preserving
+/// song-cache iteration order. Globally deduplicates chart hashes across packs
+/// (first pack wins). Optionally filters by pack group / display name and
+/// skips charts present in `existing_scores` (caller supplies the right cache
+/// for the endpoint they're importing into).
+fn collect_chart_hashes_per_pack_for_import(
+    pack_groups_filter: &[String],
+    existing_scores: &HashSet<String>,
+) -> Vec<(String, Vec<String>)> {
+    let filter_set: HashSet<String> = pack_groups_filter
+        .iter()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty())
+        .collect();
+
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let song_cache = get_song_cache();
     for pack in song_cache.iter() {
@@ -3903,29 +2572,34 @@ fn collect_chart_hashes_for_import(
         } else {
             pack.name.trim()
         };
-        if let Some(filter) = filter_norm.as_deref()
-            && group_name.to_ascii_lowercase() != filter
-            && display_name.to_ascii_lowercase() != filter
-        {
-            continue;
+        if !filter_set.is_empty() {
+            let group_lc = group_name.to_ascii_lowercase();
+            let display_lc = display_name.to_ascii_lowercase();
+            if !filter_set.contains(&group_lc) && !filter_set.contains(&display_lc) {
+                continue;
+            }
         }
 
+        let mut hashes = Vec::new();
         for song in &pack.songs {
             for chart in &song.charts {
                 let chart_hash = chart.short_hash.trim();
                 if chart_hash.is_empty() {
                     continue;
                 }
-                if only_missing_gs_scores && existing_scores.contains(chart_hash) {
+                if existing_scores.contains(chart_hash) {
                     continue;
                 }
                 if seen.insert(chart_hash.to_string()) {
-                    chart_hashes.push(chart_hash.to_string());
+                    hashes.push(chart_hash.to_string());
                 }
             }
         }
+        if !hashes.is_empty() {
+            out.push((display_name.to_string(), hashes));
+        }
     }
-    chart_hashes
+    out
 }
 
 #[inline(always)]
@@ -3939,12 +2613,15 @@ fn wait_for_next_import_request(last_request_started_at: Option<Instant>) {
     }
 }
 
-pub fn import_scores_for_profile<F>(
-    endpoint: ScoreImportEndpoint,
+/// AC-specific bulk import orchestrator. Sends one POST per pack to
+/// `/v1/retrieve-scores`, splitting any pack with > [`ARROWCLOUD_BULK_MAX_HASHES`]
+/// charts into chunks. Throttled to [`SCORE_IMPORT_RATE_LIMIT_PER_SECOND`]
+/// requests per second to match the per-chart paths.
+fn import_scores_for_profile_arrowcloud_bulk<F>(
     profile_id: String,
     profile: Profile,
-    pack_group: Option<String>,
-    only_missing_gs_scores: bool,
+    pack_groups: Vec<String>,
+    only_missing_scores: bool,
     on_progress: F,
     should_cancel: impl Fn() -> bool,
 ) -> Result<ScoreBulkImportSummary, Box<dyn Error + Send + Sync>>
@@ -3952,28 +2629,36 @@ where
     F: FnMut(ScoreImportProgress),
 {
     let mut on_progress = on_progress;
-    let api_key = score_import_api_key_for_endpoint(endpoint, &profile);
+    let api_key = profile
+        .score_import_api_key(ScoreImportEndpoint::ArrowCloud)
+        .to_string();
     if api_key.is_empty() {
-        return Err(format!(
-            "{} API key is not set in profile configuration.",
-            endpoint.display_name()
-        )
-        .into());
-    }
-    if endpoint.requires_username() && profile.groovestats_username.trim().is_empty() {
-        return Err(format!(
-            "{} username is not set in profile configuration.",
-            endpoint.display_name()
-        )
-        .into());
+        return Err("ArrowCloud API key is not set in profile configuration.".into());
     }
 
-    let username = profile.groovestats_username.trim().to_string();
-    let chart_hashes =
-        collect_chart_hashes_for_import(pack_group.as_deref(), &profile_id, only_missing_gs_scores);
-    let requested_charts = chart_hashes.len();
-    let filter_note = if only_missing_gs_scores {
-        " (missing GS only)"
+    // Resolve our user id once up front. The bulk endpoint accepts a missing
+    // userId (it'll resolve from the bearer token), but sending it explicitly
+    // is preferred and matches the documented contract.
+    let user_id = match arrowcloud_api::fetch_user_context(&api_key) {
+        Ok(Some(ctx)) => ctx.self_user_id,
+        Ok(None) => None,
+        Err(e) => {
+            warn!("Could not resolve ArrowCloud user id, sending without it: {e}");
+            None
+        }
+    };
+
+    let existing_scores = if only_missing_scores {
+        cached_ac_chart_hashes_with_itg_for_profile(&profile_id)
+    } else {
+        HashSet::new()
+    };
+    let pack_chart_groups =
+        collect_chart_hashes_per_pack_for_import(&pack_groups, &existing_scores);
+    let requested_charts: usize = pack_chart_groups.iter().map(|(_, h)| h.len()).sum();
+    let total_packs = pack_chart_groups.len();
+    let filter_note = if only_missing_scores {
+        " (missing only)"
     } else {
         ""
     };
@@ -3984,9 +2669,7 @@ where
         missing_scores: 0,
         failed_requests: 0,
         detail: format!(
-            "Queued {requested_charts} chart hashes for {} import{}.",
-            endpoint.display_name(),
-            filter_note
+            "Queued {requested_charts} chart hashes across {total_packs} pack(s) for ArrowCloud bulk import{filter_note}."
         ),
     });
     if requested_charts == 0 {
@@ -4006,80 +2689,314 @@ where
     let mut imported_scores = 0usize;
     let mut missing_scores = 0usize;
     let mut failed_requests = 0usize;
+    let mut processed_charts = 0usize;
     let mut canceled = false;
 
-    for (idx, chart_hash) in chart_hashes.iter().enumerate() {
-        if should_cancel() {
-            canceled = true;
-            debug!(
-                "{} score import canceled after {idx}/{requested_charts} charts.",
-                endpoint.display_name()
-            );
-            break;
-        }
-        wait_for_next_import_request(last_request_started_at);
-        if should_cancel() {
-            canceled = true;
-            debug!(
-                "{} score import canceled after {idx}/{requested_charts} charts.",
-                endpoint.display_name()
-            );
-            break;
-        }
-        last_request_started_at = Some(Instant::now());
-        let detail = match fetch_player_score_from_endpoint(endpoint, &profile, chart_hash) {
-            Ok(Some(score)) => {
-                cache_gs_score_for_profile(&profile_id, chart_hash, score, username.as_str());
-                imported_scores += 1;
-                format!(
-                    "Found {} score for {} on {}.",
-                    endpoint.display_name(),
-                    username,
-                    chart_hash
-                )
-            }
-            Ok(None) => {
-                missing_scores += 1;
-                format!(
-                    "No {} score for {} on {}.",
-                    endpoint.display_name(),
-                    username,
-                    chart_hash
-                )
-            }
-            Err(e) => {
-                failed_requests += 1;
-                let msg = format!(
-                    "{} import request failed for chart {}: {}",
-                    endpoint.display_name(),
-                    chart_hash,
-                    e
-                );
-                warn!("{msg}");
-                msg
-            }
-        };
+    'packs: for (pack_idx, (pack_name, hashes)) in pack_chart_groups.into_iter().enumerate() {
+        let pack_chart_count = hashes.len();
+        let mut pack_hits = 0usize;
+        let mut pack_misses = 0usize;
+        let mut pack_failures = 0usize;
 
-        let done = idx + 1;
-        on_progress(ScoreImportProgress {
-            processed_charts: done,
-            total_charts: requested_charts,
-            imported_scores,
-            missing_scores,
-            failed_requests,
-            detail: detail.clone(),
-        });
-        if done == requested_charts || done % SCORE_IMPORT_PROGRESS_LOG_EVERY == 0 || done == 1 {
-            debug!(
-                "{} bulk import progress for '{}': {done}/{requested_charts} charts (imported={}, missing={}, failed={})",
-                endpoint.display_name(),
-                username,
+        for chunk in hashes.chunks(ARROWCLOUD_BULK_MAX_HASHES) {
+            if should_cancel() {
+                canceled = true;
+                debug!(
+                    "ArrowCloud bulk import canceled at pack {} ({}/{}).",
+                    pack_name, pack_idx, total_packs
+                );
+                break 'packs;
+            }
+            wait_for_next_import_request(last_request_started_at);
+            if should_cancel() {
+                canceled = true;
+                break 'packs;
+            }
+            last_request_started_at = Some(Instant::now());
+
+            let chunk_vec = chunk.to_vec();
+            let request_started = Instant::now();
+            let detail = match arrowcloud_api::retrieve_score_cache_entries(
+                &api_key,
+                user_id.as_deref(),
+                &chunk_vec,
+                &ArrowCloudLeaderboard::ALL_GLOBAL,
+            )
+            .map_err(|error| boxed_request_error("API", error))
+            {
+                Ok(scores_by_chart) => {
+                    let request_elapsed = request_started.elapsed();
+                    let hits = scores_by_chart.len();
+                    let misses = chunk_vec.len().saturating_sub(hits);
+                    if !scores_by_chart.is_empty() {
+                        set_cached_ac_scores_for_profile_bulk(
+                            &profile_id,
+                            scores_by_chart.into_iter(),
+                        );
+                    }
+                    imported_scores += hits;
+                    missing_scores += misses;
+                    pack_hits += hits;
+                    pack_misses += misses;
+                    debug!(
+                        "ArrowCloud /v1/retrieve-scores pack={}/{} pack_name='{}' chunk={} took={:.0}ms hits={} misses={}",
+                        pack_idx + 1,
+                        total_packs,
+                        pack_name,
+                        chunk_vec.len(),
+                        request_elapsed.as_secs_f32() * 1000.0,
+                        hits,
+                        misses,
+                    );
+                    format!(
+                        "Pack {}/{}: {pack_name} -> {hits} hit, {misses} missing ({:.0}ms)",
+                        pack_idx + 1,
+                        total_packs,
+                        request_elapsed.as_secs_f32() * 1000.0,
+                    )
+                }
+                Err(e) => {
+                    let request_elapsed = request_started.elapsed();
+                    failed_requests += 1;
+                    pack_failures += 1;
+                    let msg = format!(
+                        "Pack {}/{}: {pack_name} request failed ({} charts, {:.0}ms): {e}",
+                        pack_idx + 1,
+                        total_packs,
+                        chunk_vec.len(),
+                        request_elapsed.as_secs_f32() * 1000.0,
+                    );
+                    warn!("{msg}");
+                    msg
+                }
+            };
+
+            processed_charts += chunk_vec.len();
+            on_progress(ScoreImportProgress {
+                processed_charts,
+                total_charts: requested_charts,
                 imported_scores,
                 missing_scores,
-                failed_requests
-            );
+                failed_requests,
+                detail: detail.clone(),
+            });
+            debug!("{detail}");
         }
-        debug!("{detail}");
+
+        debug!(
+            "Pack {}/{} complete: {pack_name} ({pack_chart_count} charts -> {pack_hits} hit, {pack_misses} missing{}).",
+            pack_idx + 1,
+            total_packs,
+            if pack_failures > 0 {
+                format!(", {pack_failures} failed")
+            } else {
+                String::new()
+            },
+        );
+    }
+
+    Ok(ScoreBulkImportSummary {
+        requested_charts,
+        imported_scores,
+        missing_scores,
+        failed_requests,
+        rate_limit_per_second: SCORE_IMPORT_RATE_LIMIT_PER_SECOND,
+        elapsed_seconds: import_started.elapsed().as_secs_f32(),
+        canceled,
+    })
+}
+
+pub fn import_scores_for_profile<F>(
+    endpoint: ScoreImportEndpoint,
+    profile_id: String,
+    profile: Profile,
+    pack_groups: Vec<String>,
+    only_missing_gs_scores: bool,
+    on_progress: F,
+    should_cancel: impl Fn() -> bool,
+) -> Result<ScoreBulkImportSummary, Box<dyn Error + Send + Sync>>
+where
+    F: FnMut(ScoreImportProgress),
+{
+    if endpoint == ScoreImportEndpoint::ArrowCloud {
+        return import_scores_for_profile_arrowcloud_bulk(
+            profile_id,
+            profile,
+            pack_groups,
+            only_missing_gs_scores,
+            on_progress,
+            should_cancel,
+        );
+    }
+
+    let mut on_progress = on_progress;
+    let api_key = profile.score_import_api_key(endpoint);
+    if api_key.is_empty() {
+        return Err(format!(
+            "{} API key is not set in profile configuration.",
+            endpoint.display_name()
+        )
+        .into());
+    }
+    if endpoint.requires_username() && profile.score_import_username(endpoint).is_empty() {
+        return Err(format!(
+            "{} username is not set in profile configuration.",
+            endpoint.display_name()
+        )
+        .into());
+    }
+
+    let username = profile.score_import_username(endpoint).to_string();
+    let pack_chart_groups =
+        collect_chart_hashes_for_import(&pack_groups, &profile_id, only_missing_gs_scores);
+    let requested_charts: usize = pack_chart_groups.iter().map(|(_, h)| h.len()).sum();
+    let total_packs = pack_chart_groups.len();
+    let filter_note = if only_missing_gs_scores {
+        " (missing only)"
+    } else {
+        ""
+    };
+    on_progress(ScoreImportProgress {
+        processed_charts: 0,
+        total_charts: requested_charts,
+        imported_scores: 0,
+        missing_scores: 0,
+        failed_requests: 0,
+        detail: format!(
+            "Queued {requested_charts} chart hashes across {total_packs} pack(s) for {} import{filter_note}.",
+            endpoint.display_name(),
+        ),
+    });
+    if requested_charts == 0 {
+        return Ok(ScoreBulkImportSummary {
+            requested_charts: 0,
+            imported_scores: 0,
+            missing_scores: 0,
+            failed_requests: 0,
+            rate_limit_per_second: SCORE_IMPORT_RATE_LIMIT_PER_SECOND,
+            elapsed_seconds: 0.0,
+            canceled: false,
+        });
+    }
+
+    let import_started = Instant::now();
+    let mut last_request_started_at: Option<Instant> = None;
+    let mut imported_scores = 0usize;
+    let mut missing_scores = 0usize;
+    let mut failed_requests = 0usize;
+    let mut processed_charts = 0usize;
+    let mut canceled = false;
+
+    'packs: for (pack_idx, (pack_name, hashes)) in pack_chart_groups.into_iter().enumerate() {
+        let pack_chart_count = hashes.len();
+        let mut pack_hits = 0usize;
+        let mut pack_misses = 0usize;
+        let mut pack_failures = 0usize;
+
+        for chart_hash in &hashes {
+            if should_cancel() {
+                canceled = true;
+                debug!(
+                    "{} score import canceled at pack {}/{} after {processed_charts}/{requested_charts} charts.",
+                    endpoint.display_name(),
+                    pack_idx + 1,
+                    total_packs,
+                );
+                break 'packs;
+            }
+            wait_for_next_import_request(last_request_started_at);
+            if should_cancel() {
+                canceled = true;
+                break 'packs;
+            }
+            last_request_started_at = Some(Instant::now());
+            match fetch_player_score_from_endpoint(endpoint, &profile, chart_hash) {
+                Ok(result) => {
+                    if result.itl_self_found {
+                        itl::set_cached_online_self_score(
+                            Some(profile_id.as_str()),
+                            api_key,
+                            chart_hash,
+                            result.itl_self_score,
+                        );
+                        itl::set_cached_online_self_rank(
+                            Some(profile_id.as_str()),
+                            api_key,
+                            chart_hash,
+                            result.itl_self_rank,
+                        );
+                    }
+                    if let Some(score) = result.score {
+                        cache_gs_score_for_profile(
+                            &profile_id,
+                            chart_hash,
+                            score,
+                            username.as_str(),
+                            result.score_proves_nonquint_ex,
+                        );
+                        imported_scores += 1;
+                        pack_hits += 1;
+                    } else {
+                        missing_scores += 1;
+                        pack_misses += 1;
+                    }
+                }
+                Err(e) => {
+                    failed_requests += 1;
+                    pack_failures += 1;
+                    warn!(
+                        "{} import request failed for chart {}: {}",
+                        endpoint.display_name(),
+                        chart_hash,
+                        e,
+                    );
+                }
+            }
+
+            processed_charts += 1;
+            let detail = format!(
+                "Pack {}/{}: {pack_name} -> {pack_hits} hit, {pack_misses} missing{}",
+                pack_idx + 1,
+                total_packs,
+                if pack_failures > 0 {
+                    format!(", {pack_failures} failed")
+                } else {
+                    String::new()
+                },
+            );
+            on_progress(ScoreImportProgress {
+                processed_charts,
+                total_charts: requested_charts,
+                imported_scores,
+                missing_scores,
+                failed_requests,
+                detail,
+            });
+            if processed_charts == requested_charts
+                || processed_charts % SCORE_IMPORT_PROGRESS_LOG_EVERY == 0
+                || processed_charts == 1
+            {
+                debug!(
+                    "{} import progress for '{}': {processed_charts}/{requested_charts} charts (imported={}, missing={}, failed={})",
+                    endpoint.display_name(),
+                    username,
+                    imported_scores,
+                    missing_scores,
+                    failed_requests,
+                );
+            }
+        }
+
+        debug!(
+            "Pack {}/{} complete: {pack_name} ({pack_chart_count} charts -> {pack_hits} hit, {pack_misses} missing{}).",
+            pack_idx + 1,
+            total_packs,
+            if pack_failures > 0 {
+                format!(", {pack_failures} failed")
+            } else {
+                String::new()
+            },
+        );
     }
 
     Ok(ScoreBulkImportSummary {
@@ -4098,30 +3015,33 @@ pub fn fetch_and_store_grade(
     profile: Profile,
     chart_hash: String,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    if profile.groovestats_api_key.trim().is_empty()
-        || profile.groovestats_username.trim().is_empty()
-    {
+    let endpoint = active_groovestats_service().score_import_endpoint();
+    if !profile.has_score_import_credentials(endpoint) {
         return Err("GrooveStats API key or username is not set in profile.ini.".into());
     }
 
     debug!(
         "Requesting scores for '{}' on chart '{}'...",
-        profile.groovestats_username, chart_hash
+        profile.score_import_username(endpoint),
+        chart_hash
     );
 
-    if let Some(cached_score) = fetch_player_score_from_api(&profile, chart_hash.as_str())? {
+    let result = fetch_player_score_from_endpoint(endpoint, &profile, chart_hash.as_str())?;
+    if let Some(cached_score) = result.score {
         cache_gs_score_for_profile(
             &profile_id,
             &chart_hash,
             cached_score,
-            profile.groovestats_username.trim(),
+            profile.score_import_username(endpoint),
+            result.score_proves_nonquint_ex,
         );
     } else {
         warn!(
             "No score found for player '{}' on chart '{}'. Caching as Failed.",
-            profile.groovestats_username, chart_hash
+            profile.score_import_username(endpoint),
+            chart_hash
         );
-        set_cached_gs_score_for_profile(&profile_id, chart_hash, cached_failed_gs_score());
+        set_cached_gs_score_for_profile(&profile_id, chart_hash, cached_missing_gs_score());
     }
 
     Ok(())
@@ -4130,117 +3050,168 @@ pub fn fetch_and_store_grade(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::game::timing::ScatterPoint;
-    use serde_json::{Value, json};
-
-    fn sample_scatter(time_sec: f32, offset_ms: Option<f32>) -> ScatterPoint {
-        ScatterPoint {
-            time_sec,
-            offset_ms,
-            direction_code: 1,
-            is_stream: false,
-            is_left_foot: false,
-            miss_because_held: false,
-        }
-    }
 
     #[test]
-    fn arrowcloud_timing_data_keeps_miss_rows() {
-        let scatter = [
-            sample_scatter(12.5, Some(8.0)),
-            sample_scatter(12.75, None),
-            sample_scatter(f32::NAN, Some(2.0)),
-        ];
-        let timing_data = arrowcloud_timing_data_from_scatter(&scatter);
-        assert_eq!(timing_data.len(), 2);
-
-        let value = serde_json::to_value(&timing_data).expect("serialize timingData");
-        assert_eq!(value[0][0], json!(12.5));
-        let first_offset = value[0][1]
-            .as_f64()
-            .expect("timingData[0][1] should be numeric");
-        assert!((first_offset - 0.008).abs() < 1e-6);
-        assert_eq!(value[1][0], json!(12.75));
-        assert_eq!(value[1][1], json!("Miss"));
-    }
-
-    #[test]
-    fn arrowcloud_payload_serializes_miss_and_counts() {
-        let payload = ArrowCloudPayload {
-            song_name: "Test Song".to_string(),
-            artist: "Test Artist".to_string(),
-            pack: "Test Pack".to_string(),
-            length: "1:23".to_string(),
-            hash: "deadbeefcafebabe".to_string(),
-            timing_data: vec![(24.488_208_770_752, ArrowCloudTimingOffset::Miss("Miss"))],
-            difficulty: 12,
-            stepartist: "Tester".to_string(),
-            radar: ArrowCloudRadar {
-                holds: [1, 2],
-                mines: [3, 4],
-                rolls: [5, 6],
-            },
-            judgment_counts: ArrowCloudJudgmentCounts {
-                fantastic_plus: 10,
-                fantastic: 20,
-                excellent: 30,
-                great: 40,
-                decent: 50,
-                way_off: 60,
-                miss: 3,
-                total_steps: 213,
-                holds_held: 1,
-                total_holds: 2,
-                mines_hit: 3,
-                total_mines: 4,
-                rolls_held: 5,
-                total_rolls: 6,
-            },
-            nps_info: ArrowCloudNpsInfo {
-                peak_nps: 0.0,
-                points: Vec::new(),
-            },
-            lifebar_info: Vec::new(),
-            modifiers: ArrowCloudModifiers {
-                visual_delay: 0,
-                acceleration: Vec::new(),
-                appearance: Vec::new(),
-                effect: Vec::new(),
-                mini: 0,
-                turn: "None".to_string(),
-                disabled_windows: "None".to_string(),
-                speed: ArrowCloudSpeed {
-                    value: 600.0,
-                    speed_type: "C",
-                },
-                perspective: "Overhead".to_string(),
-                noteskin: "cel".to_string(),
-                scroll: None,
-            },
-            music_rate: 1.0,
-            used_autoplay: false,
-            passed: true,
-            body_version: ARROWCLOUD_BODY_VERSION,
-            arrow_cloud_body_version: ARROWCLOUD_BODY_VERSION,
-            engine_name: ARROWCLOUD_ENGINE_NAME,
-            engine_version: ARROWCLOUD_ENGINE_VERSION,
-        };
-
-        let value = serde_json::to_value(&payload).expect("serialize ArrowCloud payload");
-        assert_eq!(value["timingData"][0][1], json!("Miss"));
-        assert_eq!(value["judgmentCounts"]["miss"], json!(3));
-        assert_eq!(value["judgmentCounts"]["wayOff"], json!(60));
-        assert_eq!(value["bodyVersion"], Value::String("1.4".to_string()));
+    fn local_lamp_uses_single_digit_white_fantastics() {
         assert_eq!(
-            value["_arrowCloudBodyVersion"],
-            Value::String("1.4".to_string())
+            compute_local_lamp([12, 0, 0, 0, 0, 0], Grade::Tier01, Some(5)),
+            (Some(1), Some(5))
         );
+        assert_eq!(
+            compute_local_lamp([12, 0, 0, 0, 0, 0], Grade::Quint, Some(0)),
+            (Some(0), None)
+        );
+    }
+
+    #[test]
+    fn cache_gs_score_from_leaderboard_keeps_existing_score_when_self_missing() {
+        let profile_id = "test-profile-missing-self";
+        let chart_hash = "deadbeef";
+        let existing = CachedScore {
+            grade: Grade::Tier01,
+            score_percent: 0.9934,
+            lamp_index: Some(1),
+            lamp_judge_count: Some(2),
+        };
+        {
+            let mut state = GS_SCORE_CACHE.lock().unwrap();
+            state.loaded_profiles.insert(
+                profile_id.to_string(),
+                HashMap::from([(chart_hash.to_string(), existing)]),
+            );
+        }
+
+        cache_gs_score_from_leaderboard(profile_id, "PerfectTaste", chart_hash, None);
+
+        let cached = GS_SCORE_CACHE
+            .lock()
+            .unwrap()
+            .loaded_profiles
+            .get(profile_id)
+            .and_then(|scores| scores.get(chart_hash))
+            .copied();
+        assert_eq!(cached, Some(existing));
+
+        GS_SCORE_CACHE
+            .lock()
+            .unwrap()
+            .loaded_profiles
+            .remove(profile_id);
+    }
+
+    #[test]
+    fn cache_gs_score_for_profile_overwrites_same_score_pass_with_fail() {
+        let profile_id = "test-profile-force-fail";
+        let chart_hash = "deadbeef";
+        {
+            let mut state = GS_SCORE_CACHE.lock().unwrap();
+            state.loaded_profiles.insert(
+                profile_id.to_string(),
+                HashMap::from([(
+                    chart_hash.to_string(),
+                    CachedScore {
+                        grade: Grade::Tier17,
+                        score_percent: 0.1358,
+                        lamp_index: None,
+                        lamp_judge_count: None,
+                    },
+                )]),
+            );
+        }
+
+        cache_gs_score_for_profile(
+            profile_id,
+            chart_hash,
+            CachedScore {
+                grade: Grade::Failed,
+                score_percent: 0.1358,
+                lamp_index: None,
+                lamp_judge_count: None,
+            },
+            "PerfectTaste",
+            false,
+        );
+
+        let cached = GS_SCORE_CACHE
+            .lock()
+            .unwrap()
+            .loaded_profiles
+            .get(profile_id)
+            .and_then(|scores| scores.get(chart_hash))
+            .copied();
+        assert_eq!(cached.map(|score| score.grade), Some(Grade::Failed));
+
+        GS_SCORE_CACHE
+            .lock()
+            .unwrap()
+            .loaded_profiles
+            .remove(profile_id);
+    }
+
+    #[test]
+    fn cache_gs_score_from_leaderboard_uses_matching_local_fail() {
+        let profile_id = "test-profile-local-fail";
+        let chart_hash = "deadbeef";
+        {
+            let mut state = LOCAL_SCORE_CACHE.lock().unwrap();
+            state.loaded_profiles.insert(
+                profile_id.to_string(),
+                LocalScoreIndex {
+                    best_itg: HashMap::from([(
+                        chart_hash.to_string(),
+                        CachedScore {
+                            grade: Grade::Failed,
+                            score_percent: 0.1358,
+                            lamp_index: None,
+                            lamp_judge_count: None,
+                        },
+                    )]),
+                    ..LocalScoreIndex::default()
+                },
+            );
+        }
+
+        cache_gs_score_from_leaderboard(
+            profile_id,
+            "PerfectTaste",
+            chart_hash,
+            Some(ImportedPlayerScore {
+                score_10000: 1358.0,
+                comments: None,
+                is_fail: false,
+                ex_evidence: deadsync_score::GsExEvidence::default(),
+            }),
+        );
+
+        let cached = GS_SCORE_CACHE
+            .lock()
+            .unwrap()
+            .loaded_profiles
+            .get(profile_id)
+            .and_then(|scores| scores.get(chart_hash))
+            .copied();
+        assert_eq!(cached.map(|score| score.grade), Some(Grade::Failed));
+
+        LOCAL_SCORE_CACHE
+            .lock()
+            .unwrap()
+            .loaded_profiles
+            .remove(profile_id);
+        GS_SCORE_CACHE
+            .lock()
+            .unwrap()
+            .loaded_profiles
+            .remove(profile_id);
     }
 
     #[test]
     fn player_leaderboard_cache_reuses_success_until_more_rows_are_needed() {
         let ready = PlayerLeaderboardCacheEntry {
-            value: PlayerLeaderboardCacheValue::Ready(PlayerLeaderboardData { panes: Vec::new() }),
+            value: PlayerLeaderboardCacheValue::Ready(PlayerLeaderboardData {
+                panes: Vec::new(),
+                itl_self_score: None,
+                itl_self_rank: None,
+            }),
             max_entries: 5,
             refreshed_at: Instant::now(),
             retry_after: None,
@@ -4263,7 +3234,11 @@ mod tests {
         assert!(should_fetch_player_leaderboard_entry(Some(&ready), 5, true));
 
         let cooled_down_ready = PlayerLeaderboardCacheEntry {
-            value: PlayerLeaderboardCacheValue::Ready(PlayerLeaderboardData { panes: Vec::new() }),
+            value: PlayerLeaderboardCacheValue::Ready(PlayerLeaderboardData {
+                panes: Vec::new(),
+                itl_self_score: None,
+                itl_self_rank: None,
+            }),
             max_entries: 5,
             refreshed_at: Instant::now(),
             retry_after: Some(Instant::now() + PLAYER_LEADERBOARD_ERROR_RETRY_INTERVAL),
@@ -4290,5 +3265,159 @@ mod tests {
             5,
             false
         ));
+    }
+
+    #[test]
+    fn in_flight_leaderboard_fetch_reruns_for_submit_refresh() {
+        assert!(!should_rerun_in_flight_player_leaderboard_fetch(
+            5, 5, false
+        ));
+        assert!(should_rerun_in_flight_player_leaderboard_fetch(
+            5, 10, false
+        ));
+        assert!(should_rerun_in_flight_player_leaderboard_fetch(5, 5, true));
+    }
+
+    #[test]
+    fn queued_leaderboard_refresh_keeps_largest_request() {
+        let key = PlayerLeaderboardCacheKey {
+            chart_hash: "deadbeef".to_string(),
+            api_key: "gs".to_string(),
+            arrowcloud_api_key: "ac".to_string(),
+            include_arrowcloud: true,
+            show_ex_score: false,
+        };
+        let mut pending_refresh = HashMap::new();
+
+        queue_player_leaderboard_refresh(&mut pending_refresh, &key, 5);
+        queue_player_leaderboard_refresh(&mut pending_refresh, &key, 10);
+        queue_player_leaderboard_refresh(&mut pending_refresh, &key, 3);
+
+        assert_eq!(pending_refresh.get(&key), Some(&10));
+    }
+
+    #[test]
+    fn newer_player_leaderboard_entry_blocks_older_fetch_result() {
+        let newer_entry = PlayerLeaderboardCacheEntry {
+            value: PlayerLeaderboardCacheValue::Ready(PlayerLeaderboardData {
+                panes: Vec::new(),
+                itl_self_score: None,
+                itl_self_rank: None,
+            }),
+            max_entries: 0,
+            refreshed_at: Instant::now(),
+            retry_after: None,
+        };
+        let older_request_started_at = Instant::now() - Duration::from_millis(1);
+        assert!(should_keep_newer_player_leaderboard_entry(
+            Some(&newer_entry),
+            older_request_started_at,
+        ));
+
+        let older_entry = PlayerLeaderboardCacheEntry {
+            value: PlayerLeaderboardCacheValue::Ready(PlayerLeaderboardData {
+                panes: Vec::new(),
+                itl_self_score: None,
+                itl_self_rank: None,
+            }),
+            max_entries: 0,
+            refreshed_at: Instant::now() - Duration::from_secs(1),
+            retry_after: None,
+        };
+        assert!(!should_keep_newer_player_leaderboard_entry(
+            Some(&older_entry),
+            Instant::now(),
+        ));
+    }
+
+    #[test]
+    fn wheel_score_read_does_not_deadlock_with_leaderboard_worker() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+
+        let profile_id = "test-deadlock-wheel-profile";
+        let chart_hash = "feedface";
+        let seeded = CachedScore {
+            grade: Grade::Tier01,
+            score_percent: 0.9123,
+            lamp_index: Some(2),
+            lamp_judge_count: Some(7),
+        };
+        // Seed every cache the read path consults so it never hits disk and the
+        // `ensure_*_loaded` helpers become no-ops during the run.
+        seed_session_local_itg_score(profile_id, chart_hash, seeded);
+        seed_session_gs_score(profile_id, chart_hash, seeded);
+        ensure_ac_score_cache_loaded_for_profile(profile_id);
+
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // Worker: reproduce the pre-fix lock order
+        // (`PLAYER_LEADERBOARD_CACHE -> LOCAL -> GS -> AC`). If the wheel read
+        // ever again held a score cache across the leaderboard lock, this
+        // ordering would close the cycle and deadlock.
+        let worker_stop = Arc::clone(&stop);
+        let worker = std::thread::spawn(move || {
+            while !worker_stop.load(Ordering::Relaxed) {
+                let lb = PLAYER_LEADERBOARD_CACHE.lock().unwrap();
+                let local = LOCAL_SCORE_CACHE.lock().unwrap();
+                let gs = GS_SCORE_CACHE.lock().unwrap();
+                let ac = AC_SCORE_CACHE.lock().unwrap();
+                drop((ac, gs, local, lb));
+            }
+        });
+
+        // Wheel: the fixed read path, hammered on a watchdog-guarded thread.
+        const ITERS: usize = 20_000;
+        let (done_tx, done_rx) = mpsc::channel();
+        let wheel_profile = profile_id.to_string();
+        let wheel_chart = chart_hash.to_string();
+        let wheel = std::thread::spawn(move || {
+            let mut last = None;
+            for _ in 0..ITERS {
+                last = get_cached_score_with_profile(&wheel_chart, &wheel_profile);
+            }
+            let _ = done_tx.send(last);
+        });
+
+        let result = done_rx.recv_timeout(std::time::Duration::from_secs(30));
+        stop.store(true, Ordering::Relaxed);
+
+        match result {
+            Ok(last) => {
+                wheel.join().expect("wheel thread panicked");
+                worker.join().expect("worker thread panicked");
+                assert_eq!(
+                    last,
+                    Some(seeded),
+                    "wheel read returned an unexpected merged score"
+                );
+            }
+            Err(_) => {
+                // The wheel thread is blocked on a lock; joining would hang, so
+                // we deliberately leak it and fail loudly. This is the deadlock.
+                panic!(
+                    "song-wheel score read deadlocked against the leaderboard worker \
+                     no progress within 30s"
+                );
+            }
+        }
+
+        // Leave the shared caches clean for other tests in this process.
+        LOCAL_SCORE_CACHE
+            .lock()
+            .unwrap()
+            .loaded_profiles
+            .remove(profile_id);
+        GS_SCORE_CACHE
+            .lock()
+            .unwrap()
+            .loaded_profiles
+            .remove(profile_id);
+        AC_SCORE_CACHE
+            .lock()
+            .unwrap()
+            .loaded_profiles
+            .remove(profile_id);
     }
 }

@@ -1,14 +1,17 @@
 use crate::act;
-use crate::core::audio;
-use crate::core::input::{InputEvent, VirtualAction};
-use crate::core::space::{screen_center_x, screen_center_y, widescale};
+use crate::assets::i18n::tr;
+use crate::assets::{FontRole, current_machine_font_key};
 use crate::screens::components::shared::screen_bar::{
     AvatarParams, ScreenBarParams, ScreenBarPosition, ScreenBarTitlePlacement,
 };
-use crate::screens::components::shared::{heart_bg, screen_bar};
+use crate::screens::components::shared::{screen_bar, visual_style_bg};
 use crate::screens::{Screen, ScreenAction};
-use crate::ui::actors::Actor;
-use crate::ui::color;
+use deadlib_present::actors::Actor;
+use deadlib_present::color;
+use deadlib_present::space::{screen_center_x, screen_center_y, widescale};
+use deadsync_audio_stream as audio;
+use deadsync_input::{InputEvent, VirtualAction};
+use deadsync_profile as profile_data;
 
 /* ------------------------------ layout ------------------------------- */
 const CHOICE_COUNT: usize = 3;
@@ -49,20 +52,21 @@ const fn choice_from_index(idx: usize) -> Choice {
 }
 
 #[inline(always)]
-const fn choice_label(choice: Choice) -> &'static str {
-    match choice {
-        Choice::Single => "1 Player",
-        Choice::Versus => "2 Players",
+fn choice_label(choice: Choice) -> String {
+    let key = match choice {
+        Choice::Single => "SinglePlayer",
+        Choice::Versus => "TwoPlayers",
         Choice::Double => "Double",
-    }
+    };
+    tr("SelectStyle", key).to_string()
 }
 
 #[inline(always)]
-const fn choice_play_style(choice: Choice) -> crate::game::profile::PlayStyle {
+const fn choice_play_style(choice: Choice) -> profile_data::PlayStyle {
     match choice {
-        Choice::Single => crate::game::profile::PlayStyle::Single,
-        Choice::Versus => crate::game::profile::PlayStyle::Versus,
-        Choice::Double => crate::game::profile::PlayStyle::Double,
+        Choice::Single => profile_data::PlayStyle::Single,
+        Choice::Versus => profile_data::PlayStyle::Versus,
+        Choice::Double => profile_data::PlayStyle::Double,
     }
 }
 
@@ -73,7 +77,7 @@ pub struct State {
     exit_requested: bool,
     exit_chosen_anim: bool,
     exit_target: Option<Screen>,
-    bg: heart_bg::State,
+    bg: visual_style_bg::State,
 }
 
 pub fn init() -> State {
@@ -84,7 +88,7 @@ pub fn init() -> State {
         exit_requested: false,
         exit_chosen_anim: false,
         exit_target: None,
-        bg: heart_bg::State::new(),
+        bg: visual_style_bg::State::new(),
     }
 }
 
@@ -136,21 +140,22 @@ pub fn handle_input(state: &mut State, ev: &InputEvent) -> ScreenAction {
         return ScreenAction::None;
     }
 
-    let nav = match crate::game::profile::get_session_player_side() {
-        crate::game::profile::PlayerSide::P2 => match ev.action {
-            VirtualAction::p2_left | VirtualAction::p2_menu_left => Some(-1),
-            VirtualAction::p2_right | VirtualAction::p2_menu_right => Some(1),
-            VirtualAction::p2_start => Some(0),
-            VirtualAction::p2_back => Some(9),
-            _ => None,
-        },
-        crate::game::profile::PlayerSide::P1 => match ev.action {
-            VirtualAction::p1_left | VirtualAction::p1_menu_left => Some(-1),
-            VirtualAction::p1_right | VirtualAction::p1_menu_right => Some(1),
-            VirtualAction::p1_start => Some(0),
-            VirtualAction::p1_back => Some(9),
-            _ => None,
-        },
+    let nav = match ev.action {
+        VirtualAction::p1_left
+        | VirtualAction::p2_left
+        | VirtualAction::p1_menu_left
+        | VirtualAction::p2_menu_left => Some(-1),
+
+        VirtualAction::p1_right
+        | VirtualAction::p2_right
+        | VirtualAction::p1_menu_right
+        | VirtualAction::p2_menu_right => Some(1),
+
+        VirtualAction::p1_start | VirtualAction::p2_start => Some(0),
+
+        VirtualAction::p1_back | VirtualAction::p2_back => Some(9),
+
+        _ => None,
     };
 
     match nav {
@@ -202,19 +207,14 @@ fn not_chosen_alpha(exit_t: f32) -> f32 {
 
 #[inline(always)]
 fn exit_anim_t(exiting: bool) -> f32 {
-    if !exiting {
-        return 0.0;
-    }
-
-    use crate::ui::{anim, runtime};
-    static STEPS: std::sync::OnceLock<Vec<anim::Step>> = std::sync::OnceLock::new();
-    let dur = CHOICE_CHOSEN_ZOOM_OUT_DURATION.max(0.0);
-    let steps = STEPS.get_or_init(|| vec![anim::linear(dur).x(dur).build()]);
-
-    let mut init = anim::TweenState::default();
-    init.x = 0.0;
-    let sid = runtime::site_id(file!(), line!(), column!(), 0x5353544C45584954u64); // "SSTLEXIT"
-    runtime::materialize(sid, init, steps).x.max(0.0)
+    static STEPS: std::sync::OnceLock<Vec<deadlib_present::anim::Step>> =
+        std::sync::OnceLock::new();
+    crate::screens::components::shared::transitions::linear_elapsed(
+        exiting,
+        CHOICE_CHOSEN_ZOOM_OUT_DURATION,
+        &STEPS,
+        0x5353544C45584954u64, // "SSTLEXIT"
+    )
 }
 
 fn push_pad_tiles(
@@ -252,26 +252,30 @@ fn push_pad_tiles(
     }
 }
 
-pub fn get_actors(state: &State) -> Vec<Actor> {
-    let mut actors = Vec::with_capacity(128);
+pub fn push_actors(actors: &mut Vec<Actor>, state: &State) {
+    actors.reserve(128);
     let exit_t = exit_anim_t(state.exit_chosen_anim);
     let (chosen_p, other_alpha) = if state.exit_chosen_anim {
         (
-            crate::ui::anim::bouncebegin_p(exit_t / CHOICE_CHOSEN_ZOOM_OUT_DURATION),
+            deadlib_present::anim::bouncebegin_p(exit_t / CHOICE_CHOSEN_ZOOM_OUT_DURATION),
             not_chosen_alpha(exit_t),
         )
     } else {
         (0.0, 1.0)
     };
 
-    actors.extend(state.bg.build(heart_bg::Params {
-        active_color_index: state.active_color_index,
-        backdrop_rgba: [0.0, 0.0, 0.0, 1.0],
-        alpha_mul: 1.0,
-    }));
+    state.bg.push(
+        actors,
+        visual_style_bg::Params {
+            active_color_index: state.active_color_index,
+            backdrop_rgba: [0.0, 0.0, 0.0, 1.0],
+            alpha_mul: 1.0,
+        },
+    );
 
+    let select_style = tr("ScreenTitles", "SelectStyle");
     actors.push(screen_bar::build(ScreenBarParams {
-        title: "SELECT STYLE",
+        title: &select_style,
         title_placement: ScreenBarTitlePlacement::Left,
         position: ScreenBarPosition::Top,
         transparent: false,
@@ -283,8 +287,8 @@ pub fn get_actors(state: &State) -> Vec<Actor> {
         right_avatar: None,
     }));
 
-    let p1_profile = crate::game::profile::get_for_side(crate::game::profile::PlayerSide::P1);
-    let p2_profile = crate::game::profile::get_for_side(crate::game::profile::PlayerSide::P2);
+    let p1_profile = crate::game::profile::get_for_side(profile_data::PlayerSide::P1);
+    let p2_profile = crate::game::profile::get_for_side(profile_data::PlayerSide::P2);
     let p1_avatar = p1_profile
         .avatar_texture_key
         .as_deref()
@@ -294,41 +298,40 @@ pub fn get_actors(state: &State) -> Vec<Actor> {
         .as_deref()
         .map(|texture_key| AvatarParams { texture_key });
 
-    let p1_joined =
-        crate::game::profile::is_session_side_joined(crate::game::profile::PlayerSide::P1);
-    let p2_joined =
-        crate::game::profile::is_session_side_joined(crate::game::profile::PlayerSide::P2);
-    let p1_guest =
-        crate::game::profile::is_session_side_guest(crate::game::profile::PlayerSide::P1);
-    let p2_guest =
-        crate::game::profile::is_session_side_guest(crate::game::profile::PlayerSide::P2);
+    let p1_joined = crate::game::profile::is_session_side_joined(profile_data::PlayerSide::P1);
+    let p2_joined = crate::game::profile::is_session_side_joined(profile_data::PlayerSide::P2);
+    let p1_guest = crate::game::profile::is_session_side_guest(profile_data::PlayerSide::P1);
+    let p2_guest = crate::game::profile::is_session_side_guest(profile_data::PlayerSide::P2);
 
+    let insert_card = tr("Common", "InsertCard");
+    let press_start = tr("Common", "PressStart");
     let (footer_left, left_avatar) = if p1_joined {
         (
             Some(if p1_guest {
-                "INSERT CARD"
+                insert_card.as_ref()
             } else {
                 p1_profile.display_name.as_str()
             }),
             if p1_guest { None } else { p1_avatar },
         )
     } else {
-        (Some("PRESS START"), None)
+        (Some(press_start.as_ref()), None)
     };
     let (footer_right, right_avatar) = if p2_joined {
         (
             Some(if p2_guest {
-                "INSERT CARD"
+                insert_card.as_ref()
             } else {
                 p2_profile.display_name.as_str()
             }),
             if p2_guest { None } else { p2_avatar },
         )
     } else {
-        (Some("PRESS START"), None)
+        (Some(press_start.as_ref()), None)
     };
+    let event_mode = tr("Common", "EventMode");
     actors.push(screen_bar::build(ScreenBarParams {
-        title: "EVENT MODE",
+        title: &event_mode,
         title_placement: ScreenBarTitlePlacement::Center,
         position: ScreenBarPosition::Bottom,
         transparent: false,
@@ -365,28 +368,20 @@ pub fn get_actors(state: &State) -> Vec<Actor> {
         match choice {
             Choice::Single => {
                 let used = color::decorative_rgba(state.active_color_index);
-                push_pad_tiles(&mut actors, x, cy, zoom, alpha, used, PAD_UNUSED_RGBA);
+                push_pad_tiles(actors, x, cy, zoom, alpha, used, PAD_UNUSED_RGBA);
             }
             Choice::Versus => {
                 let left = color::decorative_rgba(state.active_color_index - 1);
                 let right = color::decorative_rgba(state.active_color_index + 2);
                 let off = dual_pad_off * zoom;
-                push_pad_tiles(&mut actors, x - off, cy, zoom, alpha, left, PAD_UNUSED_RGBA);
-                push_pad_tiles(
-                    &mut actors,
-                    x + off,
-                    cy,
-                    zoom,
-                    alpha,
-                    right,
-                    PAD_UNUSED_RGBA,
-                );
+                push_pad_tiles(actors, x - off, cy, zoom, alpha, left, PAD_UNUSED_RGBA);
+                push_pad_tiles(actors, x + off, cy, zoom, alpha, right, PAD_UNUSED_RGBA);
             }
             Choice::Double => {
                 let used = color::decorative_rgba(state.active_color_index + 1);
                 let off = dual_pad_off * zoom;
-                push_pad_tiles(&mut actors, x - off, cy, zoom, alpha, used, PAD_UNUSED_RGBA);
-                push_pad_tiles(&mut actors, x + off, cy, zoom, alpha, used, PAD_UNUSED_RGBA);
+                push_pad_tiles(actors, x - off, cy, zoom, alpha, used, PAD_UNUSED_RGBA);
+                push_pad_tiles(actors, x + off, cy, zoom, alpha, used, PAD_UNUSED_RGBA);
             }
         }
 
@@ -398,9 +393,13 @@ pub fn get_actors(state: &State) -> Vec<Actor> {
             z(1):
             shadowlength(1.0):
             diffuse(1.0, 1.0, 1.0, alpha):
-            font("wendy"): settext(choice_label(choice)): horizalign(center)
+            font(current_machine_font_key(FontRole::Header)): settext(choice_label(choice)): horizalign(center)
         ));
     }
+}
 
+pub fn get_actors(state: &State) -> Vec<Actor> {
+    let mut actors = Vec::with_capacity(128);
+    push_actors(&mut actors, state);
     actors
 }

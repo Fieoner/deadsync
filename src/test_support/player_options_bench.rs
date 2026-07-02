@@ -1,8 +1,10 @@
 use crate::assets::AssetManager;
 use crate::game::profile;
+use crate::screens::player_options::RowId;
 use crate::screens::{Screen, player_options};
 use crate::test_support::{compose_scenarios, notefield_bench};
-use crate::ui::actors::Actor;
+use deadlib_present::actors::Actor;
+use deadsync_profile as profile_data;
 
 pub const SCENARIO_NAME: &str = "player-options";
 
@@ -21,11 +23,12 @@ impl PlayerOptionsBenchFixture {
 }
 
 pub fn fixture() -> PlayerOptionsBenchFixture {
+    crate::assets::i18n::init("en");
     let base = notefield_bench::fixture();
-    let song = base.state().song.clone();
+    let song = base.state().song_arc();
 
-    profile::set_session_play_style(profile::PlayStyle::Versus);
-    profile::set_session_player_side(profile::PlayerSide::P1);
+    profile::set_session_play_style(profile_data::PlayStyle::Versus);
+    profile::set_session_player_side(profile_data::PlayerSide::P1);
     profile::set_session_joined(true, true);
 
     let mut asset_manager = AssetManager::new();
@@ -36,19 +39,23 @@ pub fn fixture() -> PlayerOptionsBenchFixture {
     let mut state = player_options::init(song, [0; 2], [0; 2], 1, Screen::SelectMusic, None);
 
     let perspective_row = state
-        .rows
+        .pane()
+        .row_map
+        .display_order()
         .iter()
-        .position(|row| row.name == "Perspective")
+        .position(|&id| id == RowId::Perspective)
         .unwrap_or(0);
     let background_filter_row = state
-        .rows
+        .pane()
+        .row_map
+        .display_order()
         .iter()
-        .position(|row| row.name == "Background Filter")
+        .position(|&id| id == RowId::BackgroundFilter)
         .unwrap_or(perspective_row);
-    state.selected_row = [perspective_row, background_filter_row];
-    state.prev_selected_row = state.selected_row;
-    player_options::update(&mut state, 1.0, &asset_manager);
-    player_options::update(&mut state, 1.0, &asset_manager);
+    state.pane_mut().selected_row = [perspective_row, background_filter_row];
+    state.pane_mut().prev_selected_row = state.pane().selected_row;
+    let _ = player_options::update(&mut state, 1.0, &asset_manager);
+    let _ = player_options::update(&mut state, 1.0, &asset_manager);
 
     PlayerOptionsBenchFixture {
         state,
@@ -62,8 +69,9 @@ fn actor_z(actor: &Actor) -> i16 {
         | Actor::Text { z, .. }
         | Actor::Mesh { z, .. }
         | Actor::TexturedMesh { z, .. }
-        | Actor::Frame { z, .. } => *z,
-        Actor::Camera { .. } => 0,
+        | Actor::Frame { z, .. }
+        | Actor::SharedFrame { z, .. } => *z,
+        Actor::Camera { .. } | Actor::CameraPush { .. } | Actor::CameraPop => 0,
         Actor::Shadow { child, .. } => actor_z(child),
     }
 }

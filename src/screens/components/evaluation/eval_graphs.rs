@@ -1,6 +1,8 @@
-use crate::core::gfx::MeshVertex;
-use crate::game::timing::{HistogramMs, ScatterPoint};
-use crate::ui::color;
+use deadlib_present::color;
+use deadlib_render::MeshVertex;
+use deadsync_rules::timing::{self, HistogramMs, ScatterPoint};
+
+use super::utils::arrow_code_rgba;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimingHistogramScale {
@@ -22,19 +24,7 @@ const HIST_BIN_MS: f32 = 1.0;
 
 #[inline(always)]
 fn hard_ex_display_window_ms(worst_window_ms: f32) -> f32 {
-    worst_window_ms.min(crate::game::timing::effective_windows_ms()[1])
-}
-
-#[inline(always)]
-fn scatter_display_window_ms(worst_window_ms: f32, scale: ScatterPlotScale) -> f32 {
-    let display = match scale {
-        ScatterPlotScale::HardEx => hard_ex_display_window_ms(worst_window_ms),
-        ScatterPlotScale::Itg
-        | ScatterPlotScale::Ex
-        | ScatterPlotScale::Arrow
-        | ScatterPlotScale::Foot => worst_window_ms,
-    };
-    display.max(1.0)
+    worst_window_ms.min(timing::effective_windows_ms()[1])
 }
 
 #[inline(always)]
@@ -56,8 +46,8 @@ fn color_for_abs_ms(
     let w2 = timing_windows_ms[1];
     let w3 = timing_windows_ms[2];
     let w4 = timing_windows_ms[3];
-    let w0 = crate::game::timing::FA_PLUS_W0_MS;
-    let w010 = crate::game::timing::FA_PLUS_W010_MS;
+    let w0 = timing::FA_PLUS_W0_MS;
+    let w010 = timing::FA_PLUS_W010_MS;
 
     match scale {
         TimingHistogramScale::Itg => {
@@ -109,17 +99,6 @@ fn color_for_abs_ms(
 }
 
 #[inline(always)]
-fn color_for_arrow(direction_code: u8) -> [f32; 4] {
-    match direction_code {
-        1 => [1.0, 0.0, 0.0, 1.0],
-        2 => [0.0, 0.0, 1.0, 1.0],
-        3 => [0.0, 1.0, 0.0, 1.0],
-        4 => [1.0, 1.0, 0.0, 1.0],
-        _ => [1.0, 1.0, 1.0, 1.0],
-    }
-}
-
-#[inline(always)]
 fn color_for_foot(is_stream: bool, is_left_foot: bool) -> [f32; 4] {
     if !is_stream {
         return [0.0, 0.0, 0.0, 1.0];
@@ -148,7 +127,7 @@ fn color_for_scatter(
         ScatterPlotScale::HardEx => {
             color_for_abs_ms(abs_ms, timing_windows_ms, TimingHistogramScale::HardEx)
         }
-        ScatterPlotScale::Arrow => color_for_arrow(sp.direction_code),
+        ScatterPlotScale::Arrow => arrow_code_rgba(sp.direction_code),
         ScatterPlotScale::Foot => color_for_foot(sp.is_stream, sp.is_left_foot),
     }
 }
@@ -159,8 +138,16 @@ fn miss_color_for_scatter(sp: &ScatterPoint, scale: ScatterPlotScale) -> [f32; 4
         ScatterPlotScale::Itg | ScatterPlotScale::Ex | ScatterPlotScale::HardEx => {
             [1.0, 0.0, 0.0, 1.0]
         }
-        ScatterPlotScale::Arrow => color_for_arrow(sp.direction_code),
+        ScatterPlotScale::Arrow => arrow_code_rgba(sp.direction_code),
         ScatterPlotScale::Foot => color_for_foot(sp.is_stream, sp.is_left_foot),
+    }
+}
+
+#[inline(always)]
+fn scatter_hit_alpha(scale: ScatterPlotScale) -> f32 {
+    match scale {
+        ScatterPlotScale::Itg | ScatterPlotScale::Ex | ScatterPlotScale::HardEx => 1.0,
+        ScatterPlotScale::Arrow | ScatterPlotScale::Foot => 0.666,
     }
 }
 
@@ -199,6 +186,88 @@ fn push_quad(out: &mut Vec<MeshVertex>, x: f32, y: f32, w: f32, h: f32, color: [
     });
 }
 
+pub fn build_scatter_background_mesh(
+    graph_width: f32,
+    graph_height: f32,
+    worst_window_ms: f32,
+    scale: ScatterPlotScale,
+) -> Vec<MeshVertex> {
+    let w = graph_width.max(0.0);
+    let h = graph_height.max(0.0);
+    if w <= 0.0 || h <= 0.0 {
+        return Vec::new();
+    }
+
+    // Use the same display-window cap the scatter mesh uses so the bands and
+    // the plotted points share the same vertical mapping.
+    let worst = match scale {
+        ScatterPlotScale::HardEx => hard_ex_display_window_ms(worst_window_ms),
+        _ => worst_window_ms,
+    }
+    .max(1.0);
+
+    let timing_windows_ms = timing::effective_windows_ms();
+    let w0 = timing::FA_PLUS_W0_MS;
+    let w010 = timing::FA_PLUS_W010_MS;
+
+    // (outer_ms, color) ordered innermost to outermost. The inner edge of
+    // each band is the outer edge of the previous band (0 for the first).
+    let bands: &[(f32, [f32; 4])] = match scale {
+        ScatterPlotScale::Itg => &[
+            (timing_windows_ms[0], color::JUDGMENT_RGBA[0]),
+            (timing_windows_ms[1], color::JUDGMENT_RGBA[1]),
+            (timing_windows_ms[2], color::JUDGMENT_RGBA[2]),
+            (timing_windows_ms[3], color::JUDGMENT_RGBA[3]),
+            (timing_windows_ms[4], color::JUDGMENT_RGBA[4]),
+        ],
+        ScatterPlotScale::Ex => &[
+            (w0, color::JUDGMENT_RGBA[0]),
+            (timing_windows_ms[0], color::JUDGMENT_FA_PLUS_WHITE_RGBA),
+            (timing_windows_ms[1], color::JUDGMENT_RGBA[1]),
+            (timing_windows_ms[2], color::JUDGMENT_RGBA[2]),
+            (timing_windows_ms[3], color::JUDGMENT_RGBA[3]),
+            (timing_windows_ms[4], color::JUDGMENT_RGBA[4]),
+        ],
+        ScatterPlotScale::HardEx => &[
+            (w010, color::HARD_EX_SCORE_RGBA),
+            (w0, color::JUDGMENT_RGBA[0]),
+            (timing_windows_ms[0], color::JUDGMENT_FA_PLUS_WHITE_RGBA),
+            (timing_windows_ms[1], color::JUDGMENT_RGBA[1]),
+            (timing_windows_ms[2], color::JUDGMENT_RGBA[2]),
+            (timing_windows_ms[3], color::JUDGMENT_RGBA[3]),
+            (timing_windows_ms[4], color::JUDGMENT_RGBA[4]),
+        ],
+        ScatterPlotScale::Arrow | ScatterPlotScale::Foot => return Vec::new(),
+    };
+
+    // Matches Simply Love's `diffusealpha(0.1)` on its judgment-region quads.
+    const BAND_ALPHA: f32 = 0.1;
+
+    let mut out: Vec<MeshVertex> = Vec::with_capacity(bands.len() * 12);
+    let half = h * 0.5;
+    let mut inner_ms: f32 = 0.0;
+    for &(outer_ms, c) in bands {
+        let outer = outer_ms.min(worst);
+        if outer <= inner_ms {
+            continue;
+        }
+        let inner_frac = (inner_ms / worst).clamp(0.0, 1.0);
+        let outer_frac = (outer / worst).clamp(0.0, 1.0);
+        let band_h = (outer_frac - inner_frac) * half;
+        let top_y = (1.0 - outer_frac) * half;
+        let bot_y = half + inner_frac * half;
+        let col = [c[0], c[1], c[2], BAND_ALPHA];
+        push_quad(&mut out, 0.0, top_y, w, band_h, col);
+        push_quad(&mut out, 0.0, bot_y, w, band_h, col);
+        inner_ms = outer;
+        if outer_ms >= worst {
+            break;
+        }
+    }
+
+    out
+}
+
 pub fn build_scatter_mesh(
     scatter: &[ScatterPoint],
     first_second: f32,
@@ -215,8 +284,12 @@ pub fn build_scatter_mesh(
     }
 
     let denom = ((last_second + 0.05) - first_second).max(0.001);
-    let worst = scatter_display_window_ms(worst_window_ms, scale);
-    let timing_windows_ms = crate::game::timing::effective_windows_ms();
+    let worst = match scale {
+        ScatterPlotScale::HardEx => hard_ex_display_window_ms(worst_window_ms),
+        _ => worst_window_ms,
+    }
+    .max(1.0);
+    let timing_windows_ms = timing::effective_windows_ms();
     const POINT_W: f32 = 1.5;
     const POINT_H: f32 = 1.5;
     const MISS_W: f32 = 1.0;
@@ -242,7 +315,7 @@ pub fn build_scatter_mesh(
                 let x = x.clamp(0.0, (w - POINT_W).max(0.0));
                 let y = (t * (h - POINT_H).max(0.0)).clamp(0.0, (h - POINT_H).max(0.0));
                 let base = color_for_scatter(sp, off_ms.abs(), timing_windows_ms, scale);
-                let c = [base[0], base[1], base[2], 0.666];
+                let c = [base[0], base[1], base[2], scatter_hit_alpha(scale)];
                 push_quad(&mut out, x, y, POINT_W, POINT_H, c);
             }
             None => {
@@ -358,7 +431,7 @@ pub fn build_offset_histogram_mesh(
     }
     let peak = histogram.max_count.max(1) as f32;
 
-    let timing_windows_ms = crate::game::timing::effective_windows_ms();
+    let timing_windows_ms = timing::effective_windows_ms();
     let height_max = ph * 0.75;
     let bottom_y = gh;
     let x_for = |bin: i32| (bin + worst_bin + 1) as f32 * w;
@@ -401,4 +474,81 @@ pub fn build_offset_histogram_mesh(
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scatter_point(offset_ms: f32) -> ScatterPoint {
+        ScatterPoint {
+            time_sec: 1.0,
+            offset_ms: Some(offset_ms),
+            direction_code: 1,
+            is_stream: true,
+            is_left_foot: true,
+            miss_because_held: false,
+        }
+    }
+
+    #[test]
+    fn judgment_scatter_hits_use_full_alpha() {
+        let verts = build_scatter_mesh(
+            &[scatter_point(120.0)],
+            0.0,
+            2.0,
+            100.0,
+            50.0,
+            180.0,
+            ScatterPlotScale::Itg,
+        );
+
+        assert_eq!(verts.len(), 6);
+        assert!(verts.iter().all(|v| v.color
+            == [
+                color::JUDGMENT_RGBA[3][0],
+                color::JUDGMENT_RGBA[3][1],
+                color::JUDGMENT_RGBA[3][2],
+                1.0,
+            ]));
+    }
+
+    #[test]
+    fn arrow_scatter_hits_keep_reference_alpha() {
+        let verts = build_scatter_mesh(
+            &[scatter_point(10.0)],
+            0.0,
+            2.0,
+            100.0,
+            50.0,
+            180.0,
+            ScatterPlotScale::Arrow,
+        );
+
+        assert_eq!(verts.len(), 6);
+        assert!(verts.iter().all(|v| v.color == [1.0, 0.0, 0.0, 0.666]));
+    }
+
+    #[test]
+    fn arrow_scatter_doubles_fifth_column_uses_p2_color() {
+        let mut point = scatter_point(10.0);
+        point.direction_code = 5;
+        let verts = build_scatter_mesh(
+            &[point],
+            0.0,
+            2.0,
+            100.0,
+            50.0,
+            180.0,
+            ScatterPlotScale::Arrow,
+        );
+
+        assert_eq!(verts.len(), 6);
+        let purple = color::rgba_hex("#B54DFF");
+        assert!(
+            verts
+                .iter()
+                .all(|v| v.color == [purple[0], purple[1], purple[2], 0.666])
+        );
+    }
 }

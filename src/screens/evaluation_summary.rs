@@ -1,21 +1,29 @@
 use crate::act;
 use crate::assets::AssetManager;
-use crate::core::input::{InputEvent, VirtualAction};
-use crate::core::space::{screen_center_x, screen_height, screen_width, widescale};
+use crate::assets::i18n::{tr, tr_fmt};
+use crate::assets::{FontRole, current_machine_font_key};
 use crate::game::profile;
-use crate::game::scores;
-use crate::game::song::SongData;
 use crate::game::stage_stats;
 use crate::screens::components::evaluation::eval_grades;
 use crate::screens::components::shared::screen_bar::{
     ScreenBarParams, ScreenBarPosition, ScreenBarTitlePlacement,
 };
-use crate::screens::components::shared::{banner as shared_banner, heart_bg, screen_bar};
+use crate::screens::components::shared::{
+    banner as shared_banner, screen_bar, transitions, visual_style_bg,
+};
+use crate::screens::input as screen_input;
 use crate::screens::{Screen, ScreenAction};
-use crate::ui::actors::{Actor, SizeSpec};
-use crate::ui::color;
 use chrono::Local;
+use deadlib_present::actors::{Actor, SizeSpec};
+use deadlib_present::color;
+use deadlib_present::space::{screen_center_x, screen_height, screen_width, widescale};
+use deadsync_chart::ChartData;
+use deadsync_chart::SongData;
+use deadsync_input::{InputEvent, VirtualAction};
+use deadsync_profile as profile_data;
+use deadsync_score as score_data;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 /* ---------------------------- transitions ---------------------------- */
 const TRANSITION_IN_DURATION: f32 = 0.4;
@@ -25,17 +33,27 @@ const ROWS_PER_PAGE: usize = 4;
 
 pub struct State {
     pub active_color_index: i32,
-    bg: heart_bg::State,
+    bg: visual_style_bg::State,
     pub page: usize,
     pub elapsed: f32,
+    pub return_to: Screen,
+    menu_lr_chord: screen_input::MenuLrChordTracker,
+    menu_lr_undo: [i8; 2],
 }
 
 pub fn init() -> State {
+    init_for_return(Screen::Initials)
+}
+
+pub fn init_for_return(return_to: Screen) -> State {
     State {
-        active_color_index: color::DEFAULT_COLOR_INDEX, // overwritten by app.rs
-        bg: heart_bg::State::new(),
+        active_color_index: color::DEFAULT_COLOR_INDEX,
+        bg: visual_style_bg::State::new(),
         page: 1,
         elapsed: 0.0,
+        return_to,
+        menu_lr_chord: screen_input::MenuLrChordTracker::default(),
+        menu_lr_undo: [0; 2],
     }
 }
 
@@ -43,16 +61,45 @@ pub fn update(state: &mut State, dt: f32) {
     state.elapsed = (state.elapsed + dt).max(0.0);
 }
 
+#[inline(always)]
+fn shift_page(state: &mut State, num_stages: usize, dir: i32) -> bool {
+    let pages = pages_for(num_stages);
+    let old_page = state.page;
+    if dir < 0 {
+        if pages > 1 && state.page > 1 {
+            state.page = state.page.saturating_sub(1).max(1);
+        }
+    } else if pages > 1 {
+        state.page = (state.page + 1).min(pages.max(1));
+    }
+    state.page != old_page
+}
+
 pub fn handle_input(state: &mut State, num_stages: usize, ev: &InputEvent) -> ScreenAction {
+    let chord_side = if crate::config::get().three_key_navigation {
+        state.menu_lr_chord.update(ev)
+    } else {
+        None
+    };
     if !ev.pressed {
+        if let Some(side) = screen_input::menu_lr_side(ev.action) {
+            state.menu_lr_undo[profile_data::player_side_index(side)] = 0;
+        }
         return ScreenAction::None;
     }
-
+    if let Some(side) = chord_side {
+        let undo = state.menu_lr_undo[profile_data::player_side_index(side)];
+        state.menu_lr_undo[profile_data::player_side_index(side)] = 0;
+        if undo != 0 {
+            let _ = shift_page(state, num_stages, i32::from(undo));
+        }
+        return ScreenAction::RequestScreenshot(Some(side));
+    }
     match ev.action {
         VirtualAction::p1_back
         | VirtualAction::p1_start
         | VirtualAction::p2_back
-        | VirtualAction::p2_start => ScreenAction::Navigate(Screen::Initials),
+        | VirtualAction::p2_start => ScreenAction::Navigate(state.return_to),
 
         VirtualAction::p1_menu_left
         | VirtualAction::p1_left
@@ -61,9 +108,15 @@ pub fn handle_input(state: &mut State, num_stages: usize, ev: &InputEvent) -> Sc
         | VirtualAction::p2_menu_left
         | VirtualAction::p2_left
         | VirtualAction::p2_menu_up => {
-            let pages = pages_for(num_stages);
-            if pages > 1 && state.page > 1 {
-                state.page = state.page.saturating_sub(1).max(1);
+            if let Some(side) = screen_input::menu_lr_side(ev.action) {
+                state.menu_lr_undo[profile_data::player_side_index(side)] =
+                    if shift_page(state, num_stages, -1) {
+                        1
+                    } else {
+                        0
+                    };
+            } else {
+                let _ = shift_page(state, num_stages, -1);
             }
             ScreenAction::None
         }
@@ -75,9 +128,15 @@ pub fn handle_input(state: &mut State, num_stages: usize, ev: &InputEvent) -> Sc
         | VirtualAction::p2_menu_right
         | VirtualAction::p2_right
         | VirtualAction::p2_menu_down => {
-            let pages = pages_for(num_stages);
-            if pages > 1 {
-                state.page = (state.page + 1).min(pages.max(1));
+            if let Some(side) = screen_input::menu_lr_side(ev.action) {
+                state.menu_lr_undo[profile_data::player_side_index(side)] =
+                    if shift_page(state, num_stages, 1) {
+                        -1
+                    } else {
+                        0
+                    };
+            } else {
+                let _ = shift_page(state, num_stages, 1);
             }
             ScreenAction::None
         }
@@ -102,47 +161,26 @@ fn format_rate_x(rate: f32) -> String {
     s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
-fn display_bpm_range(song: &SongData) -> Option<(f64, f64)> {
-    song.display_bpm_range()
-}
-
-fn stringify_display_bpms(song: &SongData, music_rate: f32) -> String {
-    let Some((mut lo, mut hi)) = display_bpm_range(song) else {
-        return String::new();
-    };
-
-    let rate = if music_rate.is_finite() && music_rate > 0.0 {
-        music_rate as f64
-    } else {
-        1.0
-    };
-    lo *= rate;
-    hi *= rate;
-
-    let use_decimals = (music_rate - 1.0).abs() > 0.001;
-    let fmt_one = |v: f64| {
-        if use_decimals {
-            let s = format!("{v:.1}");
-            s.trim_end_matches('0').trim_end_matches('.').to_string()
-        } else {
-            format!("{v:.0}")
-        }
-    };
-
-    if (lo - hi).abs() < 1.0e-6 {
-        fmt_one(lo)
-    } else {
-        format!("{} - {}", fmt_one(lo), fmt_one(hi))
+fn stringify_display_bpms(song: &SongData, chart: Option<&ChartData>, music_rate: f32) -> String {
+    // Handle Random display BPM — show "???" on eval
+    if let Some(chart) = chart
+        && matches!(
+            chart.display_bpm,
+            Some(deadsync_chart::ChartDisplayBpm::Random)
+        )
+    {
+        return "???".to_string();
     }
+    deadsync_chart::song::format_display_bpm_range(song.chart_display_bpm_range(chart), music_rate)
 }
 
-fn steps_type_label(chart_type: &str) -> &'static str {
+fn steps_type_label(chart_type: &str) -> Arc<str> {
     if chart_type.eq_ignore_ascii_case("dance-single") {
-        "Single"
+        tr("EvaluationSummary", "SingleLabel")
     } else if chart_type.eq_ignore_ascii_case("dance-double") {
-        "Double"
+        tr("EvaluationSummary", "DoubleLabel")
     } else {
-        "Unknown"
+        tr("EvaluationSummary", "UnknownLabel")
     }
 }
 
@@ -154,7 +192,7 @@ fn should_display_profile_names(stages: &[stage_stats::StageSummary]) -> bool {
     let mut p1: HashSet<&str> = HashSet::new();
     let mut p2: HashSet<&str> = HashSet::new();
     for s in stages {
-        if let Some(p) = s.players.get(0).and_then(|p| p.as_ref()) {
+        if let Some(p) = s.players.first().and_then(|p| p.as_ref()) {
             p1.insert(p.profile_name.as_str());
         }
         if let Some(p) = s.players.get(1).and_then(|p| p.as_ref()) {
@@ -165,7 +203,7 @@ fn should_display_profile_names(stages: &[stage_stats::StageSummary]) -> bool {
 }
 
 fn build_player_stats(
-    side: profile::PlayerSide,
+    side: profile_data::PlayerSide,
     p: &stage_stats::PlayerStageSummary,
     show_profile_names: bool,
     active_color_index: i32,
@@ -174,24 +212,24 @@ fn build_player_stats(
 ) -> Vec<Actor> {
     let (col1x, col2x, grade_x, align1_x, align2_x, align1_text, align2_text, col1_eps) = match side
     {
-        profile::PlayerSide::P1 => (
+        profile_data::PlayerSide::P1 => (
             -90.0,
             -(screen_width() / 2.5),
             -widescale(194.0, 250.0),
             1.0,
             0.0,
-            crate::ui::actors::TextAlign::Right,
-            crate::ui::actors::TextAlign::Left,
+            deadlib_present::actors::TextAlign::Right,
+            deadlib_present::actors::TextAlign::Left,
             -1.0,
         ),
-        profile::PlayerSide::P2 => (
+        profile_data::PlayerSide::P2 => (
             90.0,
             screen_width() / 2.5,
             widescale(194.0, 250.0),
             0.0,
             1.0,
-            crate::ui::actors::TextAlign::Left,
-            crate::ui::actors::TextAlign::Right,
+            deadlib_present::actors::TextAlign::Left,
+            deadlib_present::actors::TextAlign::Right,
             1.0,
         ),
     };
@@ -220,7 +258,7 @@ fn build_player_stats(
 
     // Percent score (trim '%' and remove leading whitespace, like Simply Love)
     let percent_text = format!("{:.2}", (p.score_percent * 100.0).max(0.0));
-    let percent_rgba = if p.grade == scores::Grade::Failed {
+    let percent_rgba = if p.grade == score_data::Grade::Failed {
         [1.0, 0.0, 0.0, 1.0]
     } else {
         [1.0; 4]
@@ -234,7 +272,7 @@ fn build_player_stats(
         (0.5, -24.0)
     };
     let mut percent_actor = act!(text:
-        font("wendy"):
+        font(current_machine_font_key(FontRole::Header)):
         settext(percent_text):
         align(align1_x, 0.5):
         xy(col1x, percent_y):
@@ -253,7 +291,7 @@ fn build_player_stats(
         let ex_text = format!("{:.2}", p.ex_score_percent.max(0.0));
         let (ex_zoom, ex_y) = if showex { (0.48, -32.0) } else { (0.38, -12.0) };
         let mut ex_actor = act!(text:
-            font("wendy"):
+            font(current_machine_font_key(FontRole::Header)):
             settext(ex_text):
             align(align1_x, 0.5):
             xy(col1x, ex_y):
@@ -271,7 +309,11 @@ fn build_player_stats(
     {
         let style = steps_type_label(&p.chart.chart_type);
         let diff = difficulty_display_name(&p.chart.difficulty, zmod_rating_box_text);
-        let text = format!("{style} / {diff}");
+        let text = tr_fmt(
+            "EvaluationSummary",
+            "DifficultyFormat",
+            &[("style", &style), ("difficulty", &diff)],
+        );
         let mut a = act!(text:
             font("miso"):
             settext(text):
@@ -292,7 +334,7 @@ fn build_player_stats(
         let diff_color = color::difficulty_rgba(&p.chart.difficulty, active_color_index);
         let (meter_zoom, meter_y) = if show_w0 { (0.3, 5.0) } else { (0.4, -1.0) };
         let mut a = act!(text:
-            font("wendy"):
+            font(current_machine_font_key(FontRole::Header)):
             settext(p.chart.meter.to_string()):
             align(align1_x, 0.5):
             xy(col1x, meter_y):
@@ -332,6 +374,7 @@ fn build_player_stats(
             z: 4,
             zoom: widescale(0.275, 0.3),
             elapsed,
+            ..Default::default()
         },
     ));
 
@@ -343,7 +386,7 @@ fn build_player_stats(
     }
     let y_base = if show_w0 { -58.0 } else { -63.0 };
 
-    for i in 0..counts.len() {
+    for (i, count) in counts.iter().copied().enumerate() {
         if i == 0 && !show_w0 {
             continue;
         }
@@ -365,8 +408,8 @@ fn build_player_stats(
         };
 
         let mut a = act!(text:
-            font("wendy"):
-            settext(counts[i].to_string()):
+            font(current_machine_font_key(FontRole::Header)):
+            settext(count.to_string()):
             align(align2_x, 0.5):
             xy(col2x, y):
             zoom(0.28):
@@ -406,17 +449,27 @@ fn build_row(
 
     let full_title = stage.song.display_full_title(translated_titles);
 
-    let bpm_str = stringify_display_bpms(&stage.song, stage.music_rate);
+    let eval_chart = stage
+        .players
+        .iter()
+        .flatten()
+        .next()
+        .map(|p| p.chart.as_ref());
+    let bpm_str = stringify_display_bpms(&stage.song, eval_chart, stage.music_rate);
     let bpm_line = if bpm_str.is_empty() {
         String::new()
     } else if (stage.music_rate - 1.0).abs() > 0.001 {
-        format!(
-            "{} bpm ({}x Music Rate)",
-            bpm_str,
-            format_rate_x(stage.music_rate)
+        tr_fmt(
+            "EvaluationSummary",
+            "BpmWithRate",
+            &[
+                ("bpm", &bpm_str),
+                ("rate", &format_rate_x(stage.music_rate)),
+            ],
         )
+        .to_string()
     } else {
-        format!("{bpm_str} bpm")
+        tr_fmt("EvaluationSummary", "BpmDisplay", &[("bpm", &bpm_str)]).to_string()
     };
 
     let mut children: Vec<Actor> = Vec::with_capacity(64);
@@ -461,7 +514,10 @@ fn build_row(
         horizalign(center)
     ));
 
-    for (idx, side) in [(0, profile::PlayerSide::P1), (1, profile::PlayerSide::P2)] {
+    for (idx, side) in [
+        (0, profile_data::PlayerSide::P1),
+        (1, profile_data::PlayerSide::P2),
+    ] {
         let Some(p) = stage.players.get(idx).and_then(|p| p.as_ref()) else {
             continue;
         };
@@ -485,24 +541,29 @@ fn build_row(
     }
 }
 
-pub fn get_actors(
+pub fn push_actors(
+    actors: &mut Vec<Actor>,
     state: &State,
     stages: &[stage_stats::StageSummary],
     _asset_manager: &AssetManager,
-) -> Vec<Actor> {
+) {
     let cfg = crate::config::get();
-    let mut actors: Vec<Actor> = Vec::with_capacity(32);
+    actors.reserve(32);
 
     // Background
-    actors.extend(state.bg.build(heart_bg::Params {
-        active_color_index: state.active_color_index,
-        backdrop_rgba: [0.0, 0.0, 0.0, 1.0],
-        alpha_mul: 1.0,
-    }));
+    state.bg.push(
+        actors,
+        visual_style_bg::Params {
+            active_color_index: state.active_color_index,
+            backdrop_rgba: [0.0, 0.0, 0.0, 1.0],
+            alpha_mul: 1.0,
+        },
+    );
 
     // Top Bar
+    let eval_title = tr("EvaluationSummary", "ScreenTitle");
     actors.push(screen_bar::build(ScreenBarParams {
-        title: "EVALUATION",
+        title: &eval_title,
         title_placement: ScreenBarTitlePlacement::Left,
         position: ScreenBarPosition::Top,
         transparent: false,
@@ -516,8 +577,8 @@ pub fn get_actors(
 
     if stages.is_empty() {
         actors.push(act!(text:
-            font("wendy"):
-            settext("NO STAGE DATA AVAILABLE"):
+            font(current_machine_font_key(FontRole::Header)):
+            settext(tr("EvaluationSummary", "NoStageDataAvailable")):
             align(0.5, 0.5):
             xy(screen_center_x(), screen_height() * 0.5):
             zoom(0.8):
@@ -525,7 +586,7 @@ pub fn get_actors(
             diffuse(1.0, 1.0, 1.0, 1.0):
             horizalign(center)
         ));
-        return actors;
+        return;
     }
 
     let pages = pages_for(stages.len());
@@ -533,8 +594,8 @@ pub fn get_actors(
 
     // Centered "Page x/y"
     actors.push(act!(text:
-        font("wendy"):
-        settext(format!("Page {page}/{pages}")):
+        font(current_machine_font_key(FontRole::Header)):
+        settext(tr_fmt("EvaluationSummary", "PageFormat", &[("page", &page.to_string()), ("pages", &pages.to_string())])):
         align(0.5, 0.5):
         xy(screen_center_x(), 15.0):
         zoom(widescale(0.5, 0.6)):
@@ -547,8 +608,8 @@ pub fn get_actors(
     {
         let itg_text_x = screen_width() - 10.0;
         actors.push(act!(text:
-                font("wendy"):
-                settext("ITG"):
+                font(current_machine_font_key(FontRole::Header)):
+                settext(tr("EvaluationSummary", "ITGLabel")):
                 align(1.0, 0.5):
             xy(itg_text_x, 15.0):
             zoom(widescale(0.5, 0.6)):
@@ -579,13 +640,13 @@ pub fn get_actors(
         let play_style = profile::get_session_play_style();
         let player_side = profile::get_session_player_side();
 
-        let p1_profile = profile::get_for_side(profile::PlayerSide::P1);
-        let p2_profile = profile::get_for_side(profile::PlayerSide::P2);
+        let p1_profile = profile::get_for_side(profile_data::PlayerSide::P1);
+        let p2_profile = profile::get_for_side(profile_data::PlayerSide::P2);
 
-        let p1_joined = profile::is_session_side_joined(profile::PlayerSide::P1);
-        let p2_joined = profile::is_session_side_joined(profile::PlayerSide::P2);
-        let p1_guest = profile::is_session_side_guest(profile::PlayerSide::P1);
-        let p2_guest = profile::is_session_side_guest(profile::PlayerSide::P2);
+        let p1_joined = profile::is_session_side_joined(profile_data::PlayerSide::P1);
+        let p2_joined = profile::is_session_side_joined(profile_data::PlayerSide::P2);
+        let p1_guest = profile::is_session_side_guest(profile_data::PlayerSide::P1);
+        let p2_guest = profile::is_session_side_guest(profile_data::PlayerSide::P2);
 
         let p1_avatar_key = if p1_joined && !p1_guest {
             p1_profile.avatar_texture_key
@@ -598,12 +659,12 @@ pub fn get_actors(
             None
         };
 
-        let (left_avatar, right_avatar) = if play_style == profile::PlayStyle::Versus {
+        let (left_avatar, right_avatar) = if play_style == profile_data::PlayStyle::Versus {
             (p1_avatar_key.as_deref(), p2_avatar_key.as_deref())
         } else {
             match player_side {
-                profile::PlayerSide::P1 => (p1_avatar_key.as_deref(), None),
-                profile::PlayerSide::P2 => (None, p2_avatar_key.as_deref()),
+                profile_data::PlayerSide::P1 => (p1_avatar_key.as_deref(), None),
+                profile_data::PlayerSide::P2 => (None, p2_avatar_key.as_deref()),
             }
         };
 
@@ -626,7 +687,7 @@ pub fn get_actors(
 
         let timestamp_text = Local::now().format("%Y/%m/%d %H:%M").to_string();
         actors.push(act!(text:
-            font("wendy_monospace_numbers"):
+            font(current_machine_font_key(FontRole::Numbers)):
             settext(timestamp_text):
             align(0.5, 1.0):
             xy(screen_center_x(), screen_height() - 14.0):
@@ -635,27 +696,22 @@ pub fn get_actors(
             z(121)
         ));
     }
+}
 
+pub fn get_actors(
+    state: &State,
+    stages: &[stage_stats::StageSummary],
+    asset_manager: &AssetManager,
+) -> Vec<Actor> {
+    let mut actors = Vec::with_capacity(32);
+    push_actors(&mut actors, state, stages, asset_manager);
     actors
 }
 
 pub fn in_transition() -> (Vec<Actor>, f32) {
-    let actor = act!(quad:
-        align(0.0, 0.0): xy(0.0, 0.0):
-        zoomto(screen_width(), screen_height()):
-        diffuse(0.0, 0.0, 0.0, 1.0): z(1100):
-        linear(TRANSITION_IN_DURATION): alpha(0.0):
-        linear(0.0): visible(false)
-    );
-    (vec![actor], TRANSITION_IN_DURATION)
+    transitions::fade_in_black(TRANSITION_IN_DURATION, 1100)
 }
 
 pub fn out_transition() -> (Vec<Actor>, f32) {
-    let actor = act!(quad:
-        align(0.0, 0.0): xy(0.0, 0.0):
-        zoomto(screen_width(), screen_height()):
-        diffuse(0.0, 0.0, 0.0, 0.0): z(1100):
-        linear(TRANSITION_OUT_DURATION): alpha(1.0)
-    );
-    (vec![actor], TRANSITION_OUT_DURATION)
+    transitions::fade_out_black(TRANSITION_OUT_DURATION, 1100)
 }

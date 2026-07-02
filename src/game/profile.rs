@@ -1,344 +1,169 @@
-pub use super::scroll::ScrollSpeedSetting;
+//! Local profile storage and the active-session profile state.
+//!
+//! Identity model: a profile's canonical id is the `Guid` embedded under
+//! `[userprofile]` in its `profile.ini`. The on-disk folder name is cosmetic
+//! (derived from the display name) and may change freely. Profiles are resolved
+//! by GUID via [`resolve_profile_dir`], backed by the [`PROFILE_DIR_CACHE`] map.
+//!
+//! Cache invariant: any code that creates, deletes, renames, or backfills a
+//! profile folder MUST call [`invalidate_profile_dir_cache`] afterwards, because
+//! a cache miss is treated as authoritative (no rescan on miss).
 use crate::config::{self, SimpleIni};
-use bincode::{Decode, Encode};
 use chrono::Local;
+use deadlib_platform::dirs;
+use deadsync_rules::scroll::{GUEST_SCROLL_SPEED, ScrollSpeedSetting};
 use log::{debug, info, warn};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Perspective {
-    #[default]
-    Overhead,
-    Hallway,
-    Distant,
-    Incoming,
-    Space,
+mod update;
+
+use deadsync_profile::{
+    ActiveProfile, GameplayHudPlayerSnapshot, GameplayHudSnapshot, LastPlayed, LastPlayedCourse,
+    LocalProfileSummary, NoteSkin, PLAYER_SLOTS, PlayMode, PlayStyle, PlayerOptionsData,
+    PlayerSide, Profile, ProfileStats, ProfileStatsDecodeError, TimingTickMode,
+    active_profile_is_guest, active_profile_local_id, add_known_pack_names, clamp_weight_pounds,
+    cmp_profile_ids_case_insensitive, decode_profile_stats as decode_profile_stats_bytes,
+    encode_profile_stats, find_profile_avatar_path, folder_name_for_display, generate_profile_guid,
+    initials_from_name, is_local_profile_id, is_valid_profile_guid, joined_player_mask,
+    load_last_played_course_section, load_last_played_section, load_player_options_section,
+    parse_favorited_packs_content, parse_favorites_content, parse_groovestats_is_pad_player,
+    player_options_section, player_side_index as side_ix, player_side_is_joined,
+    read_userprofile_identity, render_arrowcloud_ini_content, render_favorited_packs_content,
+    render_favorites_content, render_groovestats_ini_content, render_profile_ini_content,
+    rewrite_profile_display_name_content, sanitize_player_initials, unknown_pack_names,
+    upsert_profile_guid_content,
+};
+pub use update::*;
+
+#[inline(always)]
+fn profiles_root() -> PathBuf {
+    dirs::app_dirs().profiles_root()
 }
 
-impl Perspective {
-    #[inline(always)]
-    pub const fn tilt_skew(self) -> (f32, f32) {
-        match self {
-            Self::Overhead => (0.0, 0.0),
-            Self::Hallway => (-1.0, 0.0),
-            Self::Distant => (1.0, 0.0),
-            Self::Incoming => (-1.0, 1.0),
-            Self::Space => (1.0, 1.0),
-        }
+/// Path for a literal folder name, bypassing GUID resolution (creation only).
+#[inline(always)]
+fn profile_dir_by_folder(folder: &str) -> PathBuf {
+    profiles_root().join(folder)
+}
+
+/// Lazily-built GUID -> folder map. Rebuilt only when invalidated; every
+/// mutation of the profiles directory (create/delete/rename/backfill) MUST call
+/// `invalidate_profile_dir_cache()` so the next lookup re-scans.
+static PROFILE_DIR_CACHE: Mutex<Option<HashMap<String, PathBuf>>> = Mutex::new(None);
+
+/// Read the embedded `Guid` and `DisplayName` from a folder's `profile.ini` in a
+/// single targeted pass (no full INI parse).
+fn read_profile_identity(dir: &Path) -> (Option<String>, Option<String>) {
+    match fs::read_to_string(dir.join("profile.ini")) {
+        Ok(content) => read_userprofile_identity(&content),
+        Err(_) => (None, None),
     }
 }
 
-impl FromStr for Perspective {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let v = s.trim().to_lowercase();
-        match v.as_str() {
-            "overhead" => Ok(Self::Overhead),
-            "hallway" => Ok(Self::Hallway),
-            "distant" => Ok(Self::Distant),
-            "incoming" => Ok(Self::Incoming),
-            "space" => Ok(Self::Space),
-            other => Err(format!("'{other}' is not a valid Perspective setting")),
-        }
-    }
+fn read_profile_guid(dir: &Path) -> Option<String> {
+    read_profile_identity(dir).0
 }
 
-impl core::fmt::Display for Perspective {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Overhead => write!(f, "Overhead"),
-            Self::Hallway => write!(f, "Hallway"),
-            Self::Distant => write!(f, "Distant"),
-            Self::Incoming => write!(f, "Incoming"),
-            Self::Space => write!(f, "Space"),
-        }
-    }
+/// Write `contents` to `path` atomically (temp sibling + rename) so a crash or
+/// power loss mid-write can't truncate the live file. Matters most during the
+/// one-time startup backfill, which rewrites every legacy profile at once.
+fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    fs::write(&tmp, contents)?;
+    fs::rename(&tmp, path)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum TurnOption {
-    #[default]
-    None,
-    Mirror,
-    Left,
-    Right,
-    LRMirror,
-    UDMirror,
-    Shuffle,
-    Blender,
-    Random,
-}
-
-impl FromStr for TurnOption {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut key = String::with_capacity(s.len());
-        for ch in s.trim().chars() {
-            if ch.is_ascii_alphanumeric() {
-                key.push(ch.to_ascii_lowercase());
-            }
+fn build_profile_dir_map() -> HashMap<String, PathBuf> {
+    use std::collections::hash_map::Entry;
+    let mut map: HashMap<String, PathBuf> = HashMap::new();
+    let Ok(read_dir) = fs::read_dir(profiles_root()) else {
+        return map;
+    };
+    for entry in read_dir.flatten() {
+        if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+            continue;
         }
-        match key.as_str() {
-            "" | "none" | "noturn" | "noturning" | "noturns" => Ok(Self::None),
-            "mirror" => Ok(Self::Mirror),
-            "left" => Ok(Self::Left),
-            "right" => Ok(Self::Right),
-            "lrmirror" => Ok(Self::LRMirror),
-            "udmirror" => Ok(Self::UDMirror),
-            "shuffle" => Ok(Self::Shuffle),
-            "blender" | "supershuffle" => Ok(Self::Blender),
-            "random" | "hypershuffle" => Ok(Self::Random),
-            other => Err(format!("'{other}' is not a valid Turn setting")),
-        }
-    }
-}
-
-impl core::fmt::Display for TurnOption {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::None => write!(f, "None"),
-            Self::Mirror => write!(f, "Mirror"),
-            Self::Left => write!(f, "Left"),
-            Self::Right => write!(f, "Right"),
-            Self::LRMirror => write!(f, "LRMirror"),
-            Self::UDMirror => write!(f, "UDMirror"),
-            Self::Shuffle => write!(f, "Shuffle"),
-            Self::Blender => write!(f, "Blender"),
-            Self::Random => write!(f, "Random"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum AttackMode {
-    Off,
-    #[default]
-    On,
-    Random,
-}
-
-impl FromStr for AttackMode {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut key = String::with_capacity(s.len());
-        for ch in s.trim().chars() {
-            if ch.is_ascii_alphanumeric() {
-                key.push(ch.to_ascii_lowercase());
-            }
-        }
-        match key.as_str() {
-            "off" | "noattacks" | "noattack" => Ok(Self::Off),
-            "on" | "normal" => Ok(Self::On),
-            "random" | "randomattacks" => Ok(Self::Random),
-            other => Err(format!("'{other}' is not a valid AttackMode setting")),
-        }
-    }
-}
-
-impl core::fmt::Display for AttackMode {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Off => write!(f, "Off"),
-            Self::On => write!(f, "On"),
-            Self::Random => write!(f, "Random"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum HideLightType {
-    #[default]
-    NoHideLights,
-    HideAllLights,
-    HideMarqueeLights,
-    HideBassLights,
-}
-
-impl FromStr for HideLightType {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut key = String::with_capacity(s.len());
-        for ch in s.trim().chars() {
-            if ch.is_ascii_alphanumeric() {
-                key.push(ch.to_ascii_lowercase());
-            }
-        }
-        match key.as_str() {
-            "nohidelights" => Ok(Self::NoHideLights),
-            "hidealllights" => Ok(Self::HideAllLights),
-            "hidemarqueelights" => Ok(Self::HideMarqueeLights),
-            "hidebasslights" => Ok(Self::HideBassLights),
-            other => Err(format!("'{other}' is not a valid HideLightType setting")),
-        }
-    }
-}
-
-impl core::fmt::Display for HideLightType {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::NoHideLights => write!(f, "NoHideLights"),
-            Self::HideAllLights => write!(f, "HideAllLights"),
-            Self::HideMarqueeLights => write!(f, "HideMarqueeLights"),
-            Self::HideBassLights => write!(f, "HideBassLights"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ScrollOption(u8);
-
-#[allow(non_upper_case_globals)]
-impl ScrollOption {
-    pub const Normal: Self = Self(0);
-    pub const Reverse: Self = Self(1 << 0);
-    pub const Split: Self = Self(1 << 1);
-    pub const Alternate: Self = Self(1 << 2);
-    pub const Cross: Self = Self(1 << 3);
-    pub const Centered: Self = Self(1 << 4);
-
-    #[inline(always)]
-    pub const fn empty() -> Self {
-        Self(0)
-    }
-
-    #[inline(always)]
-    pub const fn contains(self, flag: Self) -> bool {
-        (self.0 & flag.0) != 0
-    }
-
-    #[inline(always)]
-    pub const fn union(self, other: Self) -> Self {
-        Self(self.0 | other.0)
-    }
-
-    #[inline(always)]
-    pub const fn is_normal(self) -> bool {
-        self.0 == 0
-    }
-}
-
-impl Default for ScrollOption {
-    fn default() -> Self {
-        Self::Normal
-    }
-}
-
-impl FromStr for ScrollOption {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let raw = s.trim();
-        if raw.is_empty() {
-            return Err("Scroll setting is empty".to_string());
-        }
-        let lower = raw.to_lowercase();
-        // Support both legacy single values ("Reverse") and combined values
-        // like "Reverse+Cross" or "Reverse Cross".
-        let mut result = Self::empty();
-        for token in lower.split(|c: char| c == '+' || c == ',' || c.is_whitespace()) {
-            if token.is_empty() {
-                continue;
-            }
-            let flag = match token {
-                "normal" => Self::Normal,
-                "reverse" => Self::Reverse,
-                "split" => Self::Split,
-                "alternate" => Self::Alternate,
-                "cross" => Self::Cross,
-                "centered" => Self::Centered,
-                other => {
-                    return Err(format!("'{other}' is not a valid Scroll setting"));
-                }
-            };
-            // "Normal" means no flags; combining it with others is treated as just the others.
-            if flag.0 != 0 {
-                result = result.union(flag);
-            }
-        }
-        Ok(result)
-    }
-}
-
-impl core::fmt::Display for ScrollOption {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        if self.is_normal() {
-            return write!(f, "Normal");
-        }
-
-        let mut first = true;
-        let mut write_flag = |name: &str, present: bool, f: &mut core::fmt::Formatter<'_>| {
-            if !present {
-                return Ok(());
-            }
-            if !first {
-                write!(f, "+")?;
-            }
-            first = false;
-            write!(f, "{name}")
+        let path = entry.path();
+        let Some(guid) = read_profile_guid(&path) else {
+            continue;
         };
-
-        write_flag("Reverse", self.contains(Self::Reverse), f)?;
-        write_flag("Split", self.contains(Self::Split), f)?;
-        write_flag("Alternate", self.contains(Self::Alternate), f)?;
-        write_flag("Cross", self.contains(Self::Cross), f)?;
-        write_flag("Centered", self.contains(Self::Centered), f)
+        match map.entry(guid) {
+            Entry::Vacant(slot) => {
+                slot.insert(path);
+            }
+            Entry::Occupied(mut slot) => {
+                // Two folders embed the same GUID (e.g. a copied profile). Bind
+                // deterministically to the lexicographically smallest folder name
+                // so resolution is stable across runs instead of read_dir order.
+                let keep_existing = slot.get().file_name() <= path.file_name();
+                warn!(
+                    "Duplicate profile GUID {} in '{}' and '{}'; using '{}'.",
+                    slot.key(),
+                    slot.get().display(),
+                    path.display(),
+                    if keep_existing { slot.get() } else { &path }.display()
+                );
+                if !keep_existing {
+                    slot.insert(path);
+                }
+            }
+        }
     }
+    map
 }
 
-pub const INSERT_ACTIVE_BITS: u8 = (1 << 7) - 1;
-pub const REMOVE_ACTIVE_BITS: u8 = u8::MAX;
-pub const HOLDS_ACTIVE_BITS: u8 = (1 << 5) - 1;
-pub const ACCEL_EFFECTS_ACTIVE_BITS: u8 = (1 << 5) - 1;
-pub const VISUAL_EFFECTS_ACTIVE_BITS: u16 = (1 << 10) - 1;
-pub const APPEARANCE_EFFECTS_ACTIVE_BITS: u8 = (1 << 5) - 1;
-
-#[inline(always)]
-pub const fn normalize_insert_mask(mask: u8) -> u8 {
-    mask & INSERT_ACTIVE_BITS
+/// Drop the cached map so the next lookup rescans disk.
+fn invalidate_profile_dir_cache() {
+    *PROFILE_DIR_CACHE.lock().unwrap() = None;
 }
 
-#[inline(always)]
-pub const fn normalize_remove_mask(mask: u8) -> u8 {
-    mask & REMOVE_ACTIVE_BITS
+/// Resolve an embedded GUID to its on-disk folder via the cached map. Misses are
+/// authoritative (the map is invalidated on every mutation), so this never
+/// rescans on a miss.
+fn resolve_profile_dir(guid: &str) -> Option<PathBuf> {
+    let mut guard = PROFILE_DIR_CACHE.lock().unwrap();
+    if guard.is_none() {
+        *guard = Some(build_profile_dir_map());
+    }
+    let path = guard.as_ref().unwrap().get(guid).cloned();
+    drop(guard);
+    path
 }
 
-#[inline(always)]
-pub const fn normalize_holds_mask(mask: u8) -> u8 {
-    mask & HOLDS_ACTIVE_BITS
-}
-
-#[inline(always)]
-pub const fn normalize_accel_effects_mask(mask: u8) -> u8 {
-    mask & ACCEL_EFFECTS_ACTIVE_BITS
-}
-
-#[inline(always)]
-pub const fn normalize_visual_effects_mask(mask: u16) -> u16 {
-    mask & VISUAL_EFFECTS_ACTIVE_BITS
-}
-
-#[inline(always)]
-pub const fn normalize_appearance_effects_mask(mask: u8) -> u8 {
-    mask & APPEARANCE_EFFECTS_ACTIVE_BITS
-}
-
-// --- Profile Data ---
-const PROFILES_ROOT: &str = "save/profiles";
-const DEFAULT_PROFILE_ID: &str = "00000000";
-const PROFILE_STATS_VERSION_V1: u16 = 1;
-
+/// Folder for a profile id. Ids that aren't valid GUIDs (the guest/default seed,
+/// legacy folder-name ids) skip the cache and fall back to a literal folder,
+/// which also covers freshly created or not-yet-migrated profiles.
 #[inline(always)]
 fn local_profile_dir(id: &str) -> PathBuf {
-    PathBuf::from(PROFILES_ROOT).join(id)
+    if is_valid_profile_guid(id)
+        && let Some(dir) = resolve_profile_dir(id)
+    {
+        return dir;
+    }
+    profile_dir_by_folder(id)
+}
+
+#[inline(always)]
+pub fn local_profile_dir_for_id(id: &str) -> PathBuf {
+    local_profile_dir(id)
+}
+
+fn existing_profile_folder_names() -> Vec<String> {
+    let Ok(read_dir) = fs::read_dir(profiles_root()) else {
+        return Vec::new();
+    };
+    read_dir
+        .flatten()
+        .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .collect()
 }
 
 #[inline(always)]
@@ -357,33 +182,40 @@ fn arrowcloud_ini_path(id: &str) -> PathBuf {
 }
 
 #[inline(always)]
-fn find_profile_avatar_path(dir: &Path) -> Option<PathBuf> {
-    let Ok(read_dir) = fs::read_dir(dir) else {
-        return None;
-    };
-    let mut avatar = None;
-    for entry in read_dir.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let file_name = entry.file_name();
-        let Some(name) = file_name.to_str() else {
-            continue;
-        };
-        if name.eq_ignore_ascii_case("profile.png") {
-            return Some(path);
-        }
-        if avatar.is_none() && name.eq_ignore_ascii_case("avatar.png") {
-            avatar = Some(path);
-        }
-    }
-    avatar
+fn profile_stats_path(id: &str) -> PathBuf {
+    local_profile_dir(id).join("stats.bin")
 }
 
 #[inline(always)]
-fn profile_stats_path(id: &str) -> PathBuf {
-    local_profile_dir(id).join("stats.bin")
+fn load_player_options(
+    profile_conf: &SimpleIni,
+    section: &str,
+    default: &PlayerOptionsData,
+) -> Option<PlayerOptionsData> {
+    let has_any = profile_conf
+        .get_section(section)
+        .is_some_and(|s| !s.is_empty());
+    load_player_options_section(has_any, |key| profile_conf.get(section, key), default)
+}
+
+#[inline(always)]
+fn load_last_played(
+    profile_conf: &SimpleIni,
+    section: &str,
+    default: &LastPlayed,
+) -> Option<LastPlayed> {
+    let has_any = profile_conf
+        .get_section(section)
+        .is_some_and(|s| !s.is_empty());
+    load_last_played_section(has_any, |key| profile_conf.get(section, key), default)
+}
+
+#[inline(always)]
+fn load_last_played_course(profile_conf: &SimpleIni, section: &str) -> Option<LastPlayedCourse> {
+    let has_any = profile_conf
+        .get_section(section)
+        .is_some_and(|s| !s.is_empty());
+    load_last_played_course_section(has_any, |key| profile_conf.get(section, key))
 }
 
 #[inline(always)]
@@ -391,1104 +223,9 @@ fn profile_stats_tmp_path(id: &str) -> PathBuf {
     local_profile_dir(id).join("stats.bin.tmp")
 }
 
-#[derive(Debug, Clone, Copy, Encode, Decode)]
-struct ProfileStatsV1 {
-    version: u16,
-    current_combo: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum BackgroundFilter {
-    Off,
-    Dark,
-    Darker,
-    #[default]
-    Darkest,
-}
-
-impl FromStr for BackgroundFilter {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "off" => Ok(Self::Off),
-            "dark" => Ok(Self::Dark),
-            "darker" => Ok(Self::Darker),
-            "darkest" => Ok(Self::Darkest),
-            _ => Err(format!("'{s}' is not a valid BackgroundFilter setting")),
-        }
-    }
-}
-
-impl core::fmt::Display for BackgroundFilter {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Off => write!(f, "Off"),
-            Self::Dark => write!(f, "Dark"),
-            Self::Darker => write!(f, "Darker"),
-            Self::Darkest => write!(f, "Darkest"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum HoldJudgmentGraphic {
-    #[default]
-    Love,
-    Mute,
-    ITG2,
-    None,
-}
-
-impl FromStr for HoldJudgmentGraphic {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim().to_lowercase().as_str() {
-            "love" => Ok(Self::Love),
-            "mute" => Ok(Self::Mute),
-            "itg2" => Ok(Self::ITG2),
-            "none" => Ok(Self::None),
-            other => Err(format!(
-                "'{other}' is not a valid HoldJudgmentGraphic setting"
-            )),
-        }
-    }
-}
-
-impl core::fmt::Display for HoldJudgmentGraphic {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Love => write!(f, "Love"),
-            Self::Mute => write!(f, "mute"),
-            Self::ITG2 => write!(f, "ITG2"),
-            Self::None => write!(f, "None"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum JudgmentGraphic {
-    Bebas,
-    Censored,
-    Chromatic,
-    Code,
-    ComicSans,
-    Emoticon,
-    Focus,
-    Grammar,
-    GrooveNights,
-    ITG2,
-    #[default]
-    Love,
-    LoveChroma,
-    Miso,
-    Papyrus,
-    Rainbowmatic,
-    Roboto,
-    Shift,
-    Tactics,
-    Wendy,
-    WendyChroma,
-    None,
-}
-
-impl FromStr for JudgmentGraphic {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let v = s.trim().to_lowercase();
-        match v.as_str() {
-            "bebas" => Ok(Self::Bebas),
-            "censored" => Ok(Self::Censored),
-            "chromatic" => Ok(Self::Chromatic),
-            "code" => Ok(Self::Code),
-            "comic sans" => Ok(Self::ComicSans),
-            "comicsans" => Ok(Self::ComicSans),
-            "emoticon" => Ok(Self::Emoticon),
-            "focus" => Ok(Self::Focus),
-            "grammar" => Ok(Self::Grammar),
-            "groovenights" => Ok(Self::GrooveNights),
-            "groove nights" => Ok(Self::GrooveNights),
-            "itg2" => Ok(Self::ITG2),
-            "love" => Ok(Self::Love),
-            "love chroma" => Ok(Self::LoveChroma),
-            "lovechroma" => Ok(Self::LoveChroma),
-            "miso" => Ok(Self::Miso),
-            "papyrus" => Ok(Self::Papyrus),
-            "rainbowmatic" => Ok(Self::Rainbowmatic),
-            "roboto" => Ok(Self::Roboto),
-            "shift" => Ok(Self::Shift),
-            "tactics" => Ok(Self::Tactics),
-            "wendy" => Ok(Self::Wendy),
-            "wendy chroma" => Ok(Self::WendyChroma),
-            "wendychroma" => Ok(Self::WendyChroma),
-            "none" => Ok(Self::None),
-            other => Err(format!("'{other}' is not a valid JudgmentGraphic setting")),
-        }
-    }
-}
-
-impl core::fmt::Display for JudgmentGraphic {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Bebas => write!(f, "Bebas"),
-            Self::Censored => write!(f, "Censored"),
-            Self::Chromatic => write!(f, "Chromatic"),
-            Self::Code => write!(f, "Code"),
-            Self::ComicSans => write!(f, "Comic Sans"),
-            Self::Emoticon => write!(f, "Emoticon"),
-            Self::Focus => write!(f, "Focus"),
-            Self::Grammar => write!(f, "Grammar"),
-            Self::GrooveNights => write!(f, "GrooveNights"),
-            Self::ITG2 => write!(f, "ITG2"),
-            Self::Love => write!(f, "Love"),
-            Self::LoveChroma => write!(f, "Love Chroma"),
-            Self::Miso => write!(f, "Miso"),
-            Self::Papyrus => write!(f, "Papyrus"),
-            Self::Rainbowmatic => write!(f, "Rainbowmatic"),
-            Self::Roboto => write!(f, "Roboto"),
-            Self::Shift => write!(f, "Shift"),
-            Self::Tactics => write!(f, "Tactics"),
-            Self::Wendy => write!(f, "Wendy"),
-            Self::WendyChroma => write!(f, "Wendy Chroma"),
-            Self::None => write!(f, "None"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ErrorBarStyle {
-    #[default]
-    None,
-    Colorful,
-    Monochrome,
-    Text,
-    Highlight,
-    Average,
-}
-
-impl FromStr for ErrorBarStyle {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim().to_lowercase().as_str() {
-            "none" => Ok(Self::None),
-            "colorful" => Ok(Self::Colorful),
-            "monochrome" => Ok(Self::Monochrome),
-            "text" => Ok(Self::Text),
-            "highlight" => Ok(Self::Highlight),
-            "average" => Ok(Self::Average),
-            other => Err(format!("'{other}' is not a valid ErrorBar setting")),
-        }
-    }
-}
-
-impl core::fmt::Display for ErrorBarStyle {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::None => write!(f, "None"),
-            Self::Colorful => write!(f, "Colorful"),
-            Self::Monochrome => write!(f, "Monochrome"),
-            Self::Text => write!(f, "Text"),
-            Self::Highlight => write!(f, "Highlight"),
-            Self::Average => write!(f, "Average"),
-        }
-    }
-}
-
-pub const ERROR_BAR_BIT_COLORFUL: u8 = 1 << 0;
-pub const ERROR_BAR_BIT_MONOCHROME: u8 = 1 << 1;
-pub const ERROR_BAR_BIT_TEXT: u8 = 1 << 2;
-pub const ERROR_BAR_BIT_HIGHLIGHT: u8 = 1 << 3;
-pub const ERROR_BAR_BIT_AVERAGE: u8 = 1 << 4;
-pub const ERROR_BAR_ACTIVE_BITS: u8 = ERROR_BAR_BIT_COLORFUL
-    | ERROR_BAR_BIT_MONOCHROME
-    | ERROR_BAR_BIT_TEXT
-    | ERROR_BAR_BIT_HIGHLIGHT
-    | ERROR_BAR_BIT_AVERAGE;
-
-#[inline(always)]
-pub const fn normalize_error_bar_mask(mask: u8) -> u8 {
-    mask & ERROR_BAR_ACTIVE_BITS
-}
-
-#[inline(always)]
-pub const fn error_bar_mask_from_style(style: ErrorBarStyle, text: bool) -> u8 {
-    let mut mask = if text { ERROR_BAR_BIT_TEXT } else { 0 };
-    mask |= match style {
-        ErrorBarStyle::None => 0,
-        ErrorBarStyle::Colorful => ERROR_BAR_BIT_COLORFUL,
-        ErrorBarStyle::Monochrome => ERROR_BAR_BIT_MONOCHROME,
-        ErrorBarStyle::Text => ERROR_BAR_BIT_TEXT,
-        ErrorBarStyle::Highlight => ERROR_BAR_BIT_HIGHLIGHT,
-        ErrorBarStyle::Average => ERROR_BAR_BIT_AVERAGE,
-    };
-    normalize_error_bar_mask(mask)
-}
-
-#[inline(always)]
-pub const fn error_bar_style_from_mask(mask: u8) -> ErrorBarStyle {
-    let mask = normalize_error_bar_mask(mask);
-    if (mask & ERROR_BAR_BIT_COLORFUL) != 0 {
-        ErrorBarStyle::Colorful
-    } else if (mask & ERROR_BAR_BIT_MONOCHROME) != 0 {
-        ErrorBarStyle::Monochrome
-    } else if (mask & ERROR_BAR_BIT_HIGHLIGHT) != 0 {
-        ErrorBarStyle::Highlight
-    } else if (mask & ERROR_BAR_BIT_AVERAGE) != 0 {
-        ErrorBarStyle::Average
-    } else {
-        ErrorBarStyle::None
-    }
-}
-
-#[inline(always)]
-pub const fn error_bar_text_from_mask(mask: u8) -> bool {
-    (normalize_error_bar_mask(mask) & ERROR_BAR_BIT_TEXT) != 0
-}
-
-pub const CUSTOM_FANTASTIC_WINDOW_MIN_MS: u8 = 1;
-pub const CUSTOM_FANTASTIC_WINDOW_MAX_MS: u8 = 22;
-pub const CUSTOM_FANTASTIC_WINDOW_DEFAULT_MS: u8 = 10;
-
-#[inline(always)]
-pub const fn clamp_custom_fantastic_window_ms(ms: u8) -> u8 {
-    if ms < CUSTOM_FANTASTIC_WINDOW_MIN_MS {
-        CUSTOM_FANTASTIC_WINDOW_MIN_MS
-    } else if ms > CUSTOM_FANTASTIC_WINDOW_MAX_MS {
-        CUSTOM_FANTASTIC_WINDOW_MAX_MS
-    } else {
-        ms
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ErrorBarTrim {
-    #[default]
-    Off,
-    Fantastic,
-    Excellent,
-    Great,
-}
-
-impl FromStr for ErrorBarTrim {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim().to_lowercase().as_str() {
-            "off" => Ok(Self::Off),
-            "fantastic" => Ok(Self::Fantastic),
-            "excellent" => Ok(Self::Excellent),
-            "great" => Ok(Self::Great),
-            other => Err(format!("'{other}' is not a valid ErrorBarTrim setting")),
-        }
-    }
-}
-
-impl core::fmt::Display for ErrorBarTrim {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Off => write!(f, "Off"),
-            Self::Fantastic => write!(f, "Fantastic"),
-            Self::Excellent => write!(f, "Excellent"),
-            Self::Great => write!(f, "Great"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum MeasureCounter {
-    #[default]
-    None,
-    Eighth,
-    Twelfth,
-    Sixteenth,
-    TwentyFourth,
-    ThirtySecond,
-}
-
-impl MeasureCounter {
-    #[inline(always)]
-    pub const fn notes_threshold(self) -> Option<usize> {
-        match self {
-            Self::None => None,
-            Self::Eighth => Some(8),
-            Self::Twelfth => Some(12),
-            Self::Sixteenth => Some(16),
-            Self::TwentyFourth => Some(24),
-            Self::ThirtySecond => Some(32),
-        }
-    }
-
-    #[inline(always)]
-    pub const fn multiplier(self) -> f32 {
-        match self {
-            Self::TwentyFourth => 1.5,
-            Self::ThirtySecond => 2.0,
-            _ => 1.0,
-        }
-    }
-}
-
-impl FromStr for MeasureCounter {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim().to_lowercase().as_str() {
-            "none" => Ok(Self::None),
-            "8th" => Ok(Self::Eighth),
-            "12th" => Ok(Self::Twelfth),
-            "16th" => Ok(Self::Sixteenth),
-            "24th" => Ok(Self::TwentyFourth),
-            "32nd" => Ok(Self::ThirtySecond),
-            other => Err(format!("'{other}' is not a valid MeasureCounter setting")),
-        }
-    }
-}
-
-impl core::fmt::Display for MeasureCounter {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::None => write!(f, "None"),
-            Self::Eighth => write!(f, "8th"),
-            Self::Twelfth => write!(f, "12th"),
-            Self::Sixteenth => write!(f, "16th"),
-            Self::TwentyFourth => write!(f, "24th"),
-            Self::ThirtySecond => write!(f, "32nd"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum MeasureLines {
-    #[default]
-    Off,
-    Measure,
-    Quarter,
-    Eighth,
-}
-
-impl FromStr for MeasureLines {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim().to_lowercase().as_str() {
-            "off" => Ok(Self::Off),
-            "measure" => Ok(Self::Measure),
-            "quarter" => Ok(Self::Quarter),
-            "eighth" => Ok(Self::Eighth),
-            other => Err(format!("'{other}' is not a valid MeasureLines setting")),
-        }
-    }
-}
-
-impl core::fmt::Display for MeasureLines {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Off => write!(f, "Off"),
-            Self::Measure => write!(f, "Measure"),
-            Self::Quarter => write!(f, "Quarter"),
-            Self::Eighth => write!(f, "Eighth"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum DataVisualizations {
-    #[default]
-    None,
-    TargetScoreGraph,
-    StepStatistics,
-}
-
-impl FromStr for DataVisualizations {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut key = String::with_capacity(s.len());
-        for ch in s.trim().chars() {
-            if ch.is_ascii_alphanumeric() {
-                key.push(ch.to_ascii_lowercase());
-            }
-        }
-        match key.as_str() {
-            "" | "none" => Ok(Self::None),
-            "targetscoregraph" | "targetscore" | "target" => Ok(Self::TargetScoreGraph),
-            "stepstatistics" | "stepstats" => Ok(Self::StepStatistics),
-            other => Err(format!(
-                "'{other}' is not a valid DataVisualizations setting"
-            )),
-        }
-    }
-}
-
-impl core::fmt::Display for DataVisualizations {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::None => write!(f, "None"),
-            Self::TargetScoreGraph => write!(f, "Target Score Graph"),
-            Self::StepStatistics => write!(f, "Step Statistics"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum LifeMeterType {
-    #[default]
-    Standard,
-    Surround,
-    Vertical,
-}
-
-impl FromStr for LifeMeterType {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim().to_lowercase().as_str() {
-            "" | "standard" => Ok(Self::Standard),
-            "surround" => Ok(Self::Surround),
-            "vertical" => Ok(Self::Vertical),
-            other => Err(format!("'{other}' is not a valid LifeMeterType setting")),
-        }
-    }
-}
-
-impl core::fmt::Display for LifeMeterType {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Standard => write!(f, "Standard"),
-            Self::Surround => write!(f, "Surround"),
-            Self::Vertical => write!(f, "Vertical"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct NoteSkin {
-    raw: String,
-}
-
-impl NoteSkin {
-    pub const DEFAULT_NAME: &'static str = "default";
-    pub const CEL_NAME: &'static str = "cel";
-
-    #[inline(always)]
-    fn normalize(raw: &str) -> Option<String> {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        let lower = trimmed.to_ascii_lowercase();
-        Some(lower)
-    }
-
-    #[inline(always)]
-    pub fn new(raw: &str) -> Self {
-        Self::from_str(raw).unwrap_or_default()
-    }
-
-    #[inline(always)]
-    pub fn as_str(&self) -> &str {
-        &self.raw
-    }
-}
-
-impl Default for NoteSkin {
-    fn default() -> Self {
-        Self {
-            raw: Self::CEL_NAME.to_string(),
-        }
-    }
-}
-
-impl FromStr for NoteSkin {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let normalized = Self::normalize(s)
-            .ok_or_else(|| format!("'{}' is not a valid NoteSkin setting", s.trim()))?;
-        Ok(Self { raw: normalized })
-    }
-}
-
-impl core::fmt::Display for NoteSkin {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{}", self.raw)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ComboFont {
-    #[default]
-    Wendy,
-    ArialRounded,
-    Asap,
-    BebasNeue,
-    SourceCode,
-    Work,
-    WendyCursed,
-    None,
-}
-
-impl FromStr for ComboFont {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let v = s.trim().to_lowercase();
-        match v.as_str() {
-            "wendy" => Ok(Self::Wendy),
-            "arial rounded" | "arialrounded" => Ok(Self::ArialRounded),
-            "asap" => Ok(Self::Asap),
-            "bebas neue" | "bebasneue" => Ok(Self::BebasNeue),
-            "source code" | "sourcecode" => Ok(Self::SourceCode),
-            "work" => Ok(Self::Work),
-            "wendy (cursed)" | "wendy cursed" | "wendycursed" => Ok(Self::WendyCursed),
-            "none" => Ok(Self::None),
-            other => Err(format!("'{other}' is not a valid ComboFont setting")),
-        }
-    }
-}
-
-impl core::fmt::Display for ComboFont {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Wendy => write!(f, "Wendy"),
-            Self::ArialRounded => write!(f, "Arial Rounded"),
-            Self::Asap => write!(f, "Asap"),
-            Self::BebasNeue => write!(f, "Bebas Neue"),
-            Self::SourceCode => write!(f, "Source Code"),
-            Self::Work => write!(f, "Work"),
-            Self::WendyCursed => write!(f, "Wendy (Cursed)"),
-            Self::None => write!(f, "None"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ComboColors {
-    #[default]
-    Glow,
-    Solid,
-    Rainbow,
-    RainbowScroll,
-    None,
-}
-
-impl FromStr for ComboColors {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut key = String::with_capacity(s.len());
-        for ch in s.trim().chars() {
-            if ch.is_ascii_alphanumeric() {
-                key.push(ch.to_ascii_lowercase());
-            }
-        }
-        match key.as_str() {
-            "glow" => Ok(Self::Glow),
-            "solid" => Ok(Self::Solid),
-            "rainbow" => Ok(Self::Rainbow),
-            "rainbowscroll" => Ok(Self::RainbowScroll),
-            "none" => Ok(Self::None),
-            other => Err(format!("'{other}' is not a valid ComboColors setting")),
-        }
-    }
-}
-
-impl core::fmt::Display for ComboColors {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Glow => write!(f, "Glow"),
-            Self::Solid => write!(f, "Solid"),
-            Self::Rainbow => write!(f, "Rainbow"),
-            Self::RainbowScroll => write!(f, "RainbowScroll"),
-            Self::None => write!(f, "None"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ComboMode {
-    #[default]
-    FullCombo,
-    CurrentCombo,
-}
-
-impl FromStr for ComboMode {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut key = String::with_capacity(s.len());
-        for ch in s.trim().chars() {
-            if ch.is_ascii_alphanumeric() {
-                key.push(ch.to_ascii_lowercase());
-            }
-        }
-        match key.as_str() {
-            "fullcombo" => Ok(Self::FullCombo),
-            "currentcombo" => Ok(Self::CurrentCombo),
-            other => Err(format!("'{other}' is not a valid ComboMode setting")),
-        }
-    }
-}
-
-impl core::fmt::Display for ComboMode {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::FullCombo => write!(f, "FullCombo"),
-            Self::CurrentCombo => write!(f, "CurrentCombo"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum MiniIndicator {
-    #[default]
-    None,
-    SubtractiveScoring,
-    PredictiveScoring,
-    PaceScoring,
-    RivalScoring,
-    Pacemaker,
-    StreamProg,
-}
-
-impl FromStr for MiniIndicator {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut key = String::with_capacity(s.len());
-        for ch in s.trim().chars() {
-            if ch.is_ascii_alphanumeric() {
-                key.push(ch.to_ascii_lowercase());
-            }
-        }
-        match key.as_str() {
-            "" | "none" => Ok(Self::None),
-            "subtractivescoring" | "subtractive" => Ok(Self::SubtractiveScoring),
-            "predictivescoring" | "predictive" => Ok(Self::PredictiveScoring),
-            "pacescoring" | "pace" => Ok(Self::PaceScoring),
-            "rivalscoring" | "rival" => Ok(Self::RivalScoring),
-            "pacemaker" => Ok(Self::Pacemaker),
-            "streamprog" | "streamprogress" | "stream" => Ok(Self::StreamProg),
-            other => Err(format!("'{other}' is not a valid MiniIndicator setting")),
-        }
-    }
-}
-
-impl core::fmt::Display for MiniIndicator {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::None => write!(f, "None"),
-            Self::SubtractiveScoring => write!(f, "SubtractiveScoring"),
-            Self::PredictiveScoring => write!(f, "PredictiveScoring"),
-            Self::PaceScoring => write!(f, "PaceScoring"),
-            Self::RivalScoring => write!(f, "RivalScoring"),
-            Self::Pacemaker => write!(f, "Pacemaker"),
-            Self::StreamProg => write!(f, "StreamProg"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum MiniIndicatorScoreType {
-    #[default]
-    Itg,
-    Ex,
-    HardEx,
-}
-
-impl FromStr for MiniIndicatorScoreType {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut key = String::with_capacity(s.len());
-        for ch in s.trim().chars() {
-            if ch.is_ascii_alphanumeric() {
-                key.push(ch.to_ascii_lowercase());
-            }
-        }
-        match key.as_str() {
-            "" | "itg" => Ok(Self::Itg),
-            "ex" => Ok(Self::Ex),
-            "hardex" | "hex" => Ok(Self::HardEx),
-            other => Err(format!(
-                "'{other}' is not a valid MiniIndicatorScoreType setting"
-            )),
-        }
-    }
-}
-
-impl core::fmt::Display for MiniIndicatorScoreType {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Itg => write!(f, "ITG"),
-            Self::Ex => write!(f, "Ex"),
-            Self::HardEx => write!(f, "HardEx"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum TargetScoreSetting {
-    CMinus,
-    C,
-    CPlus,
-    BMinus,
-    B,
-    BPlus,
-    AMinus,
-    A,
-    APlus,
-    SMinus,
-    #[default]
-    S,
-    SPlus,
-    MachineBest,
-    PersonalBest,
-}
-
-impl FromStr for TargetScoreSetting {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut key = String::with_capacity(s.len());
-        for ch in s.trim().chars() {
-            if ch.is_ascii_alphanumeric() {
-                key.push(ch.to_ascii_lowercase());
-            }
-        }
-        match key.as_str() {
-            "cminus" | "c-" => Ok(Self::CMinus),
-            "c" => Ok(Self::C),
-            "cplus" | "c+" => Ok(Self::CPlus),
-            "bminus" | "b-" => Ok(Self::BMinus),
-            "b" => Ok(Self::B),
-            "bplus" | "b+" => Ok(Self::BPlus),
-            "aminus" | "a-" => Ok(Self::AMinus),
-            "a" => Ok(Self::A),
-            "aplus" | "a+" => Ok(Self::APlus),
-            "sminus" | "s-" => Ok(Self::SMinus),
-            "" | "s" => Ok(Self::S),
-            "splus" | "s+" => Ok(Self::SPlus),
-            "machinebest" | "machine" => Ok(Self::MachineBest),
-            "personalbest" | "personal" => Ok(Self::PersonalBest),
-            other => Err(format!("'{other}' is not a valid TargetScore setting")),
-        }
-    }
-}
-
-impl core::fmt::Display for TargetScoreSetting {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::CMinus => write!(f, "C-"),
-            Self::C => write!(f, "C"),
-            Self::CPlus => write!(f, "C+"),
-            Self::BMinus => write!(f, "B-"),
-            Self::B => write!(f, "B"),
-            Self::BPlus => write!(f, "B+"),
-            Self::AMinus => write!(f, "A-"),
-            Self::A => write!(f, "A"),
-            Self::APlus => write!(f, "A+"),
-            Self::SMinus => write!(f, "S-"),
-            Self::S => write!(f, "S"),
-            Self::SPlus => write!(f, "S+"),
-            Self::MachineBest => write!(f, "Machine Best"),
-            Self::PersonalBest => write!(f, "Personal Best"),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct Profile {
-    pub display_name: String,
-    pub player_initials: String,
-    // Profile stats (Simply Love / StepMania semantics).
-    pub calories_burned_today: f32,
-    pub calories_burned_day: String,
-    pub ignore_step_count_calories: bool,
-    pub groovestats_api_key: String,
-    pub groovestats_is_pad_player: bool,
-    pub groovestats_username: String,
-    pub arrowcloud_api_key: String,
-    pub background_filter: BackgroundFilter,
-    pub hold_judgment_graphic: HoldJudgmentGraphic,
-    pub judgment_graphic: JudgmentGraphic,
-    pub combo_font: ComboFont,
-    pub combo_colors: ComboColors,
-    pub combo_mode: ComboMode,
-    pub carry_combo_between_songs: bool,
-    pub current_combo: u32,
-    pub noteskin: NoteSkin,
-    pub avatar_path: Option<PathBuf>,
-    pub avatar_texture_key: Option<String>,
-    pub scroll_speed: ScrollSpeedSetting,
-    pub scroll_option: ScrollOption,
-    pub reverse_scroll: bool,
-    pub turn_option: TurnOption,
-    // zmod uncommon modifiers (ScreenPlayerOptions3).
-    // Bit order mirrors row choice order in metrics.ini.
-    pub insert_active_mask: u8,
-    pub remove_active_mask: u8,
-    pub holds_active_mask: u8,
-    pub accel_effects_active_mask: u8,
-    pub visual_effects_active_mask: u16,
-    pub appearance_effects_active_mask: u8,
-    pub attack_mode: AttackMode,
-    pub hide_light_type: HideLightType,
-    // Allow early Decent/WayOff hits to be rescored to better judgments.
-    pub rescore_early_hits: bool,
-    // Visual behavior for early Decent/Way Off hits (Simply Love semantics).
-    pub hide_early_dw_judgments: bool,
-    pub hide_early_dw_flash: bool,
-    // FA+ visual options (Simply Love semantics).
-    // These do not change core timing semantics; they only affect HUD/UX.
-    pub show_fa_plus_window: bool,
-    pub show_ex_score: bool,
-    pub show_hard_ex_score: bool,
-    pub show_fa_plus_pane: bool,
-    // 10ms blue Fantastic window for FA+ window display (Arrow Cloud: "SmallerWhite").
-    pub fa_plus_10ms_blue_window: bool,
-    // Track and display per-column early judgment counts on evaluation (zmod/Arrow Cloud semantics).
-    pub track_early_judgments: bool,
-    // Custom blue Fantastic window in milliseconds (1..22), shared by FA+ W0 and H.EX split.
-    pub custom_fantastic_window: bool,
-    pub custom_fantastic_window_ms: u8,
-    // Judgment tilt (Simply Love semantics).
-    pub judgment_tilt: bool,
-    pub column_cues: bool,
-    // zmod ExtraAesthetics: draw judgments/error timing HUD behind notes.
-    pub judgment_back: bool,
-    // zmod ExtraAesthetics: offset indicator (ErrorMSDisplay).
-    pub error_ms_display: bool,
-    pub display_scorebox: bool,
-    // zmod LifeBarOptions (Arrow Cloud semantics).
-    pub rainbow_max: bool,
-    pub responsive_colors: bool,
-    pub show_life_percent: bool,
-    pub tilt_multiplier: f32,
-    // Error bar (zmod semantics): each bit toggles one submodule in the
-    // SelectMultiple row (Colorful/Monochrome/Text/Highlight/Average).
-    pub error_bar_active_mask: u8,
-    // Backward-compatible primary style string written to profile.ini.
-    pub error_bar: ErrorBarStyle,
-    // Backward-compatible text flag written to profile.ini.
-    pub error_bar_text: bool,
-    pub error_bar_up: bool,
-    pub error_bar_multi_tick: bool,
-    pub error_bar_trim: ErrorBarTrim,
-    pub data_visualizations: DataVisualizations,
-    pub target_score: TargetScoreSetting,
-    pub lifemeter_type: LifeMeterType,
-    pub measure_counter: MeasureCounter,
-    pub measure_counter_lookahead: u8,
-    pub measure_counter_left: bool,
-    pub measure_counter_up: bool,
-    pub measure_counter_vert: bool,
-    pub broken_run: bool,
-    pub run_timer: bool,
-    pub measure_lines: MeasureLines,
-    // "Hide" options (Simply Love semantics).
-    pub hide_targets: bool,
-    pub hide_song_bg: bool,
-    pub hide_combo: bool,
-    pub hide_lifebar: bool,
-    pub hide_score: bool,
-    pub hide_danger: bool,
-    pub hide_combo_explosions: bool,
-    // Gameplay extras (Simply Love semantics).
-    pub column_flash_on_miss: bool,
-    pub subtractive_scoring: bool,
-    pub pacemaker: bool,
-    pub nps_graph_at_top: bool,
-    pub transparent_density_graph_bg: bool,
-    pub mini_indicator: MiniIndicator,
-    pub mini_indicator_score_type: MiniIndicatorScoreType,
-    // Mini modifier as a percentage, mirroring Simply Love semantics.
-    // 0 = normal size, 100 = 100% Mini (smaller), negative values enlarge.
-    pub mini_percent: i32,
-    pub perspective: Perspective,
-    // NoteField positional offsets (Simply Love semantics).
-    // X is non-negative and interpreted relative to player side:
-    // for P1, positive values move the field left.
-    pub note_field_offset_x: i32,
-    // Y is applied directly to the notefield and related HUD,
-    // positive values move everything down.
-    pub note_field_offset_y: i32,
-    // Per-player visual delay (Simply Love semantics). Stored in milliseconds.
-    // Negative values shift arrows upwards; positive values shift them down.
-    pub visual_delay_ms: i32,
-    // Persisted "last played" selection so that SelectMusic can
-    // reopen on the last song+difficulty the player actually played.
-    // Stored as a serialized music file path and a raw difficulty index.
-    pub last_song_music_path: Option<String>,
-    pub last_chart_hash: Option<String>,
-    pub last_difficulty_index: usize,
-}
-
-impl Default for Profile {
-    fn default() -> Self {
-        Self {
-            display_name: "Player 1".to_string(),
-            player_initials: "P1".to_string(),
-            calories_burned_today: 0.0,
-            calories_burned_day: String::new(),
-            ignore_step_count_calories: false,
-            groovestats_api_key: String::new(),
-            groovestats_is_pad_player: false,
-            groovestats_username: String::new(),
-            arrowcloud_api_key: String::new(),
-            background_filter: BackgroundFilter::default(),
-            hold_judgment_graphic: HoldJudgmentGraphic::default(),
-            judgment_graphic: JudgmentGraphic::default(),
-            combo_font: ComboFont::default(),
-            combo_colors: ComboColors::default(),
-            combo_mode: ComboMode::default(),
-            carry_combo_between_songs: true,
-            current_combo: 0,
-            noteskin: NoteSkin::default(),
-            avatar_path: None,
-            avatar_texture_key: None,
-            scroll_speed: ScrollSpeedSetting::default(),
-            scroll_option: ScrollOption::default(),
-            reverse_scroll: false,
-            turn_option: TurnOption::default(),
-            insert_active_mask: 0,
-            remove_active_mask: 0,
-            holds_active_mask: 0,
-            accel_effects_active_mask: 0,
-            visual_effects_active_mask: 0,
-            appearance_effects_active_mask: 0,
-            attack_mode: AttackMode::default(),
-            hide_light_type: HideLightType::default(),
-            rescore_early_hits: true,
-            hide_early_dw_judgments: false,
-            hide_early_dw_flash: false,
-            show_fa_plus_window: false,
-            show_ex_score: false,
-            show_hard_ex_score: false,
-            show_fa_plus_pane: false,
-            fa_plus_10ms_blue_window: false,
-            track_early_judgments: false,
-            custom_fantastic_window: false,
-            custom_fantastic_window_ms: CUSTOM_FANTASTIC_WINDOW_DEFAULT_MS,
-            judgment_tilt: false,
-            column_cues: false,
-            judgment_back: false,
-            error_ms_display: false,
-            display_scorebox: true,
-            rainbow_max: false,
-            responsive_colors: false,
-            show_life_percent: false,
-            tilt_multiplier: 1.0,
-            error_bar: ErrorBarStyle::default(),
-            error_bar_active_mask: error_bar_mask_from_style(ErrorBarStyle::default(), false),
-            error_bar_text: false,
-            error_bar_up: false,
-            error_bar_multi_tick: false,
-            error_bar_trim: ErrorBarTrim::default(),
-            data_visualizations: DataVisualizations::default(),
-            target_score: TargetScoreSetting::default(),
-            lifemeter_type: LifeMeterType::default(),
-            measure_counter: MeasureCounter::default(),
-            measure_counter_lookahead: 2,
-            measure_counter_left: true,
-            measure_counter_up: false,
-            measure_counter_vert: false,
-            broken_run: false,
-            run_timer: false,
-            measure_lines: MeasureLines::default(),
-            hide_targets: false,
-            hide_song_bg: false,
-            hide_combo: false,
-            hide_lifebar: false,
-            hide_score: false,
-            hide_danger: false,
-            hide_combo_explosions: false,
-            column_flash_on_miss: false,
-            subtractive_scoring: false,
-            pacemaker: false,
-            nps_graph_at_top: false,
-            transparent_density_graph_bg: false,
-            mini_indicator: MiniIndicator::None,
-            mini_indicator_score_type: MiniIndicatorScoreType::Itg,
-            mini_percent: 0,
-            perspective: Perspective::default(),
-            note_field_offset_x: 0,
-            note_field_offset_y: 0,
-            visual_delay_ms: 0,
-            last_song_music_path: None,
-            last_chart_hash: None,
-            // Mirror FILE_DIFFICULTY_NAMES[2] ("Medium") as the default.
-            last_difficulty_index: 2,
-        }
-    }
-}
-
-const PLAYER_SLOTS: usize = 2;
-
-#[inline(always)]
-const fn side_ix(side: PlayerSide) -> usize {
-    match side {
-        PlayerSide::P1 => 0,
-        PlayerSide::P2 => 1,
-    }
-}
-
 // Global statics for the loaded player profiles.
 static PROFILES: std::sync::LazyLock<Mutex<[Profile; PLAYER_SLOTS]>> =
     std::sync::LazyLock::new(|| Mutex::new(std::array::from_fn(|_| Profile::default())));
-
-// --- Session-scoped state (not persisted) ---
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ActiveProfile {
-    Guest,
-    Local { id: String },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum PlayStyle {
-    #[default]
-    Single,
-    Versus,
-    Double,
-}
-
-impl PlayStyle {
-    pub const fn chart_type(self) -> &'static str {
-        match self {
-            Self::Single | Self::Versus => "dance-single",
-            Self::Double => "dance-double",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum PlayMode {
-    #[default]
-    Regular,
-    Marathon,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum PlayerSide {
-    #[default]
-    P1,
-    P2,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum TimingTickMode {
-    #[default]
-    Off,
-    Assist,
-    Hit,
-}
-
-pub const GUEST_SCROLL_SPEED: ScrollSpeedSetting = ScrollSpeedSetting::MMod(250.0);
-
-const SESSION_JOINED_MASK_P1: u8 = 1 << 0;
-const SESSION_JOINED_MASK_P2: u8 = 1 << 1;
-
-#[inline(always)]
-const fn side_joined_mask(side: PlayerSide) -> u8 {
-    match side {
-        PlayerSide::P1 => SESSION_JOINED_MASK_P1,
-        PlayerSide::P2 => SESSION_JOINED_MASK_P2,
-    }
-}
 
 #[derive(Debug)]
 struct SessionState {
@@ -1504,13 +241,10 @@ struct SessionState {
 
 static SESSION: std::sync::LazyLock<Mutex<SessionState>> = std::sync::LazyLock::new(|| {
     Mutex::new(SessionState {
-        active_profiles: [
-            ActiveProfile::Local {
-                id: DEFAULT_PROFILE_ID.to_string(),
-            },
-            ActiveProfile::Guest,
-        ],
-        joined_mask: SESSION_JOINED_MASK_P1,
+        // Both sides start as Guest; `restore_default_profiles()` seeds the
+        // real active profiles from config during `load()`.
+        active_profiles: [ActiveProfile::Guest, ActiveProfile::Guest],
+        joined_mask: joined_player_mask(true, false),
         music_rate: 1.0,
         timing_tick_mode: TimingTickMode::Off,
         play_style: PlayStyle::Single,
@@ -1626,15 +360,19 @@ fn lock_profiles() -> std::sync::MutexGuard<'static, [Profile; PLAYER_SLOTS]> {
 
 #[inline(always)]
 fn session_side_is_guest(side: PlayerSide) -> bool {
-    matches!(
-        &lock_session().active_profiles[side_ix(side)],
-        ActiveProfile::Guest
-    )
+    active_profile_is_guest(&lock_session().active_profiles[side_ix(side)])
 }
 
 #[inline(always)]
 fn machine_default_noteskin_value() -> NoteSkin {
     NoteSkin::new(&config::machine_default_noteskin())
+}
+
+/// Machine-default pad-light brightness used to seed a new profile, mirroring
+/// `machine_default_noteskin_value`. Players adjust their own value afterwards.
+#[inline(always)]
+fn machine_default_light_brightness() -> u8 {
+    config::get().smx_default_light_brightness
 }
 
 pub fn machine_default_noteskin() -> NoteSkin {
@@ -1650,11 +388,11 @@ pub fn update_machine_default_noteskin(setting: NoteSkin) {
         let session = lock_session();
         let mut profiles = lock_profiles();
         for side in [PlayerSide::P1, PlayerSide::P2] {
-            if matches!(
-                &session.active_profiles[side_ix(side)],
-                ActiveProfile::Guest
-            ) {
-                profiles[side_ix(side)].noteskin = setting.clone();
+            if active_profile_is_guest(&session.active_profiles[side_ix(side)]) {
+                let profile = &mut profiles[side_ix(side)];
+                profile.noteskin = setting.clone();
+                profile.player_options_singles.noteskin = setting.clone();
+                profile.player_options_doubles.noteskin = setting.clone();
             }
         }
     }
@@ -1665,8 +403,10 @@ fn make_guest_profile() -> Profile {
     guest.display_name = "[ GUEST ]".to_string();
     guest.scroll_speed = GUEST_SCROLL_SPEED;
     guest.noteskin = machine_default_noteskin_value();
+    guest.pad_light_brightness = machine_default_light_brightness();
     guest.avatar_path = None;
     guest.avatar_texture_key = None;
+    guest.store_current_player_options_for_all_styles();
     guest
 }
 
@@ -1686,348 +426,31 @@ fn ensure_local_profile_files(id: &str) -> Result<(), std::io::Error> {
     if !profile_ini.exists() {
         let mut default_profile = Profile::default();
         default_profile.noteskin = machine_default_noteskin_value();
-        let mut content = String::new();
+        default_profile.pad_light_brightness = machine_default_light_brightness();
+        default_profile.store_current_player_options_for_all_styles();
+        default_profile.calories_burned_day = Local::now().date_naive().to_string();
 
-        content.push_str("[PlayerOptions]\n");
-        content.push_str(&format!(
-            "BackgroundFilter = {}\n",
-            default_profile.background_filter
-        ));
-        content.push_str(&format!("ScrollSpeed = {}\n", default_profile.scroll_speed));
-        content.push_str(&format!("Scroll = {}\n", default_profile.scroll_option));
-        content.push_str(&format!("Turn = {}\n", default_profile.turn_option));
-        content.push_str(&format!(
-            "InsertMask = {}\n",
-            default_profile.insert_active_mask
-        ));
-        content.push_str(&format!(
-            "RemoveMask = {}\n",
-            default_profile.remove_active_mask
-        ));
-        content.push_str(&format!(
-            "HoldsMask = {}\n",
-            default_profile.holds_active_mask
-        ));
-        content.push_str(&format!(
-            "AccelEffectsMask = {}\n",
-            default_profile.accel_effects_active_mask
-        ));
-        content.push_str(&format!(
-            "VisualEffectsMask = {}\n",
-            default_profile.visual_effects_active_mask
-        ));
-        content.push_str(&format!(
-            "AppearanceEffectsMask = {}\n",
-            default_profile.appearance_effects_active_mask
-        ));
-        content.push_str(&format!("AttackMode = {}\n", default_profile.attack_mode));
-        content.push_str(&format!(
-            "HideLightType = {}\n",
-            default_profile.hide_light_type
-        ));
-        content.push_str(&format!(
-            "RescoreEarlyHits = {}\n",
-            i32::from(default_profile.rescore_early_hits)
-        ));
-        content.push_str(&format!(
-            "HideEarlyDecentWayOffJudgments = {}\n",
-            i32::from(default_profile.hide_early_dw_judgments)
-        ));
-        content.push_str(&format!(
-            "HideEarlyDecentWayOffFlash = {}\n",
-            i32::from(default_profile.hide_early_dw_flash)
-        ));
-        content.push_str(&format!(
-            "HideTargets = {}\n",
-            i32::from(default_profile.hide_targets)
-        ));
-        content.push_str(&format!(
-            "HideSongBG = {}\n",
-            i32::from(default_profile.hide_song_bg)
-        ));
-        content.push_str(&format!(
-            "HideCombo = {}\n",
-            i32::from(default_profile.hide_combo)
-        ));
-        content.push_str(&format!(
-            "HideLifebar = {}\n",
-            i32::from(default_profile.hide_lifebar)
-        ));
-        content.push_str(&format!(
-            "HideScore = {}\n",
-            i32::from(default_profile.hide_score)
-        ));
-        content.push_str(&format!(
-            "HideDanger = {}\n",
-            i32::from(default_profile.hide_danger)
-        ));
-        content.push_str(&format!(
-            "HideComboExplosions = {}\n",
-            i32::from(default_profile.hide_combo_explosions)
-        ));
-        content.push_str(&format!(
-            "ColumnFlashOnMiss = {}\n",
-            i32::from(default_profile.column_flash_on_miss)
-        ));
-        content.push_str(&format!(
-            "SubtractiveScoring = {}\n",
-            i32::from(default_profile.subtractive_scoring)
-        ));
-        content.push_str(&format!(
-            "Pacemaker = {}\n",
-            i32::from(default_profile.pacemaker)
-        ));
-        content.push_str(&format!(
-            "NPSGraphAtTop = {}\n",
-            i32::from(default_profile.nps_graph_at_top)
-        ));
-        content.push_str(&format!(
-            "TransparentDensityGraphBackground = {}\n",
-            i32::from(default_profile.transparent_density_graph_bg)
-        ));
-        content.push_str(&format!(
-            "MiniIndicator = {}\n",
-            default_profile.mini_indicator
-        ));
-        content.push_str(&format!(
-            "MiniIndicatorScoreType = {}\n",
-            default_profile.mini_indicator_score_type
-        ));
-        content.push_str(&format!(
-            "ReverseScroll = {}\n",
-            i32::from(default_profile.reverse_scroll)
-        ));
-        content.push_str(&format!(
-            "ShowFaPlusWindow = {}\n",
-            i32::from(default_profile.show_fa_plus_window)
-        ));
-        content.push_str(&format!(
-            "ShowExScore = {}\n",
-            i32::from(default_profile.show_ex_score)
-        ));
-        content.push_str(&format!(
-            "ShowHardEXScore = {}\n",
-            i32::from(default_profile.show_hard_ex_score)
-        ));
-        content.push_str(&format!(
-            "ShowFaPlusPane = {}\n",
-            i32::from(default_profile.show_fa_plus_pane)
-        ));
-        content.push_str(&format!(
-            "SmallerWhite = {}\n",
-            i32::from(default_profile.fa_plus_10ms_blue_window)
-        ));
-        content.push_str(&format!(
-            "TrackEarlyJudgments = {}\n",
-            i32::from(default_profile.track_early_judgments)
-        ));
-        content.push_str(&format!(
-            "CustomFantasticWindow = {}\n",
-            i32::from(default_profile.custom_fantastic_window)
-        ));
-        content.push_str(&format!(
-            "CustomFantasticWindowMs = {}\n",
-            default_profile.custom_fantastic_window_ms
-        ));
-        content.push_str(&format!(
-            "JudgmentTilt = {}\n",
-            i32::from(default_profile.judgment_tilt)
-        ));
-        content.push_str(&format!(
-            "ColumnCues = {}\n",
-            i32::from(default_profile.column_cues)
-        ));
-        content.push_str(&format!(
-            "JudgmentBack = {}\n",
-            i32::from(default_profile.judgment_back)
-        ));
-        content.push_str(&format!(
-            "ErrorMSDisplay = {}\n",
-            i32::from(default_profile.error_ms_display)
-        ));
-        content.push_str(&format!(
-            "DisplayScorebox = {}\n",
-            i32::from(default_profile.display_scorebox)
-        ));
-        content.push_str(&format!(
-            "RainbowMax = {}\n",
-            i32::from(default_profile.rainbow_max)
-        ));
-        content.push_str(&format!(
-            "ResponsiveColors = {}\n",
-            i32::from(default_profile.responsive_colors)
-        ));
-        content.push_str(&format!(
-            "ShowLifePercent = {}\n",
-            i32::from(default_profile.show_life_percent)
-        ));
-        content.push_str(&format!(
-            "TiltMultiplier = {}\n",
-            default_profile.tilt_multiplier
-        ));
-        content.push_str(&format!("ErrorBar = {}\n", default_profile.error_bar));
-        content.push_str(&format!(
-            "ErrorBarText = {}\n",
-            i32::from(default_profile.error_bar_text)
-        ));
-        content.push_str(&format!(
-            "ErrorBarMask = {}\n",
-            default_profile.error_bar_active_mask
-        ));
-        content.push_str(&format!(
-            "Colorful = {}\n",
-            i32::from((default_profile.error_bar_active_mask & ERROR_BAR_BIT_COLORFUL) != 0)
-        ));
-        content.push_str(&format!(
-            "Monochrome = {}\n",
-            i32::from((default_profile.error_bar_active_mask & ERROR_BAR_BIT_MONOCHROME) != 0)
-        ));
-        content.push_str(&format!(
-            "Text = {}\n",
-            i32::from((default_profile.error_bar_active_mask & ERROR_BAR_BIT_TEXT) != 0)
-        ));
-        content.push_str(&format!(
-            "Highlight = {}\n",
-            i32::from((default_profile.error_bar_active_mask & ERROR_BAR_BIT_HIGHLIGHT) != 0)
-        ));
-        content.push_str(&format!(
-            "Average = {}\n",
-            i32::from((default_profile.error_bar_active_mask & ERROR_BAR_BIT_AVERAGE) != 0)
-        ));
-        content.push_str(&format!(
-            "ErrorBarUp = {}\n",
-            i32::from(default_profile.error_bar_up)
-        ));
-        content.push_str(&format!(
-            "ErrorBarMultiTick = {}\n",
-            i32::from(default_profile.error_bar_multi_tick)
-        ));
-        content.push_str(&format!(
-            "ErrorBarTrim = {}\n",
-            default_profile.error_bar_trim
-        ));
-        content.push_str(&format!(
-            "DataVisualizations = {}\n",
-            default_profile.data_visualizations
-        ));
-        content.push_str(&format!("TargetScore = {}\n", default_profile.target_score));
-        content.push_str(&format!(
-            "LifeMeterType = {}\n",
-            default_profile.lifemeter_type
-        ));
-        content.push_str(&format!(
-            "MeasureCounter = {}\n",
-            default_profile.measure_counter
-        ));
-        content.push_str(&format!(
-            "MeasureCounterLookahead = {}\n",
-            default_profile.measure_counter_lookahead
-        ));
-        content.push_str(&format!(
-            "MeasureCounterLeft = {}\n",
-            i32::from(default_profile.measure_counter_left)
-        ));
-        content.push_str(&format!(
-            "MeasureCounterUp = {}\n",
-            i32::from(default_profile.measure_counter_up)
-        ));
-        content.push_str(&format!(
-            "MeasureCounterVert = {}\n",
-            i32::from(default_profile.measure_counter_vert)
-        ));
-        content.push_str(&format!(
-            "BrokenRun = {}\n",
-            i32::from(default_profile.broken_run)
-        ));
-        content.push_str(&format!(
-            "RunTimer = {}\n",
-            i32::from(default_profile.run_timer)
-        ));
-        content.push_str(&format!(
-            "MeasureLines = {}\n",
-            default_profile.measure_lines
-        ));
-        content.push_str(&format!(
-            "HoldJudgmentGraphic = {}\n",
-            default_profile.hold_judgment_graphic
-        ));
-        content.push_str(&format!(
-            "JudgmentGraphic = {}\n",
-            default_profile.judgment_graphic
-        ));
-        content.push_str(&format!("ComboFont = {}\n", default_profile.combo_font));
-        content.push_str(&format!("ComboColors = {}\n", default_profile.combo_colors));
-        content.push_str(&format!("ComboMode = {}\n", default_profile.combo_mode));
-        content.push_str(&format!(
-            "CarryComboBetweenSongs = {}\n",
-            i32::from(default_profile.carry_combo_between_songs)
-        ));
-        content.push_str(&format!("NoteSkin = {}\n", default_profile.noteskin));
-        content.push_str(&format!("MiniPercent = {}\n", default_profile.mini_percent));
-        content.push_str(&format!("Perspective = {}\n", default_profile.perspective));
-        content.push_str(&format!(
-            "NoteFieldOffsetX = {}\n",
-            default_profile.note_field_offset_x
-        ));
-        content.push_str(&format!(
-            "NoteFieldOffsetY = {}\n",
-            default_profile.note_field_offset_y
-        ));
-        content.push_str(&format!(
-            "VisualDelayMs = {}\n",
-            default_profile.visual_delay_ms
-        ));
-        content.push('\n');
-
-        content.push_str("[userprofile]\n");
-        content.push_str(&format!("DisplayName = {}\n", default_profile.display_name));
-        content.push_str(&format!(
-            "PlayerInitials = {}\n",
-            default_profile.player_initials
-        ));
-        content.push('\n');
-
-        // Stats (for ScreenGameOver parity)
-        let today = Local::now().date_naive().to_string();
-        content.push_str("[Stats]\n");
-        content.push_str(&format!("CaloriesBurnedDate = {today}\n"));
-        content.push_str(&format!(
-            "CaloriesBurnedToday = {}\n",
-            default_profile.calories_burned_today
-        ));
-        content.push_str(&format!(
-            "IgnoreStepCountCalories = {}\n",
-            i32::from(default_profile.ignore_step_count_calories)
-        ));
-        content.push('\n');
-
-        fs::write(profile_ini, content)?;
+        fs::write(
+            profile_ini,
+            render_profile_ini_content(id, &default_profile),
+        )?;
     }
 
     // Create groovestats.ini
     if !groovestats_ini.exists() {
-        let mut content = String::new();
-
-        content.push_str("[GrooveStats]\n");
-        content.push_str("ApiKey = \n");
-        content.push_str("IsPadPlayer = 0\n");
-        content.push_str("Username = \n");
-        content.push('\n');
-
-        fs::write(groovestats_ini, content)?;
+        fs::write(
+            groovestats_ini,
+            render_groovestats_ini_content("", false, ""),
+        )?;
     }
 
     // Create arrowcloud.ini
     if !arrowcloud_ini.exists() {
-        let mut content = String::new();
-
-        content.push_str("[ArrowCloud]\n");
-        content.push_str("ApiKey = \n");
-        content.push('\n');
-
-        fs::write(arrowcloud_ini, content)?;
+        fs::write(arrowcloud_ini, render_arrowcloud_ini_content(""))?;
     }
 
+    // A new folder may have appeared; let the resolver pick it up.
+    invalidate_profile_dir_cache();
     Ok(())
 }
 
@@ -2043,293 +466,39 @@ fn save_profile_ini_for_side(side: PlayerSide) {
         return;
     };
 
-    let profile = lock_profiles()[side_ix(side)].clone();
-    let mut content = String::new();
-
-    content.push_str("[PlayerOptions]\n");
-    content.push_str(&format!("BackgroundFilter={}\n", profile.background_filter));
-    content.push_str(&format!("ScrollSpeed={}\n", profile.scroll_speed));
-    content.push_str(&format!("Scroll={}\n", profile.scroll_option));
-    content.push_str(&format!("Turn={}\n", profile.turn_option));
-    content.push_str(&format!("InsertMask={}\n", profile.insert_active_mask));
-    content.push_str(&format!("RemoveMask={}\n", profile.remove_active_mask));
-    content.push_str(&format!("HoldsMask={}\n", profile.holds_active_mask));
-    content.push_str(&format!(
-        "AccelEffectsMask={}\n",
-        profile.accel_effects_active_mask
-    ));
-    content.push_str(&format!(
-        "VisualEffectsMask={}\n",
-        profile.visual_effects_active_mask
-    ));
-    content.push_str(&format!(
-        "AppearanceEffectsMask={}\n",
-        profile.appearance_effects_active_mask
-    ));
-    content.push_str(&format!("AttackMode={}\n", profile.attack_mode));
-    content.push_str(&format!("HideLightType={}\n", profile.hide_light_type));
-    content.push_str(&format!(
-        "RescoreEarlyHits={}\n",
-        i32::from(profile.rescore_early_hits)
-    ));
-    content.push_str(&format!(
-        "HideEarlyDecentWayOffJudgments={}\n",
-        i32::from(profile.hide_early_dw_judgments)
-    ));
-    content.push_str(&format!(
-        "HideEarlyDecentWayOffFlash={}\n",
-        i32::from(profile.hide_early_dw_flash)
-    ));
-    content.push_str(&format!(
-        "HideTargets={}\n",
-        i32::from(profile.hide_targets)
-    ));
-    content.push_str(&format!("HideSongBG={}\n", i32::from(profile.hide_song_bg)));
-    content.push_str(&format!("HideCombo={}\n", i32::from(profile.hide_combo)));
-    content.push_str(&format!(
-        "HideLifebar={}\n",
-        i32::from(profile.hide_lifebar)
-    ));
-    content.push_str(&format!("HideScore={}\n", i32::from(profile.hide_score)));
-    content.push_str(&format!("HideDanger={}\n", i32::from(profile.hide_danger)));
-    content.push_str(&format!(
-        "HideComboExplosions={}\n",
-        i32::from(profile.hide_combo_explosions)
-    ));
-    content.push_str(&format!(
-        "ColumnFlashOnMiss={}\n",
-        i32::from(profile.column_flash_on_miss)
-    ));
-    content.push_str(&format!(
-        "SubtractiveScoring={}\n",
-        i32::from(profile.subtractive_scoring)
-    ));
-    content.push_str(&format!("Pacemaker={}\n", i32::from(profile.pacemaker)));
-    content.push_str(&format!(
-        "NPSGraphAtTop={}\n",
-        i32::from(profile.nps_graph_at_top)
-    ));
-    content.push_str(&format!(
-        "TransparentDensityGraphBackground={}\n",
-        i32::from(profile.transparent_density_graph_bg)
-    ));
-    content.push_str(&format!("MiniIndicator={}\n", profile.mini_indicator));
-    content.push_str(&format!(
-        "MiniIndicatorScoreType={}\n",
-        profile.mini_indicator_score_type
-    ));
-    content.push_str(&format!(
-        "ReverseScroll={}\n",
-        i32::from(profile.reverse_scroll)
-    ));
-    content.push_str(&format!(
-        "ShowFaPlusWindow={}\n",
-        i32::from(profile.show_fa_plus_window)
-    ));
-    content.push_str(&format!(
-        "ShowExScore={}\n",
-        i32::from(profile.show_ex_score)
-    ));
-    content.push_str(&format!(
-        "ShowHardEXScore={}\n",
-        i32::from(profile.show_hard_ex_score)
-    ));
-    content.push_str(&format!(
-        "ShowFaPlusPane={}\n",
-        i32::from(profile.show_fa_plus_pane)
-    ));
-    content.push_str(&format!(
-        "SmallerWhite={}\n",
-        i32::from(profile.fa_plus_10ms_blue_window)
-    ));
-    content.push_str(&format!(
-        "TrackEarlyJudgments={}\n",
-        i32::from(profile.track_early_judgments)
-    ));
-    content.push_str(&format!(
-        "CustomFantasticWindow={}\n",
-        i32::from(profile.custom_fantastic_window)
-    ));
-    content.push_str(&format!(
-        "CustomFantasticWindowMs={}\n",
-        profile.custom_fantastic_window_ms
-    ));
-    content.push_str(&format!(
-        "JudgmentTilt={}\n",
-        i32::from(profile.judgment_tilt)
-    ));
-    content.push_str(&format!("ColumnCues={}\n", i32::from(profile.column_cues)));
-    content.push_str(&format!(
-        "JudgmentBack={}\n",
-        i32::from(profile.judgment_back)
-    ));
-    content.push_str(&format!(
-        "ErrorMSDisplay={}\n",
-        i32::from(profile.error_ms_display)
-    ));
-    content.push_str(&format!(
-        "DisplayScorebox={}\n",
-        i32::from(profile.display_scorebox)
-    ));
-    content.push_str(&format!("RainbowMax={}\n", i32::from(profile.rainbow_max)));
-    content.push_str(&format!(
-        "ResponsiveColors={}\n",
-        i32::from(profile.responsive_colors)
-    ));
-    content.push_str(&format!(
-        "ShowLifePercent={}\n",
-        i32::from(profile.show_life_percent)
-    ));
-    content.push_str(&format!("TiltMultiplier={}\n", profile.tilt_multiplier));
-    content.push_str(&format!("ErrorBar={}\n", profile.error_bar));
-    content.push_str(&format!(
-        "ErrorBarText={}\n",
-        i32::from(profile.error_bar_text)
-    ));
-    content.push_str(&format!("ErrorBarMask={}\n", profile.error_bar_active_mask));
-    content.push_str(&format!(
-        "Colorful={}\n",
-        i32::from((profile.error_bar_active_mask & ERROR_BAR_BIT_COLORFUL) != 0)
-    ));
-    content.push_str(&format!(
-        "Monochrome={}\n",
-        i32::from((profile.error_bar_active_mask & ERROR_BAR_BIT_MONOCHROME) != 0)
-    ));
-    content.push_str(&format!(
-        "Text={}\n",
-        i32::from((profile.error_bar_active_mask & ERROR_BAR_BIT_TEXT) != 0)
-    ));
-    content.push_str(&format!(
-        "Highlight={}\n",
-        i32::from((profile.error_bar_active_mask & ERROR_BAR_BIT_HIGHLIGHT) != 0)
-    ));
-    content.push_str(&format!(
-        "Average={}\n",
-        i32::from((profile.error_bar_active_mask & ERROR_BAR_BIT_AVERAGE) != 0)
-    ));
-    content.push_str(&format!("ErrorBarUp={}\n", i32::from(profile.error_bar_up)));
-    content.push_str(&format!(
-        "ErrorBarMultiTick={}\n",
-        i32::from(profile.error_bar_multi_tick)
-    ));
-    content.push_str(&format!("ErrorBarTrim={}\n", profile.error_bar_trim));
-    content.push_str(&format!(
-        "DataVisualizations={}\n",
-        profile.data_visualizations
-    ));
-    content.push_str(&format!("TargetScore={}\n", profile.target_score));
-    content.push_str(&format!("LifeMeterType={}\n", profile.lifemeter_type));
-    content.push_str(&format!("MeasureCounter={}\n", profile.measure_counter));
-    content.push_str(&format!(
-        "MeasureCounterLookahead={}\n",
-        profile.measure_counter_lookahead
-    ));
-    content.push_str(&format!(
-        "MeasureCounterLeft={}\n",
-        i32::from(profile.measure_counter_left)
-    ));
-    content.push_str(&format!(
-        "MeasureCounterUp={}\n",
-        i32::from(profile.measure_counter_up)
-    ));
-    content.push_str(&format!(
-        "MeasureCounterVert={}\n",
-        i32::from(profile.measure_counter_vert)
-    ));
-    content.push_str(&format!("BrokenRun={}\n", i32::from(profile.broken_run)));
-    content.push_str(&format!("RunTimer={}\n", i32::from(profile.run_timer)));
-    content.push_str(&format!("MeasureLines={}\n", profile.measure_lines));
-    content.push_str(&format!(
-        "HoldJudgmentGraphic={}\n",
-        profile.hold_judgment_graphic
-    ));
-    content.push_str(&format!("JudgmentGraphic={}\n", profile.judgment_graphic));
-    content.push_str(&format!("ComboFont={}\n", profile.combo_font));
-    content.push_str(&format!("ComboColors={}\n", profile.combo_colors));
-    content.push_str(&format!("ComboMode={}\n", profile.combo_mode));
-    content.push_str(&format!(
-        "CarryComboBetweenSongs={}\n",
-        i32::from(profile.carry_combo_between_songs)
-    ));
-    content.push_str(&format!("NoteSkin={}\n", profile.noteskin));
-    content.push_str(&format!("MiniPercent={}\n", profile.mini_percent));
-    content.push_str(&format!("Perspective={}\n", profile.perspective));
-    content.push_str(&format!(
-        "NoteFieldOffsetX={}\n",
-        profile.note_field_offset_x
-    ));
-    content.push_str(&format!(
-        "NoteFieldOffsetY={}\n",
-        profile.note_field_offset_y
-    ));
-    content.push_str(&format!("VisualDelayMs={}\n", profile.visual_delay_ms));
-    content.push('\n');
-
-    content.push_str("[userprofile]\n");
-    content.push_str(&format!("DisplayName={}\n", profile.display_name));
-    content.push_str(&format!("PlayerInitials={}\n", profile.player_initials));
-    content.push('\n');
-
-    // Persist "last played" song + difficulty so that future sessions
-    // can reopen SelectMusic on the most recently played chart.
-    content.push_str("[LastPlayed]\n");
-    if let Some(path) = &profile.last_song_music_path {
-        content.push_str(&format!("MusicPath={path}\n"));
-    } else {
-        content.push_str("MusicPath=\n");
-    }
-    if let Some(hash) = &profile.last_chart_hash {
-        content.push_str(&format!("ChartHash={hash}\n"));
-    } else {
-        content.push_str("ChartHash=\n");
-    }
-    content.push_str(&format!(
-        "DifficultyIndex={}\n",
-        profile.last_difficulty_index
-    ));
-    content.push('\n');
-
-    content.push_str("[Stats]\n");
-    content.push_str(&format!(
-        "CaloriesBurnedDate={}\n",
-        profile.calories_burned_day
-    ));
-    content.push_str(&format!(
-        "CaloriesBurnedToday={}\n",
-        profile.calories_burned_today
-    ));
-    content.push_str(&format!(
-        "IgnoreStepCountCalories={}\n",
-        i32::from(profile.ignore_step_count_calories)
-    ));
-    content.push('\n');
-
+    let play_style = get_session_play_style();
+    let profile = {
+        let mut profiles = lock_profiles();
+        let profile = &mut profiles[side_ix(side)];
+        profile.store_current_player_options(play_style);
+        profile.clone()
+    };
     let path = profile_ini_path(&profile_id);
-    if let Err(e) = fs::write(&path, content) {
+    if let Err(e) = fs::write(&path, render_profile_ini_content(&profile_id, &profile)) {
         warn!("Failed to save {}: {}", path.display(), e);
     }
 }
 
 #[inline(always)]
-fn decode_profile_stats_current_combo(bytes: &[u8], path: &Path) -> Option<u32> {
-    let Ok((stats, _)) =
-        bincode::decode_from_slice::<ProfileStatsV1, _>(bytes, bincode::config::standard())
-    else {
-        warn!("Failed to decode profile stats '{}'.", path.display());
-        return None;
-    };
-    if stats.version != PROFILE_STATS_VERSION_V1 {
-        warn!(
-            "Unsupported profile stats version {} in '{}'.",
-            stats.version,
-            path.display()
-        );
-        return None;
+fn decode_profile_stats(bytes: &[u8], path: &Path) -> Option<ProfileStats> {
+    match decode_profile_stats_bytes(bytes) {
+        Ok(stats) => Some(stats),
+        Err(ProfileStatsDecodeError::UnsupportedVersion(version)) => {
+            warn!(
+                "Unsupported profile stats version {} in '{}'.",
+                version,
+                path.display()
+            );
+            None
+        }
+        Err(ProfileStatsDecodeError::InvalidPayload) => {
+            warn!("Failed to decode profile stats '{}'.", path.display());
+            None
+        }
     }
-    Some(stats.current_combo)
 }
 
-fn load_profile_stats_current_combo(path: &Path) -> Option<u32> {
+fn load_profile_stats(path: &Path) -> Option<ProfileStats> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -2339,33 +508,40 @@ fn load_profile_stats_current_combo(path: &Path) -> Option<u32> {
             return None;
         }
     };
-    decode_profile_stats_current_combo(&bytes, path)
+    decode_profile_stats(&bytes, path)
 }
 
 fn save_profile_stats_for_side(side: PlayerSide) {
-    let profile_id = {
+    let maybe_payload = {
         let session = lock_session();
         match &session.active_profiles[side_ix(side)] {
-            ActiveProfile::Local { id } => Some(id.clone()),
+            ActiveProfile::Local { id } => {
+                let profile = lock_profiles()[side_ix(side)].clone();
+                Some((
+                    id.clone(),
+                    ProfileStats {
+                        current_combo: profile.current_combo,
+                        known_pack_names: profile.known_pack_names,
+                    },
+                ))
+            }
             ActiveProfile::Guest => None,
         }
     };
-    let Some(profile_id) = profile_id else {
+    let Some((profile_id, payload)) = maybe_payload else {
         return;
     };
+    write_profile_stats(&profile_id, &payload);
+}
 
-    let current_combo = lock_profiles()[side_ix(side)].current_combo;
-    let payload = ProfileStatsV1 {
-        version: PROFILE_STATS_VERSION_V1,
-        current_combo,
-    };
-    let Ok(buf) = bincode::encode_to_vec(payload, bincode::config::standard()) else {
+fn write_profile_stats(profile_id: &str, payload: &ProfileStats) {
+    let Some(buf) = encode_profile_stats(payload) else {
         warn!("Failed to encode profile stats for '{}'.", profile_id);
         return;
     };
 
-    let path = profile_stats_path(&profile_id);
-    let tmp_path = profile_stats_tmp_path(&profile_id);
+    let path = profile_stats_path(profile_id);
+    let tmp_path = profile_stats_tmp_path(profile_id);
     if let Some(parent) = path.parent()
         && let Err(e) = fs::create_dir_all(parent)
     {
@@ -2386,6 +562,23 @@ fn save_profile_stats_for_side(side: PlayerSide) {
     }
 }
 
+/// Writes [`ProfileStats`] for a freshly-imported profile that isn't loaded into
+/// a player side (used by the ITGmania importer). `known_pack_names` is left
+/// empty so the normal first-load reconciliation still marks the current packs
+/// as known. Does nothing when there's no stat worth persisting.
+pub fn write_imported_profile_stats(profile_id: &str, current_combo: u32) {
+    if current_combo == 0 {
+        return;
+    }
+    write_profile_stats(
+        profile_id,
+        &ProfileStats {
+            current_combo,
+            known_pack_names: HashSet::new(),
+        },
+    );
+}
+
 fn save_groovestats_ini_for_side(side: PlayerSide) {
     let profile_id = {
         let session = lock_session();
@@ -2399,23 +592,16 @@ fn save_groovestats_ini_for_side(side: PlayerSide) {
     };
 
     let profile = lock_profiles()[side_ix(side)].clone();
-    let mut content = String::new();
-
-    content.push_str("[GrooveStats]\n");
-    content.push_str(&format!("ApiKey={}\n", profile.groovestats_api_key));
-    content.push_str(&format!(
-        "IsPadPlayer={}\n",
-        if profile.groovestats_is_pad_player {
-            "1"
-        } else {
-            "0"
-        }
-    ));
-    content.push_str(&format!("Username={}\n", profile.groovestats_username));
-    content.push('\n');
 
     let path = groovestats_ini_path(&profile_id);
-    if let Err(e) = fs::write(&path, content) {
+    if let Err(e) = fs::write(
+        &path,
+        render_groovestats_ini_content(
+            &profile.groovestats_api_key,
+            profile.groovestats_is_pad_player,
+            &profile.groovestats_username,
+        ),
+    ) {
         warn!("Failed to save {}: {}", path.display(), e);
     }
 }
@@ -2433,16 +619,159 @@ fn save_arrowcloud_ini_for_side(side: PlayerSide) {
     };
 
     let profile = lock_profiles()[side_ix(side)].clone();
-    let mut content = String::new();
-
-    content.push_str("[ArrowCloud]\n");
-    content.push_str(&format!("ApiKey={}\n", profile.arrowcloud_api_key));
-    content.push('\n');
 
     let path = arrowcloud_ini_path(&profile_id);
-    if let Err(e) = fs::write(&path, content) {
+    if let Err(e) = fs::write(
+        &path,
+        render_arrowcloud_ini_content(&profile.arrowcloud_api_key),
+    ) {
         warn!("Failed to save {}: {}", path.display(), e);
     }
+}
+
+/// Update the active profile's ArrowCloud API key (in memory + on disk).
+/// No-op when the side has no local profile loaded (Guest).
+pub fn set_arrowcloud_api_key_for_side(side: PlayerSide, api_key: &str) {
+    {
+        let mut profiles = lock_profiles();
+        profiles[side_ix(side)].arrowcloud_api_key = api_key.to_string();
+    }
+    save_arrowcloud_ini_for_side(side);
+}
+
+/// Write a new ArrowCloud API key for a profile identified by ID
+/// (independent of session sides).  Used by the Manage Local Profiles
+/// "Link ArrowCloud" flow where the user picks a profile that isn't
+/// necessarily joined on P1 or P2.  Also refreshes the in-memory copy
+/// on any session side currently loading that profile, so other screens
+/// see the new key immediately.
+pub fn set_arrowcloud_api_key_for_id(profile_id: &str, api_key: &str) {
+    // Update any session side currently bound to this profile id.
+    let matching_sides: Vec<PlayerSide> = {
+        let session = lock_session();
+        [PlayerSide::P1, PlayerSide::P2]
+            .iter()
+            .copied()
+            .filter(|side| {
+                matches!(
+                    &session.active_profiles[side_ix(*side)],
+                    ActiveProfile::Local { id } if id == profile_id
+                )
+            })
+            .collect()
+    };
+    if !matching_sides.is_empty() {
+        let mut profiles = lock_profiles();
+        for side in &matching_sides {
+            profiles[side_ix(*side)].arrowcloud_api_key = api_key.to_string();
+        }
+    }
+
+    // Persist directly to that profile's ArrowCloud.ini, even if the
+    // profile isn't loaded on any side right now.
+    let path = arrowcloud_ini_path(profile_id);
+    if let Err(e) = fs::write(&path, render_arrowcloud_ini_content(api_key)) {
+        warn!("Failed to save {}: {}", path.display(), e);
+    }
+}
+
+/// Returns the saved ArrowCloud API key (from disk) for a profile
+/// identified by id, regardless of whether it's currently loaded on a
+/// session side.  Empty string if the profile has no key yet or the
+/// file is missing / malformed.
+pub fn get_arrowcloud_api_key_for_id(profile_id: &str) -> String {
+    let path = arrowcloud_ini_path(profile_id);
+    let Ok(text) = fs::read_to_string(&path) else {
+        return String::new();
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("ApiKey=") {
+            return rest.trim().to_string();
+        }
+        if let Some(rest) = line.strip_prefix("ApiKey =") {
+            return rest.trim().to_string();
+        }
+    }
+    String::new()
+}
+
+/// Update the active profile's GrooveStats credentials (API key,
+/// username, and `IsPadPlayer=true` — Simply Love parity, see
+/// `BGAnimations/ScreenGrooveStatsLogin underlay/default.lua:46`) for
+/// the given session side, persisting to its `GrooveStats.ini` on disk.
+/// No-op when the side has no local profile loaded (Guest).
+pub fn set_groovestats_credentials_for_side(side: PlayerSide, api_key: &str, username: &str) {
+    {
+        let mut profiles = lock_profiles();
+        let p = &mut profiles[side_ix(side)];
+        p.groovestats_api_key = api_key.to_string();
+        p.groovestats_username = username.to_string();
+        p.groovestats_is_pad_player = true;
+    }
+    save_groovestats_ini_for_side(side);
+}
+
+/// Write new GrooveStats credentials for a profile identified by ID
+/// (independent of session sides).  Used by the Manage Local Profiles
+/// "Link GrooveStats" flow.  Also refreshes the in-memory copy on any
+/// session side currently bound to that profile id.
+pub fn set_groovestats_credentials_for_id(profile_id: &str, api_key: &str, username: &str) {
+    let matching_sides: Vec<PlayerSide> = {
+        let session = lock_session();
+        [PlayerSide::P1, PlayerSide::P2]
+            .iter()
+            .copied()
+            .filter(|side| {
+                matches!(
+                    &session.active_profiles[side_ix(*side)],
+                    ActiveProfile::Local { id } if id == profile_id
+                )
+            })
+            .collect()
+    };
+    if !matching_sides.is_empty() {
+        let mut profiles = lock_profiles();
+        for side in &matching_sides {
+            let p = &mut profiles[side_ix(*side)];
+            p.groovestats_api_key = api_key.to_string();
+            p.groovestats_username = username.to_string();
+            p.groovestats_is_pad_player = true;
+        }
+    }
+
+    // Persist directly to that profile's GrooveStats.ini, even if the
+    // profile isn't loaded on any side right now.
+    let path = groovestats_ini_path(profile_id);
+    if let Err(e) = fs::write(
+        &path,
+        render_groovestats_ini_content(api_key, true, username),
+    ) {
+        warn!("Failed to save {}: {}", path.display(), e);
+    }
+}
+
+/// Returns the saved GrooveStats API key (from disk) for a profile
+/// identified by id, regardless of whether it's currently loaded on a
+/// session side.  `None` if the profile has no key yet or the file is
+/// missing / malformed; `Some` always wraps a non-empty trimmed key.
+pub fn get_groovestats_api_key_for_id(profile_id: &str) -> Option<String> {
+    let path = groovestats_ini_path(profile_id);
+    let text = fs::read_to_string(&path).ok()?;
+    for line in text.lines() {
+        let line = line.trim();
+        let rest = line
+            .strip_prefix("ApiKey=")
+            .or_else(|| line.strip_prefix("ApiKey ="));
+        if let Some(rest) = rest {
+            let key = rest.trim();
+            if key.is_empty() {
+                return None;
+            }
+            return Some(key.to_string());
+        }
+    }
+    None
 }
 
 fn load_for_side(side: PlayerSide) {
@@ -2495,6 +824,8 @@ fn load_for_side(side: PlayerSide) {
         let profile = &mut profiles[side_ix(side)];
         let mut default_profile = Profile::default();
         default_profile.noteskin = machine_default_noteskin_value();
+        default_profile.pad_light_brightness = machine_default_light_brightness();
+        default_profile.store_current_player_options_for_all_styles();
 
         // Load profile.ini
         let mut profile_conf = SimpleIni::new();
@@ -2504,427 +835,77 @@ fn load_for_side(side: PlayerSide) {
                 .unwrap_or(default_profile.display_name.clone());
             profile.player_initials = profile_conf
                 .get("userprofile", "PlayerInitials")
+                .map(|initials| sanitize_player_initials(&initials))
+                .filter(|initials| !initials.is_empty())
                 .unwrap_or(default_profile.player_initials.clone());
-            profile.background_filter = profile_conf
-                .get("PlayerOptions", "BackgroundFilter")
-                .and_then(|s| BackgroundFilter::from_str(&s).ok())
-                .unwrap_or(default_profile.background_filter);
-            profile.hold_judgment_graphic = profile_conf
-                .get("PlayerOptions", "HoldJudgmentGraphic")
-                .and_then(|s| HoldJudgmentGraphic::from_str(&s).ok())
-                .unwrap_or(default_profile.hold_judgment_graphic);
-            profile.judgment_graphic = profile_conf
-                .get("PlayerOptions", "JudgmentGraphic")
-                .and_then(|s| JudgmentGraphic::from_str(&s).ok())
-                .unwrap_or(default_profile.judgment_graphic);
-            profile.combo_font = profile_conf
-                .get("PlayerOptions", "ComboFont")
-                .and_then(|s| ComboFont::from_str(&s).ok())
-                .unwrap_or(default_profile.combo_font);
-            profile.combo_colors = profile_conf
-                .get("PlayerOptions", "ComboColors")
-                .and_then(|s| ComboColors::from_str(&s).ok())
-                .unwrap_or(default_profile.combo_colors);
-            profile.combo_mode = profile_conf
-                .get("PlayerOptions", "ComboMode")
-                .and_then(|s| ComboMode::from_str(&s).ok())
-                .unwrap_or(default_profile.combo_mode);
-            profile.carry_combo_between_songs = profile_conf
-                .get("PlayerOptions", "CarryComboBetweenSongs")
-                .or_else(|| profile_conf.get("PlayerOptions", "ComboContinuesBetweenSongs"))
-                .and_then(|s| s.parse::<u8>().ok())
-                .map_or(default_profile.carry_combo_between_songs, |v| v != 0);
-            profile.noteskin = profile_conf
-                .get("PlayerOptions", "NoteSkin")
-                .and_then(|s| NoteSkin::from_str(&s).ok())
-                .unwrap_or_else(|| default_profile.noteskin.clone());
-            profile.mini_percent = profile_conf
-                .get("PlayerOptions", "MiniPercent")
+            profile.player_options_singles = load_player_options(
+                &profile_conf,
+                player_options_section(PlayStyle::Single),
+                &default_profile.player_options_singles,
+            )
+            .unwrap_or_else(|| default_profile.player_options_singles.clone());
+            profile.player_options_doubles = load_player_options(
+                &profile_conf,
+                player_options_section(PlayStyle::Double),
+                &default_profile.player_options_doubles,
+            )
+            .unwrap_or_else(|| default_profile.player_options_doubles.clone());
+            profile.apply_player_options_for_style(get_session_play_style());
+
+            // Optional last-played sections: keep the legacy [LastPlayed]
+            // fallback so older profile.ini files still load cleanly.
+            profile.last_played_singles = load_last_played(
+                &profile_conf,
+                "LastPlayedSingles",
+                &default_profile.last_played_singles,
+            )
+            .or_else(|| {
+                load_last_played(
+                    &profile_conf,
+                    "LastPlayed",
+                    &default_profile.last_played_singles,
+                )
+            })
+            .unwrap_or_else(|| default_profile.last_played_singles.clone());
+            profile.last_played_doubles = load_last_played(
+                &profile_conf,
+                "LastPlayedDoubles",
+                &default_profile.last_played_doubles,
+            )
+            .or_else(|| {
+                load_last_played(
+                    &profile_conf,
+                    "LastPlayed",
+                    &default_profile.last_played_doubles,
+                )
+            })
+            .unwrap_or_else(|| default_profile.last_played_doubles.clone());
+            profile.last_played_course_singles =
+                load_last_played_course(&profile_conf, "LastPlayedCourseSingles")
+                    .or_else(|| load_last_played_course(&profile_conf, "LastPlayedCourse"))
+                    .unwrap_or_else(|| default_profile.last_played_course_singles.clone());
+            profile.last_played_course_doubles =
+                load_last_played_course(&profile_conf, "LastPlayedCourseDoubles")
+                    .or_else(|| load_last_played_course(&profile_conf, "LastPlayedCourse"))
+                    .unwrap_or_else(|| default_profile.last_played_course_doubles.clone());
+
+            profile.weight_pounds = profile_conf
+                .get("Editable", "WeightPounds")
                 .and_then(|s| s.parse::<i32>().ok())
-                .unwrap_or(default_profile.mini_percent);
-            profile.perspective = profile_conf
-                .get("PlayerOptions", "Perspective")
-                .and_then(|s| Perspective::from_str(&s).ok())
-                .unwrap_or(default_profile.perspective);
-            profile.note_field_offset_x = profile_conf
-                .get("PlayerOptions", "NoteFieldOffsetX")
+                .map(clamp_weight_pounds)
+                .unwrap_or(default_profile.weight_pounds);
+
+            profile.birth_year = profile_conf
+                .get("Editable", "BirthYear")
                 .and_then(|s| s.parse::<i32>().ok())
-                .unwrap_or(default_profile.note_field_offset_x);
-            profile.note_field_offset_y = profile_conf
-                .get("PlayerOptions", "NoteFieldOffsetY")
-                .and_then(|s| s.parse::<i32>().ok())
-                .unwrap_or(default_profile.note_field_offset_y);
-            profile.visual_delay_ms = profile_conf
-                .get("PlayerOptions", "VisualDelayMs")
-                .or_else(|| profile_conf.get("PlayerOptions", "VisualDelay"))
-                .and_then(|s| s.trim_end_matches("ms").parse::<i32>().ok())
-                .unwrap_or(default_profile.visual_delay_ms);
-            profile.show_fa_plus_window = profile_conf
-                .get("PlayerOptions", "ShowFaPlusWindow")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map_or(default_profile.show_fa_plus_window, |v| v != 0);
-            profile.show_ex_score = profile_conf
-                .get("PlayerOptions", "ShowExScore")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map_or(default_profile.show_ex_score, |v| v != 0);
-            profile.show_hard_ex_score = profile_conf
-                .get("PlayerOptions", "ShowHardEXScore")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map_or(default_profile.show_hard_ex_score, |v| v != 0);
-            profile.show_fa_plus_pane = profile_conf
-                .get("PlayerOptions", "ShowFaPlusPane")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map_or(default_profile.show_fa_plus_pane, |v| v != 0);
-            profile.fa_plus_10ms_blue_window = profile_conf
-                .get("PlayerOptions", "SmallerWhite")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map_or(default_profile.fa_plus_10ms_blue_window, |v| v != 0);
-            profile.track_early_judgments = profile_conf
-                .get("PlayerOptions", "TrackEarlyJudgments")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map_or(default_profile.track_early_judgments, |v| v != 0);
-            profile.custom_fantastic_window = profile_conf
-                .get("PlayerOptions", "CustomFantasticWindow")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map_or(default_profile.custom_fantastic_window, |v| v != 0);
-            profile.custom_fantastic_window_ms = profile_conf
-                .get("PlayerOptions", "CustomFantasticWindowMs")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map(clamp_custom_fantastic_window_ms)
-                .unwrap_or(default_profile.custom_fantastic_window_ms);
-            profile.judgment_tilt = profile_conf
-                .get("PlayerOptions", "JudgmentTilt")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map_or(default_profile.judgment_tilt, |v| v != 0);
-            profile.column_cues = profile_conf
-                .get("PlayerOptions", "ColumnCues")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map_or(default_profile.column_cues, |v| v != 0);
-            profile.judgment_back = profile_conf
-                .get("PlayerOptions", "JudgmentBack")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map_or(default_profile.judgment_back, |v| v != 0);
-            profile.error_ms_display = profile_conf
-                .get("PlayerOptions", "ErrorMSDisplay")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map_or(default_profile.error_ms_display, |v| v != 0);
-            profile.display_scorebox = profile_conf
-                .get("PlayerOptions", "DisplayScorebox")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map_or(default_profile.display_scorebox, |v| v != 0);
-            profile.rainbow_max = profile_conf
-                .get("PlayerOptions", "RainbowMax")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map_or(default_profile.rainbow_max, |v| v != 0);
-            profile.responsive_colors = profile_conf
-                .get("PlayerOptions", "ResponsiveColors")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map_or(default_profile.responsive_colors, |v| v != 0);
-            profile.show_life_percent = profile_conf
-                .get("PlayerOptions", "ShowLifePercent")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map_or(default_profile.show_life_percent, |v| v != 0);
-            profile.tilt_multiplier = profile_conf
-                .get("PlayerOptions", "TiltMultiplier")
-                .and_then(|s| s.parse::<f32>().ok())
-                .filter(|v| v.is_finite())
-                .unwrap_or(default_profile.tilt_multiplier);
-            profile.error_bar = profile_conf
-                .get("PlayerOptions", "ErrorBar")
-                .and_then(|s| ErrorBarStyle::from_str(&s).ok())
-                .unwrap_or(default_profile.error_bar);
-            profile.error_bar_text = profile_conf
-                .get("PlayerOptions", "ErrorBarText")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map_or(default_profile.error_bar_text, |v| v != 0);
-            let mask_from_key = profile_conf
-                .get("PlayerOptions", "ErrorBarMask")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map(normalize_error_bar_mask);
-            let colorful = profile_conf
-                .get("PlayerOptions", "Colorful")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map(|v| v != 0);
-            let monochrome = profile_conf
-                .get("PlayerOptions", "Monochrome")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map(|v| v != 0);
-            let text = profile_conf
-                .get("PlayerOptions", "Text")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map(|v| v != 0);
-            let highlight = profile_conf
-                .get("PlayerOptions", "Highlight")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map(|v| v != 0);
-            let average = profile_conf
-                .get("PlayerOptions", "Average")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map(|v| v != 0);
-            let mask_from_flags = if colorful.is_some()
-                || monochrome.is_some()
-                || text.is_some()
-                || highlight.is_some()
-                || average.is_some()
-            {
-                let mut mask: u8 = 0;
-                if colorful.unwrap_or(false) {
-                    mask |= ERROR_BAR_BIT_COLORFUL;
-                }
-                if monochrome.unwrap_or(false) {
-                    mask |= ERROR_BAR_BIT_MONOCHROME;
-                }
-                if text.unwrap_or(false) {
-                    mask |= ERROR_BAR_BIT_TEXT;
-                }
-                if highlight.unwrap_or(false) {
-                    mask |= ERROR_BAR_BIT_HIGHLIGHT;
-                }
-                if average.unwrap_or(false) {
-                    mask |= ERROR_BAR_BIT_AVERAGE;
-                }
-                Some(normalize_error_bar_mask(mask))
-            } else {
-                None
-            };
-            profile.error_bar_active_mask =
-                mask_from_key.or(mask_from_flags).unwrap_or_else(|| {
-                    error_bar_mask_from_style(profile.error_bar, profile.error_bar_text)
-                });
-            profile.error_bar = error_bar_style_from_mask(profile.error_bar_active_mask);
-            profile.error_bar_text = error_bar_text_from_mask(profile.error_bar_active_mask);
-            profile.error_bar_up = profile_conf
-                .get("PlayerOptions", "ErrorBarUp")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map_or(default_profile.error_bar_up, |v| v != 0);
-            profile.error_bar_multi_tick = profile_conf
-                .get("PlayerOptions", "ErrorBarMultiTick")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map_or(default_profile.error_bar_multi_tick, |v| v != 0);
-            profile.error_bar_trim = profile_conf
-                .get("PlayerOptions", "ErrorBarTrim")
-                .and_then(|s| ErrorBarTrim::from_str(&s).ok())
-                .unwrap_or(default_profile.error_bar_trim);
-            profile.data_visualizations = profile_conf
-                .get("PlayerOptions", "DataVisualizations")
-                .and_then(|s| DataVisualizations::from_str(&s).ok())
-                .unwrap_or(default_profile.data_visualizations);
-            profile.target_score = profile_conf
-                .get("PlayerOptions", "TargetScore")
-                .and_then(|s| TargetScoreSetting::from_str(&s).ok())
-                .unwrap_or(default_profile.target_score);
-            profile.lifemeter_type = profile_conf
-                .get("PlayerOptions", "LifeMeterType")
-                .and_then(|s| LifeMeterType::from_str(&s).ok())
-                .unwrap_or(default_profile.lifemeter_type);
-            profile.measure_counter = profile_conf
-                .get("PlayerOptions", "MeasureCounter")
-                .and_then(|s| MeasureCounter::from_str(&s).ok())
-                .unwrap_or(default_profile.measure_counter);
-            profile.measure_counter_lookahead = profile_conf
-                .get("PlayerOptions", "MeasureCounterLookahead")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map(|v| v.min(4))
-                .unwrap_or(default_profile.measure_counter_lookahead);
-            profile.measure_counter_left = profile_conf
-                .get("PlayerOptions", "MeasureCounterLeft")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map_or(default_profile.measure_counter_left, |v| v != 0);
-            profile.measure_counter_up = profile_conf
-                .get("PlayerOptions", "MeasureCounterUp")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map_or(default_profile.measure_counter_up, |v| v != 0);
-            profile.measure_counter_vert = profile_conf
-                .get("PlayerOptions", "MeasureCounterVert")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map_or(default_profile.measure_counter_vert, |v| v != 0);
-            profile.broken_run = profile_conf
-                .get("PlayerOptions", "BrokenRun")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map_or(default_profile.broken_run, |v| v != 0);
-            profile.run_timer = profile_conf
-                .get("PlayerOptions", "RunTimer")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map_or(default_profile.run_timer, |v| v != 0);
-            profile.measure_lines = profile_conf
-                .get("PlayerOptions", "MeasureLines")
-                .and_then(|s| MeasureLines::from_str(&s).ok())
-                .unwrap_or(default_profile.measure_lines);
-            profile.scroll_speed = profile_conf
-                .get("PlayerOptions", "ScrollSpeed")
-                .and_then(|s| ScrollSpeedSetting::from_str(&s).ok())
-                .unwrap_or(default_profile.scroll_speed);
-            profile.turn_option = profile_conf
-                .get("PlayerOptions", "Turn")
-                .and_then(|s| TurnOption::from_str(&s).ok())
-                .unwrap_or(default_profile.turn_option);
-            profile.insert_active_mask = profile_conf
-                .get("PlayerOptions", "InsertMask")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map(normalize_insert_mask)
-                .unwrap_or(default_profile.insert_active_mask);
-            profile.remove_active_mask = profile_conf
-                .get("PlayerOptions", "RemoveMask")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map(normalize_remove_mask)
-                .unwrap_or(default_profile.remove_active_mask);
-            profile.holds_active_mask = profile_conf
-                .get("PlayerOptions", "HoldsMask")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map(normalize_holds_mask)
-                .unwrap_or(default_profile.holds_active_mask);
-            profile.accel_effects_active_mask = profile_conf
-                .get("PlayerOptions", "AccelEffectsMask")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map(normalize_accel_effects_mask)
-                .unwrap_or(default_profile.accel_effects_active_mask);
-            profile.visual_effects_active_mask = profile_conf
-                .get("PlayerOptions", "VisualEffectsMask")
-                .and_then(|s| s.parse::<u16>().ok())
-                .map(normalize_visual_effects_mask)
-                .unwrap_or(default_profile.visual_effects_active_mask);
-            profile.appearance_effects_active_mask = profile_conf
-                .get("PlayerOptions", "AppearanceEffectsMask")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map(normalize_appearance_effects_mask)
-                .unwrap_or(default_profile.appearance_effects_active_mask);
-            profile.attack_mode = profile_conf
-                .get("PlayerOptions", "AttackMode")
-                .or_else(|| profile_conf.get("PlayerOptions", "Attacks"))
-                .and_then(|s| AttackMode::from_str(&s).ok())
-                .unwrap_or(default_profile.attack_mode);
-            profile.hide_light_type = profile_conf
-                .get("PlayerOptions", "HideLightType")
-                .and_then(|s| HideLightType::from_str(&s).ok())
-                .unwrap_or(default_profile.hide_light_type);
-            profile.rescore_early_hits = profile_conf
-                .get("PlayerOptions", "RescoreEarlyHits")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map_or(default_profile.rescore_early_hits, |v| v != 0);
-            profile.hide_early_dw_judgments = profile_conf
-                .get("PlayerOptions", "HideEarlyDecentWayOffJudgments")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map_or(default_profile.hide_early_dw_judgments, |v| v != 0);
-            profile.hide_early_dw_flash = profile_conf
-                .get("PlayerOptions", "HideEarlyDecentWayOffFlash")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map_or(default_profile.hide_early_dw_flash, |v| v != 0);
-            profile.hide_targets = profile_conf
-                .get("PlayerOptions", "HideTargets")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map_or(default_profile.hide_targets, |v| v != 0);
-            profile.hide_song_bg = profile_conf
-                .get("PlayerOptions", "HideSongBG")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map_or(default_profile.hide_song_bg, |v| v != 0);
-            profile.hide_combo = profile_conf
-                .get("PlayerOptions", "HideCombo")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map_or(default_profile.hide_combo, |v| v != 0);
-            profile.hide_lifebar = profile_conf
-                .get("PlayerOptions", "HideLifebar")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map_or(default_profile.hide_lifebar, |v| v != 0);
-            profile.hide_score = profile_conf
-                .get("PlayerOptions", "HideScore")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map_or(default_profile.hide_score, |v| v != 0);
-            profile.hide_danger = profile_conf
-                .get("PlayerOptions", "HideDanger")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map_or(default_profile.hide_danger, |v| v != 0);
-            profile.hide_combo_explosions = profile_conf
-                .get("PlayerOptions", "HideComboExplosions")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map_or(default_profile.hide_combo_explosions, |v| v != 0);
-            profile.column_flash_on_miss = profile_conf
-                .get("PlayerOptions", "ColumnFlashOnMiss")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map_or(default_profile.column_flash_on_miss, |v| v != 0);
-            profile.subtractive_scoring = profile_conf
-                .get("PlayerOptions", "SubtractiveScoring")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map_or(default_profile.subtractive_scoring, |v| v != 0);
-            profile.pacemaker = profile_conf
-                .get("PlayerOptions", "Pacemaker")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map_or(default_profile.pacemaker, |v| v != 0);
-            profile.nps_graph_at_top = profile_conf
-                .get("PlayerOptions", "NPSGraphAtTop")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map_or(default_profile.nps_graph_at_top, |v| v != 0);
-            profile.transparent_density_graph_bg = profile_conf
-                .get("PlayerOptions", "TransparentDensityGraphBackground")
-                .and_then(|s| s.parse::<u8>().ok())
-                .map_or(default_profile.transparent_density_graph_bg, |v| v != 0);
-            profile.mini_indicator = profile_conf
-                .get("PlayerOptions", "MiniIndicator")
-                .and_then(|s| MiniIndicator::from_str(&s).ok())
-                .unwrap_or_else(|| {
-                    if profile.subtractive_scoring {
-                        MiniIndicator::SubtractiveScoring
-                    } else if profile.pacemaker {
-                        MiniIndicator::Pacemaker
-                    } else {
-                        default_profile.mini_indicator
-                    }
-                });
-            if profile.mini_indicator == MiniIndicator::SubtractiveScoring {
-                profile.subtractive_scoring = true;
-            }
-            if profile.mini_indicator == MiniIndicator::Pacemaker {
-                profile.pacemaker = true;
-            }
-            profile.mini_indicator_score_type = profile_conf
-                .get("PlayerOptions", "MiniIndicatorScoreType")
-                .and_then(|s| MiniIndicatorScoreType::from_str(&s).ok())
-                .unwrap_or(default_profile.mini_indicator_score_type);
-            profile.scroll_option = profile_conf
-                .get("PlayerOptions", "Scroll")
-                .and_then(|s| ScrollOption::from_str(&s).ok())
-                .unwrap_or_else(|| {
-                    let reverse_enabled = profile_conf
-                        .get("PlayerOptions", "ReverseScroll")
-                        .and_then(|v| v.parse::<u8>().ok())
-                        .map_or(default_profile.reverse_scroll, |v| v != 0);
-                    if reverse_enabled {
-                        ScrollOption::Reverse
-                    } else {
-                        default_profile.scroll_option
-                    }
-                });
-            profile.reverse_scroll = profile.scroll_option.contains(ScrollOption::Reverse);
+                .map(|year| year.max(0))
+                .unwrap_or(default_profile.birth_year);
 
-            // Optional last-played section: if missing, fall back to defaults.
-            profile.last_song_music_path =
-                profile_conf.get("LastPlayed", "MusicPath").and_then(|s| {
-                    let trimmed = s.trim();
-                    if trimmed.is_empty() {
-                        None
-                    } else {
-                        Some(trimmed.to_string())
-                    }
-                });
-
-            profile.last_chart_hash = profile_conf.get("LastPlayed", "ChartHash").and_then(|s| {
-                let trimmed = s.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                }
-            });
-
-            let raw_last_diff = profile_conf
-                .get("LastPlayed", "DifficultyIndex")
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(default_profile.last_difficulty_index);
-            // Do not assume any particular max here; clamp later at call sites.
-            profile.last_difficulty_index = raw_last_diff;
-
-            // Profile stats (ScreenGameOver parity)
+            // Profile stats (ScreenGameOver parity). Keep the legacy [Stats]
+            // fallback so older profile.ini files still load cleanly.
             profile.ignore_step_count_calories = profile_conf
-                .get("Stats", "IgnoreStepCountCalories")
+                .get("Editable", "IgnoreStepCountCalories")
+                .or_else(|| profile_conf.get("Stats", "IgnoreStepCountCalories"))
                 .and_then(|s| s.parse::<u8>().ok())
                 .map_or(default_profile.ignore_step_count_calories, |v| v != 0);
 
@@ -2952,8 +933,15 @@ fn load_for_side(side: PlayerSide) {
             );
         }
 
-        profile.current_combo = load_profile_stats_current_combo(&profile_stats_path(&profile_id))
-            .unwrap_or(default_profile.current_combo);
+        let stats =
+            load_profile_stats(&profile_stats_path(&profile_id)).unwrap_or_else(|| ProfileStats {
+                current_combo: default_profile.current_combo,
+                known_pack_names: HashSet::new(),
+            });
+        profile.current_combo = stats.current_combo;
+        profile.known_pack_names = stats.known_pack_names;
+        profile.favorites = load_favorites(&profile_id);
+        profile.favorited_packs = load_favorited_packs(&profile_id);
 
         // Load groovestats.ini
         let mut gs_conf = SimpleIni::new();
@@ -2961,10 +949,11 @@ fn load_for_side(side: PlayerSide) {
             profile.groovestats_api_key = gs_conf
                 .get("GrooveStats", "ApiKey")
                 .unwrap_or(default_profile.groovestats_api_key.clone());
-            profile.groovestats_is_pad_player = gs_conf
-                .get("GrooveStats", "IsPadPlayer")
-                .and_then(|v| v.parse::<u8>().ok())
-                .map_or(default_profile.groovestats_is_pad_player, |v| v != 0);
+            let is_pad_player = gs_conf.get("GrooveStats", "IsPadPlayer");
+            profile.groovestats_is_pad_player = parse_groovestats_is_pad_player(
+                is_pad_player.as_deref(),
+                default_profile.groovestats_is_pad_player,
+            );
             profile.groovestats_username = gs_conf
                 .get("GrooveStats", "Username")
                 .unwrap_or(default_profile.groovestats_username);
@@ -3000,8 +989,173 @@ fn load_for_side(side: PlayerSide) {
 }
 
 pub fn load() {
+    migrate_local_profiles();
+    restore_default_profiles();
     load_for_side(PlayerSide::P1);
     load_for_side(PlayerSide::P2);
+}
+
+/// Translate a stored default-profile id to a canonical GUID: pass valid GUIDs
+/// through, map a legacy folder-name id to that folder's GUID, and otherwise
+/// keep the value unchanged (e.g. a stale id with no matching folder).
+fn heal_default_profile_id(
+    stored: Option<String>,
+    folder_to_guid: &HashMap<&str, &str>,
+) -> Option<String> {
+    let s = stored?;
+    if is_valid_profile_guid(&s) {
+        return Some(s);
+    }
+    folder_to_guid
+        .get(s.as_str())
+        .map(|g| (*g).to_string())
+        .or(Some(s))
+}
+
+/// Idempotent startup migration to embedded-GUID identity. In a single pass over
+/// the profiles directory it backfills GUIDs into legacy profiles, rewrites
+/// stored default ids that still hold a folder name, renames legacy folders to
+/// match their display name (best-effort), and seeds the resolver cache.
+fn migrate_local_profiles() {
+    struct ProfileEntry {
+        /// Folder name as found on disk before any rename (config heal key).
+        original_folder: String,
+        /// Current folder name (updated if renamed below).
+        folder: String,
+        guid: String,
+        display: Option<String>,
+    }
+
+    // Single directory walk: read each profile.ini exactly once, backfilling a
+    // GUID when absent.
+    let mut entries: Vec<ProfileEntry> = Vec::new();
+    let mut taken: Vec<String> = Vec::new();
+    if let Ok(read_dir) = fs::read_dir(profiles_root()) {
+        for de in read_dir.flatten() {
+            if !de.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let path = de.path();
+            let Some(folder) = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            taken.push(folder.clone());
+
+            let ini_path = path.join("profile.ini");
+            let Ok(content) = fs::read_to_string(&ini_path) else {
+                continue; // not a profile folder
+            };
+            let (guid_opt, display) = read_userprofile_identity(&content);
+            let guid = match guid_opt {
+                Some(g) => g,
+                None => {
+                    let g = generate_profile_guid();
+                    let updated = upsert_profile_guid_content(&content, &g);
+                    if let Err(e) = write_atomic(&ini_path, &updated) {
+                        warn!("Failed to backfill GUID for '{}': {e}", path.display());
+                        continue;
+                    }
+                    info!("Assigned profile GUID {g} to '{}'.", path.display());
+                    g
+                }
+            };
+            entries.push(ProfileEntry {
+                original_folder: folder.clone(),
+                folder,
+                guid,
+                display,
+            });
+        }
+    }
+
+    // Self-heal stored default ids that still reference a legacy folder name.
+    let folder_to_guid: HashMap<&str, &str> = entries
+        .iter()
+        .map(|e| (e.original_folder.as_str(), e.guid.as_str()))
+        .collect();
+    let (p1, p2) = config::default_profiles();
+    let new_p1 = heal_default_profile_id(p1.clone(), &folder_to_guid);
+    let new_p2 = heal_default_profile_id(p2.clone(), &folder_to_guid);
+    if new_p1 != p1 || new_p2 != p2 {
+        info!("Migrated default profile ids to embedded GUIDs.");
+        config::update_default_profiles(new_p1, new_p2);
+    }
+
+    // Rename legacy folders to match their display name. Identity is the GUID,
+    // so this never breaks active bindings; failures are logged and skipped.
+    for entry in &mut entries {
+        let Some(display) = entry.display.clone() else {
+            continue;
+        };
+        let folder = entry.folder.clone();
+        // Take this folder out of `taken` so it doesn't collide with itself
+        // (order is irrelevant for collision checks).
+        if let Some(pos) = taken.iter().position(|f| *f == folder) {
+            taken.swap_remove(pos);
+        }
+        let desired = folder_name_for_display(&display, &folder, &taken);
+        if desired.eq_ignore_ascii_case(&folder) {
+            taken.push(folder);
+            continue;
+        }
+        match fs::rename(
+            profile_dir_by_folder(&folder),
+            profile_dir_by_folder(&desired),
+        ) {
+            Ok(()) => {
+                info!("Renamed profile folder '{folder}' -> '{desired}'.");
+                taken.push(desired.clone());
+                entry.folder = desired;
+            }
+            Err(e) => {
+                warn!("Failed to rename profile folder '{folder}' -> '{desired}': {e}");
+                taken.push(folder);
+            }
+        }
+    }
+
+    // Seed the resolver cache from the post-migration snapshot (dedup duplicate
+    // GUIDs by smallest folder name) so the first lookup needn't rescan.
+    use std::collections::hash_map::Entry as MapEntry;
+    let mut map: HashMap<String, PathBuf> = HashMap::new();
+    for e in &entries {
+        let path = profile_dir_by_folder(&e.folder);
+        match map.entry(e.guid.clone()) {
+            MapEntry::Vacant(slot) => {
+                slot.insert(path);
+            }
+            MapEntry::Occupied(mut slot) => {
+                if path.file_name() < slot.get().file_name() {
+                    slot.insert(path);
+                }
+            }
+        }
+    }
+    *PROFILE_DIR_CACHE.lock().unwrap() = Some(map);
+}
+
+/// Seeds the session's active profiles from the configured default local
+/// profiles. Only applies a saved id when it still refers to an existing local
+/// profile; otherwise that side starts as Guest.
+fn restore_default_profiles() {
+    let (p1, p2) = config::default_profiles();
+    let mut session = lock_session();
+    for (side, saved) in [(PlayerSide::P1, p1), (PlayerSide::P2, p2)] {
+        session.active_profiles[side_ix(side)] = default_profile_from_id(saved);
+    }
+}
+
+fn default_profile_from_id(id: Option<String>) -> ActiveProfile {
+    match id {
+        Some(id) if is_local_profile_id(&id) && local_profile_dir(&id).is_dir() => {
+            ActiveProfile::Local { id }
+        }
+        _ => ActiveProfile::Guest,
+    }
 }
 
 /// Returns a copy of the currently loaded profile data.
@@ -3013,20 +1167,29 @@ pub fn get_for_side(side: PlayerSide) -> Profile {
     lock_profiles()[side_ix(side)].clone()
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct GameplayHudPlayerSnapshot {
-    pub joined: bool,
-    pub guest: bool,
-    pub display_name: String,
-    pub avatar_texture_key: Option<String>,
+pub fn footer_fields_for_side(side: PlayerSide) -> (Option<String>, String) {
+    let profiles = lock_profiles();
+    let p = &profiles[side_ix(side)];
+    (p.avatar_texture_key.clone(), p.display_name.clone())
 }
 
-#[derive(Debug, Clone)]
-pub struct GameplayHudSnapshot {
-    pub play_style: PlayStyle,
-    pub player_side: PlayerSide,
-    pub p1: GameplayHudPlayerSnapshot,
-    pub p2: GameplayHudPlayerSnapshot,
+pub fn groovestats_api_key_for_side(side: PlayerSide) -> String {
+    lock_profiles()[side_ix(side)]
+        .groovestats_api_key
+        .trim()
+        .to_string()
+}
+
+pub fn scorebox_fields_for_side(side: PlayerSide) -> (bool, bool, String, String, String) {
+    let profiles = lock_profiles();
+    let p = &profiles[side_ix(side)];
+    (
+        p.display_scorebox,
+        p.show_ex_score,
+        p.groovestats_api_key.clone(),
+        p.arrowcloud_api_key.clone(),
+        p.groovestats_username.clone(),
+    )
 }
 
 pub fn gameplay_hud_snapshot() -> GameplayHudSnapshot {
@@ -3036,14 +1199,8 @@ pub fn gameplay_hud_snapshot() -> GameplayHudSnapshot {
             session.play_style,
             session.player_side,
             session.joined_mask,
-            matches!(
-                &session.active_profiles[side_ix(PlayerSide::P1)],
-                ActiveProfile::Guest
-            ),
-            matches!(
-                &session.active_profiles[side_ix(PlayerSide::P2)],
-                ActiveProfile::Guest
-            ),
+            active_profile_is_guest(&session.active_profiles[side_ix(PlayerSide::P1)]),
+            active_profile_is_guest(&session.active_profiles[side_ix(PlayerSide::P2)]),
         )
     };
     let profiles = lock_profiles();
@@ -3053,16 +1210,18 @@ pub fn gameplay_hud_snapshot() -> GameplayHudSnapshot {
         play_style,
         player_side,
         p1: GameplayHudPlayerSnapshot {
-            joined: joined_mask & SESSION_JOINED_MASK_P1 != 0,
+            joined: player_side_is_joined(joined_mask, PlayerSide::P1),
             guest: p1_guest,
             display_name: p1_profile.display_name.clone(),
             avatar_texture_key: p1_profile.avatar_texture_key.clone(),
+            hide_username: p1_profile.hide_username,
         },
         p2: GameplayHudPlayerSnapshot {
-            joined: joined_mask & SESSION_JOINED_MASK_P2 != 0,
+            joined: player_side_is_joined(joined_mask, PlayerSide::P2),
             guest: p2_guest,
             display_name: p2_profile.display_name.clone(),
             avatar_texture_key: p2_profile.avatar_texture_key.clone(),
+            hide_username: p2_profile.hide_username,
         },
     }
 }
@@ -3079,10 +1238,321 @@ pub fn get_active_profile_for_side(side: PlayerSide) -> ActiveProfile {
 
 pub fn active_local_profile_id_for_side(side: PlayerSide) -> Option<String> {
     let session = lock_session();
-    match &session.active_profiles[side_ix(side)] {
-        ActiveProfile::Local { id } => Some(id.clone()),
+    active_profile_local_id(&session.active_profiles[side_ix(side)]).map(str::to_owned)
+}
+
+pub fn get_default_profile_for_side(side: PlayerSide) -> ActiveProfile {
+    let (p1, p2) = config::default_profiles();
+    default_profile_from_id(match side {
+        PlayerSide::P1 => p1,
+        PlayerSide::P2 => p2,
+    })
+}
+
+pub fn default_local_profile_id_for_side(side: PlayerSide) -> Option<String> {
+    match get_default_profile_for_side(side) {
+        ActiveProfile::Local { id } => Some(id),
         ActiveProfile::Guest => None,
     }
+}
+
+pub fn set_default_profile_for_side(side: PlayerSide, profile: ActiveProfile) {
+    let mut defaults = {
+        let (p1, p2) = config::default_profiles();
+        [p1, p2]
+    };
+    let side_idx = side_ix(side);
+    let new_id = active_profile_local_id(&profile)
+        .filter(|id| is_local_profile_id(id) && local_profile_dir(id).is_dir())
+        .map(str::to_owned);
+
+    if let Some(id) = new_id.as_deref() {
+        for (idx, slot) in defaults.iter_mut().enumerate() {
+            if idx != side_idx && slot.as_deref() == Some(id) {
+                *slot = None;
+            }
+        }
+    }
+    defaults[side_idx] = new_id;
+    config::update_default_profiles(defaults[0].clone(), defaults[1].clone());
+}
+
+fn update_default_profiles_from_selection(p1: &ActiveProfile, p2: &ActiveProfile) {
+    let (p1_default, p2_default) = config::default_profiles();
+    let mut defaults = [p1_default, p2_default];
+    let joined_mask = lock_session().joined_mask;
+    for (side, profile) in [(PlayerSide::P1, p1), (PlayerSide::P2, p2)] {
+        if !player_side_is_joined(joined_mask, side) {
+            continue;
+        }
+        let side_idx = side_ix(side);
+        let new_id = active_profile_local_id(profile).map(str::to_owned);
+        if let Some(id) = new_id.as_deref() {
+            for (idx, slot) in defaults.iter_mut().enumerate() {
+                if idx != side_idx && slot.as_deref() == Some(id) {
+                    *slot = None;
+                }
+            }
+        }
+        defaults[side_idx] = new_id;
+    }
+    config::update_default_profiles(defaults[0].clone(), defaults[1].clone());
+}
+
+/// The local profile that owns a given physical pad. `is_p2_side` is the pad's
+/// player side (P2 vs P1), taken from its SDK slot (slot 1 = P2), NOT the raw
+/// hardware jumper bit. In Doubles one player drives both pads, so both map to the
+/// joined player's side; otherwise the pad maps to its own side.
+pub fn active_local_profile_id_for_pad(is_p2_side: bool) -> Option<String> {
+    let side = if get_session_play_style() == PlayStyle::Double {
+        get_session_player_side()
+    } else if is_p2_side {
+        PlayerSide::P2
+    } else {
+        PlayerSide::P1
+    };
+    active_local_profile_id_for_side(side)
+}
+
+/// Pad-light brightness (0..=100) for the player on a given physical pad slot,
+/// using the same side mapping as `active_local_profile_id_for_pad` (Doubles →
+/// the one joined player for both pads; otherwise the pad's own side). Reads the
+/// active profile's value (guest profiles are seeded from the machine default).
+pub fn pad_light_brightness_for_pad(is_p2_side: bool) -> u8 {
+    let side = if get_session_play_style() == PlayStyle::Double {
+        get_session_player_side()
+    } else if is_p2_side {
+        PlayerSide::P2
+    } else {
+        PlayerSide::P1
+    };
+    lock_profiles()[side_ix(side)].pad_light_brightness
+}
+
+pub fn known_pack_names_for_local_profile(profile_id: &str) -> Option<HashSet<String>> {
+    let session = lock_session();
+    let profiles = lock_profiles();
+    for side in [PlayerSide::P1, PlayerSide::P2] {
+        let Some(id) = active_profile_local_id(&session.active_profiles[side_ix(side)]) else {
+            continue;
+        };
+        if id == profile_id {
+            return Some(profiles[side_ix(side)].known_pack_names.clone());
+        }
+    }
+    None
+}
+
+pub fn mark_known_pack_names_for_local_profile<'a>(
+    profile_id: &str,
+    pack_names: impl IntoIterator<Item = &'a str>,
+) {
+    let pack_names: Vec<&str> = pack_names.into_iter().collect();
+    if profile_id.is_empty() || pack_names.is_empty() {
+        return;
+    }
+    let save_side = {
+        let session = lock_session();
+        let mut profiles = lock_profiles();
+        let mut save_side = None;
+        for side in [PlayerSide::P1, PlayerSide::P2] {
+            let Some(id) = active_profile_local_id(&session.active_profiles[side_ix(side)]) else {
+                continue;
+            };
+            if id != profile_id {
+                continue;
+            }
+            let profile = &mut profiles[side_ix(side)];
+            let changed =
+                add_known_pack_names(&mut profile.known_pack_names, pack_names.iter().copied());
+            if changed && save_side.is_none() {
+                save_side = Some(side);
+            }
+        }
+        save_side
+    };
+    if let Some(side) = save_side {
+        save_profile_stats_for_side(side);
+    }
+}
+
+pub fn sync_known_packs(profile_ids: &[String], scanned_pack_names: &[String]) -> HashSet<String> {
+    if profile_ids.is_empty() {
+        return HashSet::new();
+    }
+    let mut out = HashSet::new();
+    for profile_id in profile_ids {
+        let known_pack_names = known_pack_names_for_local_profile(profile_id).unwrap_or_default();
+        if known_pack_names.is_empty() && !scanned_pack_names.is_empty() {
+            mark_known_pack_names_for_local_profile(
+                profile_id,
+                scanned_pack_names.iter().map(String::as_str),
+            );
+            continue;
+        }
+        out.extend(unknown_pack_names(&known_pack_names, scanned_pack_names));
+    }
+    out
+}
+
+pub fn mark_pack_known(profile_ids: &[String], name: &str) {
+    mark_packs_known(profile_ids, std::iter::once(name));
+}
+
+pub fn mark_packs_known<'a>(profile_ids: &[String], pack_names: impl IntoIterator<Item = &'a str>) {
+    let pack_names: Vec<&str> = pack_names.into_iter().collect();
+    if profile_ids.is_empty() || pack_names.is_empty() {
+        return;
+    }
+    for profile_id in profile_ids {
+        mark_known_pack_names_for_local_profile(profile_id, pack_names.iter().copied());
+    }
+}
+
+// --- Favorites ---
+
+fn favorites_path(profile_id: &str) -> PathBuf {
+    local_profile_dir(profile_id).join("favorites.txt")
+}
+
+fn load_favorites(profile_id: &str) -> HashSet<String> {
+    let path = favorites_path(profile_id);
+    let Ok(text) = fs::read_to_string(&path) else {
+        return HashSet::new();
+    };
+    parse_favorites_content(&text)
+}
+
+fn save_favorites(profile_id: &str, favorites: &HashSet<String>) {
+    let path = favorites_path(profile_id);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let text = render_favorites_content(favorites);
+    let tmp_path = path.with_extension("tmp");
+    if fs::write(&tmp_path, text.as_bytes()).is_ok() {
+        let _ = fs::rename(&tmp_path, &path);
+    }
+}
+
+/// Writes imported favorites (chart `short_hash`es) into a freshly-created
+/// profile's `favorites.txt`, merging with anything already present. Used by the
+/// ITGmania importer, which resolves Simply Love song favorites to chart hashes.
+pub fn write_imported_favorites(profile_id: &str, hashes: &HashSet<String>) {
+    if hashes.is_empty() {
+        return;
+    }
+    let mut merged = load_favorites(profile_id);
+    merged.extend(hashes.iter().cloned());
+    save_favorites(profile_id, &merged);
+}
+
+/// Toggle a song's favorite status for the given player side.
+/// Returns `true` if the song is now a favorite, `false` if removed.
+pub fn toggle_favorite(side: PlayerSide, chart_hash: &str) -> bool {
+    let Some(profile_id) = active_local_profile_id_for_side(side) else {
+        return false;
+    };
+    let is_now_favorite = {
+        let mut profiles = lock_profiles();
+        let profile = &mut profiles[side_ix(side)];
+        if profile.favorites.contains(chart_hash) {
+            profile.favorites.remove(chart_hash);
+            false
+        } else {
+            profile.favorites.insert(chart_hash.to_string());
+            true
+        }
+    };
+    let favorites = lock_profiles()[side_ix(side)].favorites.clone();
+    save_favorites(&profile_id, &favorites);
+    is_now_favorite
+}
+
+/// Check if a chart hash is favorited for the given player side.
+pub fn is_favorite(side: PlayerSide, chart_hash: &str) -> bool {
+    let profiles = lock_profiles();
+    profiles[side_ix(side)].favorites.contains(chart_hash)
+}
+
+/// Test/bench helper: mark a chart hash as favorited for the given side in the
+/// in-memory profile only, without persisting to disk. Lets benchmarks exercise
+/// the favorites render path deterministically.
+pub fn seed_session_favorite(side: PlayerSide, chart_hash: &str) {
+    let mut profiles = lock_profiles();
+    profiles[side_ix(side)]
+        .favorites
+        .insert(chart_hash.to_string());
+}
+
+fn favorited_packs_path(profile_id: &str) -> PathBuf {
+    local_profile_dir(profile_id).join("favorited_packs.txt")
+}
+
+fn load_favorited_packs(profile_id: &str) -> HashSet<String> {
+    let path = favorited_packs_path(profile_id);
+    let Ok(text) = fs::read_to_string(&path) else {
+        return HashSet::new();
+    };
+    parse_favorited_packs_content(&text)
+}
+
+fn save_favorited_packs(profile_id: &str, packs: &HashSet<String>) {
+    let path = favorited_packs_path(profile_id);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let text = render_favorited_packs_content(packs);
+    let tmp_path = path.with_extension("tmp");
+    if fs::write(&tmp_path, text.as_bytes()).is_ok() {
+        let _ = fs::rename(&tmp_path, &path);
+    }
+}
+
+/// Toggle a pack's favorite status for the given player side, identifying the
+/// pack by its display name. Returns `true` if the pack is
+/// now a favorite, `false` if it was removed.
+pub fn toggle_pack_favorite(side: PlayerSide, pack_name: &str) -> bool {
+    let Some(profile_id) = active_local_profile_id_for_side(side) else {
+        return false;
+    };
+    let is_now_favorite = {
+        let mut profiles = lock_profiles();
+        let profile = &mut profiles[side_ix(side)];
+        let existing = profile
+            .favorited_packs
+            .iter()
+            .find(|p| *p == pack_name)
+            .cloned();
+        if let Some(existing) = existing {
+            profile.favorited_packs.remove(&existing);
+            false
+        } else {
+            profile.favorited_packs.insert(pack_name.to_string());
+            true
+        }
+    };
+    let packs = lock_profiles()[side_ix(side)].favorited_packs.clone();
+    save_favorited_packs(&profile_id, &packs);
+    is_now_favorite
+}
+
+/// Check if a pack name is favorited for the given player side.
+pub fn is_pack_favorite(side: PlayerSide, pack_name: &str) -> bool {
+    let profiles = lock_profiles();
+    profiles[side_ix(side)]
+        .favorited_packs
+        .iter()
+        .any(|p| *p == pack_name)
+}
+
+/// Test/bench helper: mark a pack as favorited for the given side in the
+/// in-memory profile only, without persisting to disk.
+pub fn seed_session_favorited_pack(side: PlayerSide, pack_name: &str) {
+    let mut profiles = lock_profiles();
+    profiles[side_ix(side)]
+        .favorited_packs
+        .insert(pack_name.to_string());
 }
 
 pub fn set_active_profile_for_side(side: PlayerSide, profile: ActiveProfile) -> Profile {
@@ -3101,31 +1571,30 @@ pub fn set_active_profile_for_side(side: PlayerSide, profile: ActiveProfile) -> 
 pub fn set_active_profiles(p1: ActiveProfile, p2: ActiveProfile) -> [Profile; PLAYER_SLOTS] {
     let _ = set_active_profile_for_side(PlayerSide::P1, p1);
     let _ = set_active_profile_for_side(PlayerSide::P2, p2);
+    update_default_profiles_from_selection(
+        &get_active_profile_for_side(PlayerSide::P1),
+        &get_active_profile_for_side(PlayerSide::P2),
+    );
     [get_for_side(PlayerSide::P1), get_for_side(PlayerSide::P2)]
 }
 
-pub struct LocalProfileSummary {
-    pub id: String,
-    pub display_name: String,
-    pub avatar_path: Option<PathBuf>,
-}
-
-#[inline(always)]
-fn is_local_profile_id(s: &str) -> bool {
-    !s.is_empty() && s.len() <= 64 && s != "." && s != ".." && !s.contains(['/', '\\', '\0'])
-}
-
-#[inline(always)]
-fn cmp_profile_ids_case_insensitive(a: &str, b: &str) -> std::cmp::Ordering {
-    a.chars()
-        .flat_map(char::to_lowercase)
-        .cmp(b.chars().flat_map(char::to_lowercase))
-        .then_with(|| a.cmp(b))
+pub fn load_default_profiles_for_joined_sides() -> [Profile; PLAYER_SLOTS] {
+    let (p1, p2) = config::default_profiles();
+    let defaults = [p1, p2];
+    let joined_mask = lock_session().joined_mask;
+    for side in [PlayerSide::P1, PlayerSide::P2] {
+        if !player_side_is_joined(joined_mask, side) {
+            continue;
+        }
+        let active = default_profile_from_id(defaults[side_ix(side)].clone());
+        lock_session().active_profiles[side_ix(side)] = active;
+        load_for_side(side);
+    }
+    [get_for_side(PlayerSide::P1), get_for_side(PlayerSide::P2)]
 }
 
 pub fn scan_local_profiles() -> Vec<LocalProfileSummary> {
-    let root = Path::new(PROFILES_ROOT);
-    let Ok(read_dir) = fs::read_dir(root) else {
+    let Ok(read_dir) = fs::read_dir(profiles_root()) else {
         return Vec::new();
     };
 
@@ -3137,125 +1606,28 @@ pub fn scan_local_profiles() -> Vec<LocalProfileSummary> {
         if !ft.is_dir() {
             continue;
         }
-        let Some(id) = entry
-            .file_name()
-            .to_str()
-            .map(std::string::ToString::to_string)
-        else {
+        let dir = entry.path();
+
+        // Pure read: identity comes from the embedded GUID. Legacy profiles
+        // without one are skipped here and backfilled by startup migration; a
+        // read-only enumeration must never write to disk.
+        let (Some(id), display) = read_profile_identity(&dir) else {
             continue;
         };
-        if !is_local_profile_id(&id) {
-            continue;
-        }
-
-        let ini_path = entry.path().join("profile.ini");
-        if !ini_path.is_file() {
-            continue;
-        }
-
-        let mut display_name = id.clone();
-        let mut ini = SimpleIni::new();
-        if ini.load(&ini_path).is_ok()
-            && let Some(name) = ini.get("userprofile", "DisplayName")
-            && !name.trim().is_empty()
-        {
-            display_name = name;
-        }
-
-        let avatar_path = find_profile_avatar_path(&entry.path());
 
         out.push(LocalProfileSummary {
+            display_name: display.unwrap_or_else(|| id.clone()),
             id,
-            display_name,
-            avatar_path,
+            avatar_path: find_profile_avatar_path(&dir),
         });
     }
 
-    out.sort_by(|a, b| cmp_profile_ids_case_insensitive(&a.id, &b.id));
+    // Folder name is no longer the identity, so order by display name.
+    out.sort_by(|a, b| {
+        cmp_profile_ids_case_insensitive(&a.display_name, &b.display_name)
+            .then_with(|| a.id.cmp(&b.id))
+    });
     out
-}
-
-const LOCAL_PROFILE_MAX_ID: u32 = 99_999_999;
-
-fn scan_local_profile_numbers() -> Vec<u32> {
-    let root = Path::new(PROFILES_ROOT);
-    let Ok(read_dir) = fs::read_dir(root) else {
-        return Vec::new();
-    };
-
-    let mut out = Vec::new();
-    for entry in read_dir.flatten() {
-        let Ok(ft) = entry.file_type() else {
-            continue;
-        };
-        if !ft.is_dir() {
-            continue;
-        }
-        let file_name = entry.file_name();
-        let Some(name) = file_name.to_str() else {
-            continue;
-        };
-        if name.len() != 8 {
-            continue;
-        }
-        let Ok(n) = name.parse::<u32>() else {
-            continue;
-        };
-        if n <= LOCAL_PROFILE_MAX_ID {
-            out.push(n);
-        }
-    }
-    out
-}
-
-fn allocate_local_profile_id() -> Result<String, std::io::Error> {
-    let mut nums = scan_local_profile_numbers();
-    nums.sort_unstable();
-    nums.dedup();
-
-    let mut first_free = 0_u32;
-    for &n in &nums {
-        if n == first_free {
-            first_free += 1;
-        } else if n > first_free {
-            break;
-        }
-    }
-
-    let mut next = nums.last().copied().unwrap_or(0);
-    if !nums.is_empty() {
-        next = next.saturating_add(1);
-    }
-    if next > LOCAL_PROFILE_MAX_ID {
-        if first_free > LOCAL_PROFILE_MAX_ID {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Too many profiles",
-            ));
-        }
-        next = first_free;
-    }
-    Ok(format!("{next:08}"))
-}
-
-fn initials_from_name(name: &str) -> String {
-    let mut out = String::new();
-    for ch in name.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_uppercase());
-            if out.len() >= 2 {
-                break;
-            }
-        }
-    }
-    match out.len() {
-        0 => "??".to_string(),
-        1 => {
-            out.push('?');
-            out
-        }
-        _ => out,
-    }
 }
 
 pub fn create_local_profile(display_name: &str) -> Result<String, std::io::Error> {
@@ -3267,134 +1639,173 @@ pub fn create_local_profile(display_name: &str) -> Result<String, std::io::Error
         ));
     }
 
-    let id = allocate_local_profile_id()?;
-    let dir = local_profile_dir(&id);
+    let id = generate_profile_guid();
+    let folder = folder_name_for_display(name, &id, &existing_profile_folder_names());
+    let dir = profile_dir_by_folder(&folder);
     fs::create_dir_all(&dir)?;
 
     let mut default_profile = Profile::default();
     default_profile.noteskin = machine_default_noteskin_value();
+    default_profile.pad_light_brightness = machine_default_light_brightness();
+    default_profile.store_current_player_options_for_all_styles();
     let initials = initials_from_name(name);
-    let mut content = String::new();
-    content.push_str("[PlayerOptions]\n");
-    content.push_str(&format!("ScrollSpeed={}\n", default_profile.scroll_speed));
-    content.push_str(&format!("Scroll={}\n", default_profile.scroll_option));
-    content.push_str(&format!(
-        "InsertMask={}\n",
-        default_profile.insert_active_mask
-    ));
-    content.push_str(&format!(
-        "RemoveMask={}\n",
-        default_profile.remove_active_mask
-    ));
-    content.push_str(&format!(
-        "HoldsMask={}\n",
-        default_profile.holds_active_mask
-    ));
-    content.push_str(&format!(
-        "AccelEffectsMask={}\n",
-        default_profile.accel_effects_active_mask
-    ));
-    content.push_str(&format!(
-        "VisualEffectsMask={}\n",
-        default_profile.visual_effects_active_mask
-    ));
-    content.push_str(&format!(
-        "AppearanceEffectsMask={}\n",
-        default_profile.appearance_effects_active_mask
-    ));
-    content.push_str(&format!("AttackMode={}\n", default_profile.attack_mode));
-    content.push_str(&format!(
-        "HideLightType={}\n",
-        default_profile.hide_light_type
-    ));
-    content.push_str(&format!("NoteSkin={}\n", default_profile.noteskin));
-    content.push('\n');
-    content.push_str("[userprofile]\n");
-    content.push_str(&format!("DisplayName={name}\n"));
-    content.push_str(&format!("PlayerInitials={initials}\n"));
-    content.push('\n');
+    let today = Local::now().date_naive().to_string();
+    default_profile.display_name = name.to_string();
+    default_profile.player_initials = initials;
+    default_profile.weight_pounds = 0;
+    default_profile.birth_year = 0;
+    default_profile.ignore_step_count_calories = false;
+    default_profile.calories_burned_day = today;
+    default_profile.calories_burned_today = 0.0;
+    fs::write(
+        dir.join("profile.ini"),
+        render_profile_ini_content(&id, &default_profile),
+    )?;
+    fs::write(
+        dir.join("groovestats.ini"),
+        render_groovestats_ini_content("", false, ""),
+    )?;
+    fs::write(
+        dir.join("arrowcloud.ini"),
+        render_arrowcloud_ini_content(""),
+    )?;
+
+    // Make the new GUID -> folder mapping visible to later path lookups.
+    invalidate_profile_dir_cache();
+
+    let (p1_default, p2_default) = config::default_profiles();
+    if p1_default.is_none() {
+        config::update_default_profiles(Some(id.clone()), p2_default);
+    } else if p2_default.is_none() {
+        config::update_default_profiles(p1_default, Some(id.clone()));
+    }
+
+    Ok(id)
+}
+
+/// Player options seeded from machine defaults for a brand-new local profile,
+/// returned as `(singles, doubles)`. Used as the translation base when importing
+/// Simply Love settings so unspecified options match a freshly created profile.
+pub fn default_local_profile_options() -> (PlayerOptionsData, PlayerOptionsData) {
+    let mut default_profile = Profile::default();
+    default_profile.noteskin = machine_default_noteskin_value();
+    default_profile.pad_light_brightness = machine_default_light_brightness();
+    default_profile.store_current_player_options_for_all_styles();
+    (
+        default_profile.player_options_singles.clone(),
+        default_profile.player_options_doubles.clone(),
+    )
+}
+
+/// Everything needed to materialise a new local profile from an external source
+/// (the ITGmania / Simply Love importer).
+pub struct ImportProfileData<'a> {
+    pub display_name: &'a str,
+    pub weight_pounds: u32,
+    pub birth_year: u32,
+    /// Preferred player initials (e.g. ITGmania `LastUsedHighScoreName`). Falls
+    /// back to initials derived from the display name when empty.
+    pub initials: &'a str,
+    pub groovestats_api_key: &'a str,
+    pub groovestats_username: &'a str,
+    pub groovestats_is_pad_player: bool,
+    pub arrowcloud_api_key: &'a str,
+    /// Whether step-count calorie estimation is disabled (ITGmania
+    /// `IgnoreStepCountCalories`).
+    pub ignore_step_count_calories: bool,
+    /// Source avatar image to copy in as `profile.png`, if any.
+    pub avatar_src: Option<&'a Path>,
+    pub options_singles: &'a PlayerOptionsData,
+    pub options_doubles: &'a PlayerOptionsData,
+    /// Desired profile GUID (canonical identity). For ITGmania imports this is
+    /// derived deterministically from the source profile's `Guid`. When empty or
+    /// not a valid GUID, a fresh one is generated.
+    pub guid: &'a str,
+}
+
+/// Create a new local profile from imported data, writing `profile.ini`,
+/// `groovestats.ini`, `arrowcloud.ini`, and copying the avatar. Returns the new
+/// profile id. Scores are written separately via
+/// [`crate::game::scores::import_local_scores`].
+pub fn create_local_profile_from_import(
+    data: &ImportProfileData<'_>,
+) -> Result<String, std::io::Error> {
+    let name = data.display_name.trim();
+    if name.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Display name is empty",
+        ));
+    }
+
+    let id = if is_valid_profile_guid(data.guid.trim()) {
+        data.guid.trim().to_string()
+    } else {
+        generate_profile_guid()
+    };
+    let folder = folder_name_for_display(name, &id, &existing_profile_folder_names());
+    let dir = profile_dir_by_folder(&folder);
+    fs::create_dir_all(&dir)?;
+
+    let initials = {
+        let sanitized = sanitize_player_initials(data.initials);
+        if sanitized.is_empty() {
+            initials_from_name(name)
+        } else {
+            sanitized
+        }
+    };
+    let weight = clamp_weight_pounds(data.weight_pounds.min(i32::MAX as u32) as i32);
 
     let today = Local::now().date_naive().to_string();
-    content.push_str("[Stats]\n");
-    content.push_str(&format!("CaloriesBurnedDate={today}\n"));
-    content.push_str("CaloriesBurnedToday=0\n");
-    content.push_str("IgnoreStepCountCalories=0\n");
-    content.push('\n');
-    fs::write(profile_ini_path(&id), content)?;
+    let profile = Profile {
+        display_name: name.to_string(),
+        player_initials: initials,
+        weight_pounds: weight,
+        birth_year: data.birth_year.min(i32::MAX as u32) as i32,
+        ignore_step_count_calories: data.ignore_step_count_calories,
+        calories_burned_day: today,
+        calories_burned_today: 0.0,
+        player_options_singles: data.options_singles.clone(),
+        player_options_doubles: data.options_doubles.clone(),
+        ..Profile::default()
+    };
+    fs::write(
+        dir.join("profile.ini"),
+        render_profile_ini_content(&id, &profile),
+    )?;
+    fs::write(
+        dir.join("groovestats.ini"),
+        render_groovestats_ini_content(
+            data.groovestats_api_key,
+            data.groovestats_is_pad_player,
+            data.groovestats_username,
+        ),
+    )?;
+    fs::write(
+        dir.join("arrowcloud.ini"),
+        render_arrowcloud_ini_content(data.arrowcloud_api_key),
+    )?;
 
-    let mut gs = String::new();
-    gs.push_str("[GrooveStats]\n");
-    gs.push_str("ApiKey=\n");
-    gs.push_str("IsPadPlayer=0\n");
-    gs.push_str("Username=\n");
-    gs.push('\n');
-    fs::write(groovestats_ini_path(&id), gs)?;
+    if let Some(src) = data.avatar_src {
+        if let Err(e) = fs::copy(src, dir.join("profile.png")) {
+            warn!("Failed to copy imported avatar {src:?}: {e}");
+        }
+    }
 
-    let mut ac = String::new();
-    ac.push_str("[ArrowCloud]\n");
-    ac.push_str("ApiKey=\n");
-    ac.push('\n');
-    fs::write(arrowcloud_ini_path(&id), ac)?;
+    // Make the new GUID -> folder mapping visible to later path lookups (scores,
+    // favorites and profile-stats writes all resolve the profile dir by GUID).
+    invalidate_profile_dir_cache();
 
     Ok(id)
 }
 
 fn rewrite_profile_display_name(path: &Path, display_name: &str) -> Result<(), std::io::Error> {
     let src = fs::read_to_string(path)?;
-    let mut out = String::with_capacity(src.len() + display_name.len() + 32);
-    let mut in_userprofile = false;
-    let mut saw_userprofile = false;
-    let mut wrote_display = false;
-
-    for raw_line in src.lines() {
-        let trimmed = raw_line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            if in_userprofile && !wrote_display {
-                out.push_str("DisplayName=");
-                out.push_str(display_name);
-                out.push('\n');
-                wrote_display = true;
-            }
-            let section = trimmed[1..trimmed.len() - 1].trim();
-            in_userprofile = section.eq_ignore_ascii_case("userprofile");
-            if in_userprofile {
-                saw_userprofile = true;
-            }
-            out.push_str(raw_line);
-            out.push('\n');
-            continue;
-        }
-
-        if in_userprofile && let Some(eq) = trimmed.find('=') {
-            let key = trimmed[..eq].trim();
-            if key.eq_ignore_ascii_case("DisplayName") {
-                out.push_str("DisplayName=");
-                out.push_str(display_name);
-                out.push('\n');
-                wrote_display = true;
-                continue;
-            }
-        }
-
-        out.push_str(raw_line);
-        out.push('\n');
-    }
-
-    if !saw_userprofile {
-        if !out.is_empty() && !out.ends_with('\n') {
-            out.push('\n');
-        }
-        out.push_str("[userprofile]\n");
-        out.push_str("DisplayName=");
-        out.push_str(display_name);
-        out.push('\n');
-    } else if in_userprofile && !wrote_display {
-        out.push_str("DisplayName=");
-        out.push_str(display_name);
-        out.push('\n');
-    }
-
-    fs::write(path, out)
+    fs::write(
+        path,
+        rewrite_profile_display_name_content(&src, display_name),
+    )
 }
 
 pub fn rename_local_profile(id: &str, display_name: &str) -> Result<(), std::io::Error> {
@@ -3421,6 +1832,26 @@ pub fn rename_local_profile(id: &str, display_name: &str) -> Result<(), std::io:
         ));
     }
     rewrite_profile_display_name(&ini_path, name)?;
+
+    // Keep the folder readable; safe because identity is the GUID, not the name.
+    let current_dir = local_profile_dir(id);
+    if let Some(current_folder) = current_dir.file_name().and_then(|s| s.to_str()) {
+        let others: Vec<String> = existing_profile_folder_names()
+            .into_iter()
+            .filter(|f| !f.eq_ignore_ascii_case(current_folder))
+            .collect();
+        let desired = folder_name_for_display(name, id, &others);
+        if !desired.eq_ignore_ascii_case(current_folder) {
+            let target = profile_dir_by_folder(&desired);
+            match fs::rename(&current_dir, &target) {
+                Ok(()) => info!("Renamed profile folder '{current_folder}' -> '{desired}'."),
+                Err(e) => {
+                    warn!("Failed to rename profile folder '{current_folder}' -> '{desired}': {e}");
+                }
+            }
+        }
+    }
+    invalidate_profile_dir_cache();
 
     let p1_active = active_local_profile_id_for_side(PlayerSide::P1)
         .as_deref()
@@ -3458,6 +1889,12 @@ pub fn delete_local_profile(id: &str) -> Result<(), std::io::Error> {
     }
 
     fs::remove_dir_all(&dir)?;
+    invalidate_profile_dir_cache();
+
+    let (p1_default, p2_default) = config::default_profiles();
+    let next_p1 = p1_default.filter(|profile_id| profile_id != id);
+    let next_p2 = p2_default.filter(|profile_id| profile_id != id);
+    config::update_default_profiles(next_p1, next_p2);
 
     for side in [PlayerSide::P1, PlayerSide::P2] {
         let is_active = active_local_profile_id_for_side(side)
@@ -3499,7 +1936,21 @@ pub fn get_session_play_style() -> PlayStyle {
 }
 
 pub fn set_session_play_style(style: PlayStyle) {
-    lock_session().play_style = style;
+    let prev_style = {
+        let mut session = lock_session();
+        let prev_style = session.play_style;
+        if prev_style == style {
+            return;
+        }
+        session.play_style = style;
+        prev_style
+    };
+
+    let mut profiles = lock_profiles();
+    for profile in profiles.iter_mut() {
+        profile.store_current_player_options(prev_style);
+        profile.apply_player_options_for_style(style);
+    }
 }
 
 pub fn get_session_play_mode() -> PlayMode {
@@ -3520,7 +1971,7 @@ pub fn set_session_player_side(side: PlayerSide) {
 
 pub fn is_session_side_joined(side: PlayerSide) -> bool {
     let mask = lock_session().joined_mask;
-    mask & side_joined_mask(side) != 0
+    player_side_is_joined(mask, side)
 }
 
 pub fn is_session_side_guest(side: PlayerSide) -> bool {
@@ -3528,8 +1979,7 @@ pub fn is_session_side_guest(side: PlayerSide) -> bool {
 }
 
 pub fn set_session_joined(p1: bool, p2: bool) {
-    let mask = (u8::from(p1) * SESSION_JOINED_MASK_P1) | (u8::from(p2) * SESSION_JOINED_MASK_P2);
-    lock_session().joined_mask = mask;
+    lock_session().joined_mask = joined_player_mask(p1, p2);
 }
 
 pub fn set_fast_profile_switch_from_select_music(enabled: bool) {
@@ -3547,880 +1997,476 @@ pub fn take_fast_profile_switch_from_select_music() -> bool {
     was_set
 }
 
-pub fn update_last_played_for_side(
-    side: PlayerSide,
-    music_path: Option<&Path>,
-    chart_hash: Option<&str>,
-    difficulty_index: usize,
-) {
-    if session_side_is_guest(side) {
-        return;
+#[cfg(test)]
+mod tests {
+    use super::{
+        SimpleIni, heal_default_profile_id, load_player_options, parse_groovestats_is_pad_player,
+    };
+    use deadsync_profile::{
+        AccelEffectsMask, AppearanceEffectsMask, DEFAULT_BIRTH_YEAR, DEFAULT_WEIGHT_POUNDS,
+        ErrorBarMask, ErrorBarStyle, HoldsMask, InsertMask, LastPlayed, LastPlayedCourse,
+        LiveTimingStatsMask, MiniIndicatorColor, MiniIndicatorPosition, MiniIndicatorSize,
+        MiniIndicatorSubtractiveDisplay, NoCmodAlternative, NoteSkin, PlayStyle, PlayerOptionsData,
+        Profile, RemoveMask, TapExplosionMask, TimingWindowsOption, VisualEffectsMask,
+        append_player_options_section, error_bar_mask_from_style, error_bar_style_from_mask,
+        error_bar_text_from_mask, normalize_tap_explosion_mask, player_options_section,
+    };
+    use std::collections::HashMap;
+    use std::str::FromStr;
+
+    #[test]
+    fn heal_default_profile_id_translates_folder_names_to_guids() {
+        let guid = "17c7b8a2-3b73-4e8a-9d7d-cfa7e783c00b";
+        let mut folder_to_guid: HashMap<&str, &str> = HashMap::new();
+        folder_to_guid.insert("00000000", guid);
+
+        // A legacy folder-name id is rewritten to that folder's GUID.
+        assert_eq!(
+            heal_default_profile_id(Some("00000000".to_string()), &folder_to_guid).as_deref(),
+            Some(guid)
+        );
+        // An already-valid GUID passes through untouched.
+        assert_eq!(
+            heal_default_profile_id(Some(guid.to_string()), &folder_to_guid).as_deref(),
+            Some(guid)
+        );
+        // A stale id with no matching folder is preserved (not dropped to Guest).
+        assert_eq!(
+            heal_default_profile_id(Some("99999999".to_string()), &folder_to_guid).as_deref(),
+            Some("99999999")
+        );
+        // No stored default stays absent.
+        assert_eq!(heal_default_profile_id(None, &folder_to_guid), None);
     }
-    let new_path = music_path.map(|p| p.to_string_lossy().into_owned());
-    let new_hash = chart_hash.map(str::to_string);
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        let mut changed = false;
-        if profile.last_song_music_path != new_path {
-            profile.last_song_music_path = new_path;
-            changed = true;
-        }
-        if profile.last_chart_hash != new_hash {
-            profile.last_chart_hash = new_hash;
-            changed = true;
-        }
-        if profile.last_difficulty_index != difficulty_index {
-            profile.last_difficulty_index = difficulty_index;
-            changed = true;
-        }
-        if !changed {
-            return;
+
+    #[test]
+    fn mini_indicator_style_settings_round_trip() {
+        assert_eq!(
+            MiniIndicatorSize::from_str(&MiniIndicatorSize::Default.to_string()).unwrap(),
+            MiniIndicatorSize::Default
+        );
+        assert_eq!(
+            MiniIndicatorSize::from_str(&MiniIndicatorSize::Large.to_string()).unwrap(),
+            MiniIndicatorSize::Large
+        );
+        assert_eq!(
+            MiniIndicatorColor::from_str(&MiniIndicatorColor::Default.to_string()).unwrap(),
+            MiniIndicatorColor::Default
+        );
+        assert_eq!(
+            MiniIndicatorColor::from_str(&MiniIndicatorColor::Detailed.to_string()).unwrap(),
+            MiniIndicatorColor::Detailed
+        );
+        assert_eq!(
+            MiniIndicatorColor::from_str(&MiniIndicatorColor::Combo.to_string()).unwrap(),
+            MiniIndicatorColor::Combo
+        );
+        assert_eq!(
+            MiniIndicatorSubtractiveDisplay::from_str(
+                &MiniIndicatorSubtractiveDisplay::Points.to_string(),
+            )
+            .unwrap(),
+            MiniIndicatorSubtractiveDisplay::Points
+        );
+        assert_eq!(
+            MiniIndicatorPosition::from_str(&MiniIndicatorPosition::UnderUpArrow.to_string())
+                .unwrap(),
+            MiniIndicatorPosition::UnderUpArrow
+        );
+    }
+
+    #[test]
+    fn no_cmod_alternative_round_trips_through_player_options_ini() {
+        let section = player_options_section(PlayStyle::Single);
+        for alt in [
+            NoCmodAlternative::None,
+            NoCmodAlternative::XMod,
+            NoCmodAlternative::MMod,
+        ] {
+            let options = PlayerOptionsData {
+                no_cmod_alternative: alt,
+                ..PlayerOptionsData::default()
+            };
+            let mut content = String::new();
+            append_player_options_section(&mut content, section, &options);
+
+            let mut ini = SimpleIni::new();
+            ini.load_str(&content);
+            let loaded = load_player_options(&ini, section, &PlayerOptionsData::default())
+                .expect("section has keys, so it should load");
+
+            assert_eq!(loaded.no_cmod_alternative, alt);
         }
     }
-    save_profile_ini_for_side(side);
-}
 
-pub fn add_stage_calories_for_side(side: PlayerSide, notes_hit: u32) {
-    if session_side_is_guest(side) {
-        return;
+    #[test]
+    fn mini_indicator_style_defaults_preserve_legacy_look() {
+        let profile = Profile::default();
+        assert_eq!(profile.mini_indicator_size, MiniIndicatorSize::Default);
+        assert_eq!(profile.mini_indicator_color, MiniIndicatorColor::Default);
+        assert_eq!(
+            profile.mini_indicator_subtractive_display,
+            MiniIndicatorSubtractiveDisplay::Percent
+        );
+        assert_eq!(
+            profile.mini_indicator_position,
+            MiniIndicatorPosition::Default
+        );
     }
 
-    let today = Local::now().date_naive().to_string();
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
+    #[test]
+    fn groovestats_is_pad_player_requires_explicit_one() {
+        assert!(parse_groovestats_is_pad_player(Some("1"), false));
+        assert!(!parse_groovestats_is_pad_player(Some("0"), false));
+        assert!(!parse_groovestats_is_pad_player(Some("2"), false));
+        assert!(!parse_groovestats_is_pad_player(Some("255"), false));
+    }
 
-        if profile.calories_burned_day.trim() != today {
-            profile.calories_burned_day = today.clone();
-            profile.calories_burned_today = 0.0;
-        }
+    #[test]
+    fn groovestats_is_pad_player_uses_default_on_invalid_value() {
+        assert!(parse_groovestats_is_pad_player(None, true));
+        assert!(!parse_groovestats_is_pad_player(None, false));
+        assert!(parse_groovestats_is_pad_player(Some("abc"), true));
+        assert!(!parse_groovestats_is_pad_player(Some("abc"), false));
+    }
 
-        if !profile.ignore_step_count_calories {
-            // TODO: Implement StepMania's actual calorie model.
-            const KCAL_PER_NOTE_HIT: f32 = 0.032;
-            let add = notes_hit as f32 * KCAL_PER_NOTE_HIT;
-            if add.is_finite() && add >= 0.0 {
-                profile.calories_burned_today = (profile.calories_burned_today + add).max(0.0);
+    #[test]
+    fn calculated_weight_pounds_uses_itg_default_when_unset() {
+        assert_eq!(
+            Profile::default().calculated_weight_pounds(),
+            DEFAULT_WEIGHT_POUNDS
+        );
+        assert_eq!(
+            Profile {
+                weight_pounds: 165,
+                ..Profile::default()
             }
-        }
+            .calculated_weight_pounds(),
+            165
+        );
     }
-    save_profile_ini_for_side(side);
-}
 
-pub fn update_player_initials_for_side(side: PlayerSide, initials: &str) {
-    if session_side_is_guest(side) {
-        return;
+    #[test]
+    fn age_years_for_uses_birth_year_or_default() {
+        assert_eq!(
+            Profile::default().age_years_for(2026),
+            2026 - DEFAULT_BIRTH_YEAR
+        );
+        assert_eq!(
+            Profile {
+                birth_year: 2000,
+                ..Profile::default()
+            }
+            .age_years_for(2026),
+            26
+        );
     }
-    let initials = initials.trim();
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.player_initials == initials {
-            return;
-        }
-        profile.player_initials = initials.to_string();
-    }
-    save_profile_ini_for_side(side);
-}
 
-pub fn update_scroll_speed_for_side(side: PlayerSide, setting: ScrollSpeedSetting) {
-    // Guest changes should persist for the active session; save_* no-ops for guests.
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.scroll_speed == setting {
-            return;
-        }
-        profile.scroll_speed = setting;
-    }
-    save_profile_ini_for_side(side);
-}
+    #[test]
+    fn last_played_uses_singles_for_single_and_versus() {
+        let singles = LastPlayed {
+            song_music_path: Some("single.ogg".to_string()),
+            chart_hash: Some("singlehash".to_string()),
+            difficulty_index: 3,
+        };
+        let doubles = LastPlayed {
+            song_music_path: Some("double.ogg".to_string()),
+            chart_hash: Some("doublehash".to_string()),
+            difficulty_index: 7,
+        };
+        let profile = Profile {
+            last_played_singles: singles.clone(),
+            last_played_doubles: doubles.clone(),
+            ..Profile::default()
+        };
 
-pub fn update_background_filter_for_side(side: PlayerSide, setting: BackgroundFilter) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.background_filter == setting {
-            return;
-        }
-        profile.background_filter = setting;
+        assert_eq!(profile.last_played(PlayStyle::Single), &singles);
+        assert_eq!(profile.last_played(PlayStyle::Versus), &singles);
+        assert_eq!(profile.last_played(PlayStyle::Double), &doubles);
     }
-    save_profile_ini_for_side(side);
-}
 
-pub fn update_hold_judgment_graphic_for_side(side: PlayerSide, setting: HoldJudgmentGraphic) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.hold_judgment_graphic == setting {
-            return;
-        }
-        profile.hold_judgment_graphic = setting;
-    }
-    save_profile_ini_for_side(side);
-}
+    #[test]
+    fn last_played_course_uses_singles_for_single_and_versus() {
+        let singles = LastPlayedCourse {
+            course_path: Some("Courses/Single.crs".to_string()),
+            difficulty_name: Some("Hard".to_string()),
+        };
+        let doubles = LastPlayedCourse {
+            course_path: Some("Courses/Double.crs".to_string()),
+            difficulty_name: Some("Challenge".to_string()),
+        };
+        let profile = Profile {
+            last_played_course_singles: singles.clone(),
+            last_played_course_doubles: doubles.clone(),
+            ..Profile::default()
+        };
 
-pub fn update_judgment_graphic_for_side(side: PlayerSide, setting: JudgmentGraphic) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.judgment_graphic == setting {
-            return;
-        }
-        profile.judgment_graphic = setting;
+        assert_eq!(profile.last_played_course(PlayStyle::Single), &singles);
+        assert_eq!(profile.last_played_course(PlayStyle::Versus), &singles);
+        assert_eq!(profile.last_played_course(PlayStyle::Double), &doubles);
     }
-    save_profile_ini_for_side(side);
-}
 
-pub fn update_combo_font_for_side(side: PlayerSide, setting: ComboFont) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.combo_font == setting {
-            return;
-        }
-        profile.combo_font = setting;
-    }
-    save_profile_ini_for_side(side);
-}
+    #[test]
+    fn player_options_use_singles_for_single_and_versus() {
+        let mut profile = Profile::default();
+        profile.mini_percent = 12;
+        profile.global_offset_shift_ms = 9;
+        profile.store_current_player_options(PlayStyle::Single);
+        profile.mini_percent = 48;
+        profile.global_offset_shift_ms = -11;
+        profile.store_current_player_options(PlayStyle::Double);
 
-pub fn update_combo_colors_for_side(side: PlayerSide, setting: ComboColors) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.combo_colors == setting {
-            return;
-        }
-        profile.combo_colors = setting;
+        assert_eq!(profile.player_options(PlayStyle::Single).mini_percent, 12);
+        assert_eq!(profile.player_options(PlayStyle::Versus).mini_percent, 12);
+        assert_eq!(profile.player_options(PlayStyle::Double).mini_percent, 48);
+        assert_eq!(
+            profile
+                .player_options(PlayStyle::Single)
+                .global_offset_shift_ms,
+            9
+        );
+        assert_eq!(
+            profile
+                .player_options(PlayStyle::Versus)
+                .global_offset_shift_ms,
+            9
+        );
+        assert_eq!(
+            profile
+                .player_options(PlayStyle::Double)
+                .global_offset_shift_ms,
+            -11
+        );
     }
-    save_profile_ini_for_side(side);
-}
 
-pub fn update_combo_mode_for_side(side: PlayerSide, setting: ComboMode) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.combo_mode == setting {
-            return;
-        }
-        profile.combo_mode = setting;
-    }
-    save_profile_ini_for_side(side);
-}
+    #[test]
+    fn apply_player_options_for_style_restores_separate_snapshots() {
+        let mut profile = Profile::default();
+        profile.mini_percent = 18;
+        profile.show_ex_score = true;
+        profile.score_position = deadsync_profile::ScorePosition::StepStatistics;
+        profile.score_display_mode = deadsync_profile::ScoreDisplayMode::Predictive;
+        profile.global_offset_shift_ms = 7;
+        profile.timing_windows = TimingWindowsOption::WayOffs;
+        profile.receptor_noteskin = Some(NoteSkin::new("default"));
+        profile.tap_explosion_noteskin = Some(NoteSkin::new("metal"));
+        profile.tap_explosion_active_mask =
+            TapExplosionMask::all().difference(TapExplosionMask::HELD);
+        profile.store_current_player_options(PlayStyle::Single);
 
-pub fn update_carry_combo_between_songs_for_side(side: PlayerSide, enabled: bool) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.carry_combo_between_songs == enabled {
-            return;
-        }
-        profile.carry_combo_between_songs = enabled;
-    }
-    save_profile_ini_for_side(side);
-}
+        profile.mini_percent = 62;
+        profile.show_ex_score = false;
+        profile.score_position = deadsync_profile::ScorePosition::Normal;
+        profile.score_display_mode = deadsync_profile::ScoreDisplayMode::Normal;
+        profile.global_offset_shift_ms = -13;
+        profile.timing_windows = TimingWindowsOption::FantasticsAndExcellents;
+        profile.receptor_noteskin = Some(NoteSkin::new("cyber"));
+        profile.tap_explosion_noteskin = None;
+        profile.tap_explosion_active_mask = TapExplosionMask::HELD;
+        profile.store_current_player_options(PlayStyle::Double);
 
-pub fn update_current_combo_for_side(side: PlayerSide, combo: u32) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.current_combo == combo {
-            return;
-        }
-        profile.current_combo = combo;
-    }
-    save_profile_stats_for_side(side);
-}
+        profile.apply_player_options_for_style(PlayStyle::Single);
+        assert_eq!(profile.mini_percent, 18);
+        assert!(profile.show_ex_score);
+        assert_eq!(
+            profile.score_position,
+            deadsync_profile::ScorePosition::StepStatistics
+        );
+        assert_eq!(
+            profile.score_display_mode,
+            deadsync_profile::ScoreDisplayMode::Predictive
+        );
+        assert_eq!(profile.global_offset_shift_ms, 7);
+        assert_eq!(profile.timing_windows, TimingWindowsOption::WayOffs);
+        assert_eq!(profile.receptor_noteskin, Some(NoteSkin::new("default")));
+        assert_eq!(profile.tap_explosion_noteskin, Some(NoteSkin::new("metal")));
+        assert_eq!(
+            profile.tap_explosion_active_mask,
+            TapExplosionMask::all().difference(TapExplosionMask::HELD)
+        );
 
-pub fn update_scroll_option_for_side(side: PlayerSide, setting: ScrollOption) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        let reverse_enabled = setting.contains(ScrollOption::Reverse);
-        if profile.scroll_option == setting && profile.reverse_scroll == reverse_enabled {
-            return;
-        }
-        profile.scroll_option = setting;
-        profile.reverse_scroll = reverse_enabled;
+        profile.apply_player_options_for_style(PlayStyle::Double);
+        assert_eq!(profile.mini_percent, 62);
+        assert!(!profile.show_ex_score);
+        assert_eq!(
+            profile.score_position,
+            deadsync_profile::ScorePosition::Normal
+        );
+        assert_eq!(
+            profile.score_display_mode,
+            deadsync_profile::ScoreDisplayMode::Normal
+        );
+        assert_eq!(profile.global_offset_shift_ms, -13);
+        assert_eq!(
+            profile.timing_windows,
+            TimingWindowsOption::FantasticsAndExcellents
+        );
+        assert_eq!(profile.receptor_noteskin, Some(NoteSkin::new("cyber")));
+        assert_eq!(profile.tap_explosion_noteskin, None);
+        assert_eq!(profile.tap_explosion_active_mask, TapExplosionMask::HELD);
     }
-    save_profile_ini_for_side(side);
-}
 
-pub fn update_turn_option_for_side(side: PlayerSide, setting: TurnOption) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.turn_option == setting {
-            return;
-        }
-        profile.turn_option = setting;
-    }
-    save_profile_ini_for_side(side);
-}
+    #[test]
+    fn tap_explosion_none_choice_disables_resolution() {
+        let profile = Profile {
+            tap_explosion_noteskin: Some(NoteSkin::none_choice()),
+            ..Profile::default()
+        };
 
-pub fn update_insert_mask_for_side(side: PlayerSide, mask: u8) {
-    let mask = normalize_insert_mask(mask);
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.insert_active_mask == mask {
-            return;
-        }
-        profile.insert_active_mask = mask;
+        assert!(profile.tap_explosion_noteskin_hidden());
+        assert_eq!(profile.resolved_tap_explosion_noteskin(), None);
     }
-    save_profile_ini_for_side(side);
-}
 
-pub fn update_remove_mask_for_side(side: PlayerSide, mask: u8) {
-    let mask = normalize_remove_mask(mask);
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.remove_active_mask == mask {
-            return;
-        }
-        profile.remove_active_mask = mask;
-    }
-    save_profile_ini_for_side(side);
-}
+    #[test]
+    fn tap_explosion_mask_migrates_new_bits_from_old_profiles() {
+        let old_all = TapExplosionMask::FANTASTIC
+            | TapExplosionMask::EXCELLENT
+            | TapExplosionMask::GREAT
+            | TapExplosionMask::DECENT
+            | TapExplosionMask::WAY_OFF
+            | TapExplosionMask::HELD;
 
-pub fn update_holds_mask_for_side(side: PlayerSide, mask: u8) {
-    let mask = normalize_holds_mask(mask);
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.holds_active_mask == mask {
-            return;
-        }
-        profile.holds_active_mask = mask;
+        assert_eq!(
+            normalize_tap_explosion_mask(old_all.bits(), 1),
+            TapExplosionMask::all()
+        );
+        assert_eq!(normalize_tap_explosion_mask(old_all.bits(), 2), old_all);
     }
-    save_profile_ini_for_side(side);
-}
 
-pub fn update_accel_effects_mask_for_side(side: PlayerSide, mask: u8) {
-    let mask = normalize_accel_effects_mask(mask);
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.accel_effects_active_mask == mask {
-            return;
-        }
-        profile.accel_effects_active_mask = mask;
-    }
-    save_profile_ini_for_side(side);
-}
+    #[test]
+    fn tap_explosion_miss_window_uses_miss_mask() {
+        let mut profile = Profile::default();
+        assert!(profile.tap_explosion_window_enabled("Miss"));
 
-pub fn update_visual_effects_mask_for_side(side: PlayerSide, mask: u16) {
-    let mask = normalize_visual_effects_mask(mask);
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.visual_effects_active_mask == mask {
-            return;
-        }
-        profile.visual_effects_active_mask = mask;
+        profile
+            .tap_explosion_active_mask
+            .remove(TapExplosionMask::MISS);
+        assert!(!profile.tap_explosion_window_enabled("Miss"));
+        assert!(profile.tap_explosion_window_enabled("Held"));
     }
-    save_profile_ini_for_side(side);
-}
 
-pub fn update_appearance_effects_mask_for_side(side: PlayerSide, mask: u8) {
-    let mask = normalize_appearance_effects_mask(mask);
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.appearance_effects_active_mask == mask {
-            return;
-        }
-        profile.appearance_effects_active_mask = mask;
-    }
-    save_profile_ini_for_side(side);
-}
+    #[test]
+    fn persisted_row_mask_bit_layouts_are_stable() {
+        // InsertMask: persisted bits 0..=6 (Mines is runtime-only and
+        // intentionally not represented here).
+        assert_eq!(InsertMask::WIDE.bits(), 1 << 0);
+        assert_eq!(InsertMask::BIG.bits(), 1 << 1);
+        assert_eq!(InsertMask::QUICK.bits(), 1 << 2);
+        assert_eq!(InsertMask::BMRIZE.bits(), 1 << 3);
+        assert_eq!(InsertMask::SKIPPY.bits(), 1 << 4);
+        assert_eq!(InsertMask::ECHO.bits(), 1 << 5);
+        assert_eq!(InsertMask::STOMP.bits(), 1 << 6);
+        assert_eq!(InsertMask::all().bits(), 0b0111_1111);
 
-pub fn update_attack_mode_for_side(side: PlayerSide, setting: AttackMode) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.attack_mode == setting {
-            return;
-        }
-        profile.attack_mode = setting;
-    }
-    save_profile_ini_for_side(side);
-}
+        // RemoveMask: bits 0..=7
+        assert_eq!(RemoveMask::LITTLE.bits(), 1 << 0);
+        assert_eq!(RemoveMask::NO_MINES.bits(), 1 << 1);
+        assert_eq!(RemoveMask::NO_HOLDS.bits(), 1 << 2);
+        assert_eq!(RemoveMask::NO_JUMPS.bits(), 1 << 3);
+        assert_eq!(RemoveMask::NO_HANDS.bits(), 1 << 4);
+        assert_eq!(RemoveMask::NO_QUADS.bits(), 1 << 5);
+        assert_eq!(RemoveMask::NO_LIFTS.bits(), 1 << 6);
+        assert_eq!(RemoveMask::NO_FAKES.bits(), 1 << 7);
+        assert_eq!(RemoveMask::all().bits(), 0xFF);
 
-pub fn update_hide_light_type_for_side(side: PlayerSide, setting: HideLightType) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.hide_light_type == setting {
-            return;
-        }
-        profile.hide_light_type = setting;
-    }
-    save_profile_ini_for_side(side);
-}
+        assert_eq!(HoldsMask::PLANTED.bits(), 1 << 0);
+        assert_eq!(HoldsMask::FLOORED.bits(), 1 << 1);
+        assert_eq!(HoldsMask::TWISTER.bits(), 1 << 2);
+        assert_eq!(HoldsMask::NO_ROLLS.bits(), 1 << 3);
+        assert_eq!(HoldsMask::HOLDS_TO_ROLLS.bits(), 1 << 4);
+        assert_eq!(HoldsMask::all().bits(), 0b0001_1111);
 
-pub fn update_rescore_early_hits_for_side(side: PlayerSide, enabled: bool) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.rescore_early_hits == enabled {
-            return;
-        }
-        profile.rescore_early_hits = enabled;
-    }
-    save_profile_ini_for_side(side);
-}
+        assert_eq!(AccelEffectsMask::BOOST.bits(), 1 << 0);
+        assert_eq!(AccelEffectsMask::BRAKE.bits(), 1 << 1);
+        assert_eq!(AccelEffectsMask::WAVE.bits(), 1 << 2);
+        assert_eq!(AccelEffectsMask::EXPAND.bits(), 1 << 3);
+        assert_eq!(AccelEffectsMask::BOOMERANG.bits(), 1 << 4);
+        assert_eq!(AccelEffectsMask::all().bits(), 0b0001_1111);
 
-pub fn update_early_dw_options_for_side(side: PlayerSide, hide_judgments: bool, hide_flash: bool) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.hide_early_dw_judgments == hide_judgments
-            && profile.hide_early_dw_flash == hide_flash
-        {
-            return;
-        }
-        profile.hide_early_dw_judgments = hide_judgments;
-        profile.hide_early_dw_flash = hide_flash;
-    }
-    save_profile_ini_for_side(side);
-}
+        assert_eq!(VisualEffectsMask::DRUNK.bits(), 1 << 0);
+        assert_eq!(VisualEffectsMask::DIZZY.bits(), 1 << 1);
+        assert_eq!(VisualEffectsMask::CONFUSION.bits(), 1 << 2);
+        assert_eq!(VisualEffectsMask::BIG.bits(), 1 << 3);
+        assert_eq!(VisualEffectsMask::FLIP.bits(), 1 << 4);
+        assert_eq!(VisualEffectsMask::INVERT.bits(), 1 << 5);
+        assert_eq!(VisualEffectsMask::TORNADO.bits(), 1 << 6);
+        assert_eq!(VisualEffectsMask::TIPSY.bits(), 1 << 7);
+        assert_eq!(VisualEffectsMask::BUMPY.bits(), 1 << 8);
+        assert_eq!(VisualEffectsMask::BEAT.bits(), 1 << 9);
+        assert_eq!(VisualEffectsMask::all().bits(), 0b11_1111_1111);
 
-pub fn update_hide_options_for_side(
-    side: PlayerSide,
-    hide_targets: bool,
-    hide_song_bg: bool,
-    hide_combo: bool,
-    hide_lifebar: bool,
-    hide_score: bool,
-    hide_danger: bool,
-    hide_combo_explosions: bool,
-) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.hide_targets == hide_targets
-            && profile.hide_song_bg == hide_song_bg
-            && profile.hide_combo == hide_combo
-            && profile.hide_lifebar == hide_lifebar
-            && profile.hide_score == hide_score
-            && profile.hide_danger == hide_danger
-            && profile.hide_combo_explosions == hide_combo_explosions
-        {
-            return;
-        }
-        profile.hide_targets = hide_targets;
-        profile.hide_song_bg = hide_song_bg;
-        profile.hide_combo = hide_combo;
-        profile.hide_lifebar = hide_lifebar;
-        profile.hide_score = hide_score;
-        profile.hide_danger = hide_danger;
-        profile.hide_combo_explosions = hide_combo_explosions;
-    }
-    save_profile_ini_for_side(side);
-}
+        assert_eq!(AppearanceEffectsMask::HIDDEN.bits(), 1 << 0);
+        assert_eq!(AppearanceEffectsMask::SUDDEN.bits(), 1 << 1);
+        assert_eq!(AppearanceEffectsMask::STEALTH.bits(), 1 << 2);
+        assert_eq!(AppearanceEffectsMask::BLINK.bits(), 1 << 3);
+        assert_eq!(AppearanceEffectsMask::RANDOM_VANISH.bits(), 1 << 4);
+        assert_eq!(AppearanceEffectsMask::all().bits(), 0b0001_1111);
 
-pub fn update_gameplay_extras_for_side(
-    side: PlayerSide,
-    column_flash_on_miss: bool,
-    subtractive_scoring: bool,
-    pacemaker: bool,
-    nps_graph_at_top: bool,
-) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.column_flash_on_miss == column_flash_on_miss
-            && profile.subtractive_scoring == subtractive_scoring
-            && profile.pacemaker == pacemaker
-            && profile.nps_graph_at_top == nps_graph_at_top
-        {
-            return;
-        }
-        profile.column_flash_on_miss = column_flash_on_miss;
-        profile.subtractive_scoring = subtractive_scoring;
-        profile.pacemaker = pacemaker;
-        profile.nps_graph_at_top = nps_graph_at_top;
-        if subtractive_scoring {
-            profile.mini_indicator = MiniIndicator::SubtractiveScoring;
-        } else if pacemaker {
-            profile.mini_indicator = MiniIndicator::Pacemaker;
-        } else if matches!(
-            profile.mini_indicator,
-            MiniIndicator::SubtractiveScoring | MiniIndicator::Pacemaker
-        ) {
-            profile.mini_indicator = MiniIndicator::None;
-        }
-    }
-    save_profile_ini_for_side(side);
-}
+        assert_eq!(ErrorBarMask::COLORFUL.bits(), 1 << 0);
+        assert_eq!(ErrorBarMask::MONOCHROME.bits(), 1 << 1);
+        assert_eq!(ErrorBarMask::TEXT.bits(), 1 << 2);
+        assert_eq!(ErrorBarMask::HIGHLIGHT.bits(), 1 << 3);
+        assert_eq!(ErrorBarMask::AVERAGE.bits(), 1 << 4);
+        assert_eq!(ErrorBarMask::all().bits(), 0b0001_1111);
 
-pub fn update_transparent_density_graph_bg_for_side(side: PlayerSide, enabled: bool) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.transparent_density_graph_bg == enabled {
-            return;
-        }
-        profile.transparent_density_graph_bg = enabled;
-    }
-    save_profile_ini_for_side(side);
-}
+        assert_eq!(LiveTimingStatsMask::MEAN.bits(), 1 << 0);
+        assert_eq!(LiveTimingStatsMask::MEAN_ABS.bits(), 1 << 1);
+        assert_eq!(LiveTimingStatsMask::MAX.bits(), 1 << 2);
+        assert_eq!(LiveTimingStatsMask::all().bits(), 0b0000_0111);
 
-pub fn update_mini_indicator_for_side(side: PlayerSide, setting: MiniIndicator) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.mini_indicator == setting {
-            return;
-        }
-        profile.mini_indicator = setting;
+        assert_eq!(TapExplosionMask::FANTASTIC.bits(), 1 << 0);
+        assert_eq!(TapExplosionMask::EXCELLENT.bits(), 1 << 1);
+        assert_eq!(TapExplosionMask::GREAT.bits(), 1 << 2);
+        assert_eq!(TapExplosionMask::DECENT.bits(), 1 << 3);
+        assert_eq!(TapExplosionMask::WAY_OFF.bits(), 1 << 4);
+        assert_eq!(TapExplosionMask::HELD.bits(), 1 << 5);
+        assert_eq!(TapExplosionMask::MISS.bits(), 1 << 6);
+        assert_eq!(TapExplosionMask::HOLDING.bits(), 1 << 7);
+        assert_eq!(TapExplosionMask::all().bits(), 0xFF);
     }
-    save_profile_ini_for_side(side);
-}
 
-pub fn update_mini_indicator_score_type_for_side(
-    side: PlayerSide,
-    setting: MiniIndicatorScoreType,
-) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.mini_indicator_score_type == setting {
-            return;
-        }
-        profile.mini_indicator_score_type = setting;
-    }
-    save_profile_ini_for_side(side);
-}
+    #[test]
+    fn from_bits_truncate_drops_unrepresented_bits() {
+        // InsertMask only persists 7 bits; bit 7 (Mines) belongs to runtime.
+        assert_eq!(InsertMask::from_bits_truncate(0xFF), InsertMask::all());
+        assert_eq!(InsertMask::from_bits_truncate(0xFF).bits(), 0b0111_1111);
 
-pub fn update_noteskin_for_side(side: PlayerSide, setting: NoteSkin) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.noteskin == setting {
-            return;
-        }
-        profile.noteskin = setting;
+        // VisualEffectsMask is 10 bits in a u16.
+        assert_eq!(
+            VisualEffectsMask::from_bits_truncate(u16::MAX),
+            VisualEffectsMask::all()
+        );
+        assert_eq!(
+            VisualEffectsMask::from_bits_truncate(u16::MAX).bits(),
+            0b11_1111_1111
+        );
     }
-    save_profile_ini_for_side(side);
-}
 
-pub fn update_notefield_offset_x_for_side(side: PlayerSide, offset: i32) {
-    let clamped = offset.clamp(0, 50);
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.note_field_offset_x == clamped {
-            return;
-        }
-        profile.note_field_offset_x = clamped;
-    }
-    save_profile_ini_for_side(side);
-}
+    #[test]
+    fn error_bar_helpers_roundtrip_through_mask() {
+        // Style + text combine into mask bits.
+        let mask = error_bar_mask_from_style(ErrorBarStyle::Colorful, true);
+        assert!(mask.contains(ErrorBarMask::COLORFUL));
+        assert!(mask.contains(ErrorBarMask::TEXT));
+        assert_eq!(error_bar_style_from_mask(mask), ErrorBarStyle::Colorful);
+        assert!(error_bar_text_from_mask(mask));
 
-pub fn update_notefield_offset_y_for_side(side: PlayerSide, offset: i32) {
-    let clamped = offset.clamp(-50, 50);
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.note_field_offset_y == clamped {
-            return;
-        }
-        profile.note_field_offset_y = clamped;
-    }
-    save_profile_ini_for_side(side);
-}
+        // Style precedence: Colorful > Monochrome > Highlight > Average > None.
+        let mask = ErrorBarMask::COLORFUL | ErrorBarMask::MONOCHROME;
+        assert_eq!(error_bar_style_from_mask(mask), ErrorBarStyle::Colorful);
 
-pub fn update_mini_percent_for_side(side: PlayerSide, percent: i32) {
-    // Mirror Simply Love's range: -100% to +150%.
-    let clamped = percent.clamp(-100, 150);
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.mini_percent == clamped {
-            return;
-        }
-        profile.mini_percent = clamped;
-    }
-    save_profile_ini_for_side(side);
-}
+        // Text-only mask round-trips to (Style::None, text=true) — the legacy
+        // canonicalization quirk preserved by the typed helpers.
+        let mask = error_bar_mask_from_style(ErrorBarStyle::Text, false);
+        assert!(mask.contains(ErrorBarMask::TEXT));
+        assert!(!mask.contains(ErrorBarMask::COLORFUL));
+        assert_eq!(error_bar_style_from_mask(mask), ErrorBarStyle::None);
+        assert!(error_bar_text_from_mask(mask));
 
-pub fn update_perspective_for_side(side: PlayerSide, perspective: Perspective) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.perspective == perspective {
-            return;
-        }
-        profile.perspective = perspective;
+        // Empty mask means no error bar at all.
+        let mask = error_bar_mask_from_style(ErrorBarStyle::None, false);
+        assert!(mask.is_empty());
+        assert_eq!(error_bar_style_from_mask(mask), ErrorBarStyle::None);
+        assert!(!error_bar_text_from_mask(mask));
     }
-    save_profile_ini_for_side(side);
-}
-
-pub fn update_visual_delay_ms_for_side(side: PlayerSide, ms: i32) {
-    // Mirror Simply Love's range: -100ms to +100ms.
-    let clamped = ms.clamp(-100, 100);
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.visual_delay_ms == clamped {
-            return;
-        }
-        profile.visual_delay_ms = clamped;
-    }
-    save_profile_ini_for_side(side);
-}
-
-pub fn update_show_fa_plus_window_for_side(side: PlayerSide, enabled: bool) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.show_fa_plus_window == enabled {
-            return;
-        }
-        profile.show_fa_plus_window = enabled;
-    }
-    save_profile_ini_for_side(side);
-}
-
-pub fn update_show_ex_score_for_side(side: PlayerSide, enabled: bool) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.show_ex_score == enabled {
-            return;
-        }
-        profile.show_ex_score = enabled;
-    }
-    save_profile_ini_for_side(side);
-}
-
-pub fn update_show_hard_ex_score_for_side(side: PlayerSide, enabled: bool) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.show_hard_ex_score == enabled {
-            return;
-        }
-        profile.show_hard_ex_score = enabled;
-    }
-    save_profile_ini_for_side(side);
-}
-
-pub fn update_show_fa_plus_pane_for_side(side: PlayerSide, enabled: bool) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.show_fa_plus_pane == enabled {
-            return;
-        }
-        profile.show_fa_plus_pane = enabled;
-    }
-    save_profile_ini_for_side(side);
-}
-
-pub fn update_fa_plus_10ms_blue_window_for_side(side: PlayerSide, enabled: bool) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.fa_plus_10ms_blue_window == enabled {
-            return;
-        }
-        profile.fa_plus_10ms_blue_window = enabled;
-    }
-    save_profile_ini_for_side(side);
-}
-
-pub fn update_track_early_judgments_for_side(side: PlayerSide, enabled: bool) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.track_early_judgments == enabled {
-            return;
-        }
-        profile.track_early_judgments = enabled;
-    }
-    save_profile_ini_for_side(side);
-}
-
-pub fn update_custom_fantastic_window_for_side(side: PlayerSide, enabled: bool) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.custom_fantastic_window == enabled {
-            return;
-        }
-        profile.custom_fantastic_window = enabled;
-    }
-    save_profile_ini_for_side(side);
-}
-
-pub fn update_custom_fantastic_window_ms_for_side(side: PlayerSide, ms: u8) {
-    let clamped = clamp_custom_fantastic_window_ms(ms);
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.custom_fantastic_window_ms == clamped {
-            return;
-        }
-        profile.custom_fantastic_window_ms = clamped;
-    }
-    save_profile_ini_for_side(side);
-}
-
-pub fn update_judgment_tilt_for_side(side: PlayerSide, enabled: bool) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.judgment_tilt == enabled {
-            return;
-        }
-        profile.judgment_tilt = enabled;
-    }
-    save_profile_ini_for_side(side);
-}
-
-pub fn update_column_cues_for_side(side: PlayerSide, enabled: bool) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.column_cues == enabled {
-            return;
-        }
-        profile.column_cues = enabled;
-    }
-    save_profile_ini_for_side(side);
-}
-
-pub fn update_judgment_back_for_side(side: PlayerSide, enabled: bool) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.judgment_back == enabled {
-            return;
-        }
-        profile.judgment_back = enabled;
-    }
-    save_profile_ini_for_side(side);
-}
-
-pub fn update_error_ms_display_for_side(side: PlayerSide, enabled: bool) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.error_ms_display == enabled {
-            return;
-        }
-        profile.error_ms_display = enabled;
-    }
-    save_profile_ini_for_side(side);
-}
-
-pub fn update_display_scorebox_for_side(side: PlayerSide, enabled: bool) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.display_scorebox == enabled {
-            return;
-        }
-        profile.display_scorebox = enabled;
-    }
-    save_profile_ini_for_side(side);
-}
-
-pub fn update_rainbow_max_for_side(side: PlayerSide, enabled: bool) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.rainbow_max == enabled {
-            return;
-        }
-        profile.rainbow_max = enabled;
-    }
-    save_profile_ini_for_side(side);
-}
-
-pub fn update_responsive_colors_for_side(side: PlayerSide, enabled: bool) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.responsive_colors == enabled {
-            return;
-        }
-        profile.responsive_colors = enabled;
-    }
-    save_profile_ini_for_side(side);
-}
-
-pub fn update_show_life_percent_for_side(side: PlayerSide, enabled: bool) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.show_life_percent == enabled {
-            return;
-        }
-        profile.show_life_percent = enabled;
-    }
-    save_profile_ini_for_side(side);
-}
-
-pub fn update_tilt_multiplier_for_side(side: PlayerSide, multiplier: f32) {
-    if !multiplier.is_finite() {
-        return;
-    }
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if (profile.tilt_multiplier - multiplier).abs() < 1e-6 {
-            return;
-        }
-        profile.tilt_multiplier = multiplier;
-    }
-    save_profile_ini_for_side(side);
-}
-
-pub fn update_error_bar_mask_for_side(side: PlayerSide, mask: u8) {
-    let mask = normalize_error_bar_mask(mask);
-    let style = error_bar_style_from_mask(mask);
-    let text = error_bar_text_from_mask(mask);
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.error_bar_active_mask == mask {
-            return;
-        }
-        profile.error_bar_active_mask = mask;
-        profile.error_bar = style;
-        profile.error_bar_text = text;
-    }
-    save_profile_ini_for_side(side);
-}
-
-pub fn update_error_bar_trim_for_side(side: PlayerSide, setting: ErrorBarTrim) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.error_bar_trim == setting {
-            return;
-        }
-        profile.error_bar_trim = setting;
-    }
-    save_profile_ini_for_side(side);
-}
-
-pub fn update_data_visualizations_for_side(side: PlayerSide, setting: DataVisualizations) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.data_visualizations == setting {
-            return;
-        }
-        profile.data_visualizations = setting;
-    }
-    save_profile_ini_for_side(side);
-}
-
-pub fn update_target_score_for_side(side: PlayerSide, setting: TargetScoreSetting) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.target_score == setting {
-            return;
-        }
-        profile.target_score = setting;
-    }
-    save_profile_ini_for_side(side);
-}
-
-pub fn update_lifemeter_type_for_side(side: PlayerSide, setting: LifeMeterType) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.lifemeter_type == setting {
-            return;
-        }
-        profile.lifemeter_type = setting;
-    }
-    save_profile_ini_for_side(side);
-}
-
-pub fn update_error_bar_options_for_side(side: PlayerSide, up: bool, multi_tick: bool) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.error_bar_up == up && profile.error_bar_multi_tick == multi_tick {
-            return;
-        }
-        profile.error_bar_up = up;
-        profile.error_bar_multi_tick = multi_tick;
-    }
-    save_profile_ini_for_side(side);
-}
-
-pub fn update_measure_counter_for_side(side: PlayerSide, setting: MeasureCounter) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.measure_counter == setting {
-            return;
-        }
-        profile.measure_counter = setting;
-    }
-    save_profile_ini_for_side(side);
-}
-
-pub fn update_measure_counter_lookahead_for_side(side: PlayerSide, lookahead: u8) {
-    let lookahead = lookahead.min(4);
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.measure_counter_lookahead == lookahead {
-            return;
-        }
-        profile.measure_counter_lookahead = lookahead;
-    }
-    save_profile_ini_for_side(side);
-}
-
-pub fn update_measure_counter_options_for_side(
-    side: PlayerSide,
-    left: bool,
-    up: bool,
-    vert: bool,
-    broken_run: bool,
-    run_timer: bool,
-) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.measure_counter_left == left
-            && profile.measure_counter_up == up
-            && profile.measure_counter_vert == vert
-            && profile.broken_run == broken_run
-            && profile.run_timer == run_timer
-        {
-            return;
-        }
-        profile.measure_counter_left = left;
-        profile.measure_counter_up = up;
-        profile.measure_counter_vert = vert;
-        profile.broken_run = broken_run;
-        profile.run_timer = run_timer;
-    }
-    save_profile_ini_for_side(side);
-}
-
-pub fn update_measure_lines_for_side(side: PlayerSide, setting: MeasureLines) {
-    {
-        let mut profiles = lock_profiles();
-        let profile = &mut profiles[side_ix(side)];
-        if profile.measure_lines == setting {
-            return;
-        }
-        profile.measure_lines = setting;
-    }
-    save_profile_ini_for_side(side);
 }

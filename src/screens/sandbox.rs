@@ -1,9 +1,13 @@
 use crate::act;
-use crate::core::input::{GpSystemEvent, InputEvent, PadEvent, RawKeyboardEvent, VirtualAction};
-use crate::core::space::{screen_center_x, screen_height, screen_width};
+use crate::assets::{FontRole, current_machine_font_key};
+use crate::screens::components::shared::transitions;
 use crate::screens::{Screen, ScreenAction};
-use crate::ui::actors::Actor;
-// Keyboard input is handled centrally via the virtual dispatcher in app.rs
+use deadlib_present::actors::Actor;
+use deadlib_present::space::screen_center_x;
+use deadsync_input::RawKeyboardEvent;
+use deadsync_input::{InputEvent, PadEvent, VirtualAction};
+use deadsync_input_native::GpSystemEvent;
+// Keyboard input is handled centrally via the virtual dispatcher in app
 use std::collections::VecDeque;
 use std::time::Instant;
 use winit::keyboard::KeyCode;
@@ -29,7 +33,7 @@ pub fn init() -> State {
     }
 }
 
-// Keyboard input is handled centrally via the virtual dispatcher in app.rs
+// Keyboard input is handled centrally via the virtual dispatcher in app
 
 pub fn update(state: &mut State, dt: f32) {
     state.elapsed += dt;
@@ -39,25 +43,11 @@ pub fn update(state: &mut State, dt: f32) {
 }
 
 pub fn in_transition() -> (Vec<Actor>, f32) {
-    let actor = act!(quad:
-        align(0.0, 0.0): xy(0.0, 0.0):
-        zoomto(screen_width(), screen_height()):
-        diffuse(0.0, 0.0, 0.0, 1.0): z(1100):
-        linear(TRANSITION_IN_DURATION): alpha(0.0):
-        linear(0.0): visible(false)
-    );
-    (vec![actor], TRANSITION_IN_DURATION)
+    transitions::fade_in_black(TRANSITION_IN_DURATION, 1100)
 }
 
 pub fn out_transition() -> (Vec<Actor>, f32) {
-    let actor = act!(quad:
-        align(0.0, 0.0): xy(0.0, 0.0):
-        zoomto(screen_width(), screen_height()):
-        diffuse(0.0, 0.0, 0.0, 0.0):
-        z(1200):
-        linear(TRANSITION_OUT_DURATION): alpha(1.0)
-    );
-    (vec![actor], TRANSITION_OUT_DURATION)
+    transitions::fade_out_black(TRANSITION_OUT_DURATION, 1200)
 }
 
 pub fn handle_raw_key_event(state: &mut State, key_event: &RawKeyboardEvent) -> ScreenAction {
@@ -170,12 +160,12 @@ pub fn handle_gamepad_system_event(state: &mut State, ev: &GpSystemEvent) {
     }
 }
 
-pub fn get_actors(state: &State) -> Vec<Actor> {
-    let mut actors = Vec::with_capacity(10 + INPUT_LOG_MAX_ITEMS);
+pub fn push_actors(actors: &mut Vec<Actor>, state: &State) {
+    actors.reserve(10 + INPUT_LOG_MAX_ITEMS);
 
     actors.push(act!(text:
         align(0.5, 0.0): xy(screen_center_x(), 20.0):
-        zoomtoheight(15.0): font("wendy"): settext("Actor System & Input Sandbox"): horizalign(center)
+        zoomtoheight(15.0): font(current_machine_font_key(FontRole::Header)): settext("Actor System & Input Sandbox"): horizalign(center)
     ));
     actors.push(act!(text:
         align(0.5, 0.0): xy(screen_center_x(), 60.0):
@@ -200,7 +190,11 @@ pub fn get_actors(state: &State) -> Vec<Actor> {
             z(200)
         ));
     }
+}
 
+pub fn get_actors(state: &State) -> Vec<Actor> {
+    let mut actors = Vec::with_capacity(10 + INPUT_LOG_MAX_ITEMS);
+    push_actors(&mut actors, state);
     actors
 }
 

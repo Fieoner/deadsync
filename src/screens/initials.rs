@@ -1,15 +1,23 @@
 use crate::act;
 use crate::assets::AssetManager;
-use crate::core::audio;
-use crate::core::input::{InputEvent, VirtualAction};
-use crate::core::space::{screen_center_x, screen_center_y, screen_height, screen_width};
+use crate::assets::i18n::tr;
+use crate::assets::{FontRole, current_machine_font_key};
 use crate::game::profile;
 use crate::game::scores;
 use crate::game::stage_stats;
-use crate::screens::components::shared::heart_bg;
+use crate::screens::components::shared::{transitions, visual_style_bg};
 use crate::screens::{Screen, ScreenAction};
-use crate::ui::actors::{Actor, SizeSpec};
-use crate::ui::color;
+use deadlib_present::actors::{Actor, SizeSpec};
+use deadlib_present::cache::{SharedStrCache, cached_shared_str};
+use deadlib_present::color;
+use deadlib_present::space::{screen_center_x, screen_center_y, screen_height};
+use deadsync_audio_stream as audio;
+use deadsync_input::{InputEvent, VirtualAction};
+use deadsync_profile as profile_data;
+use deadsync_score as score_data;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 /* ---------------------------- transitions ---------------------------- */
@@ -18,7 +26,7 @@ const TRANSITION_OUT_DURATION: f32 = 0.4;
 
 const STAGE_CYCLE_SECONDS: f32 = 4.0;
 
-const CHARACTER_LIMIT: usize = 4;
+const CHARACTER_LIMIT: usize = profile_data::PLAYER_INITIALS_MAX_LEN;
 
 /* -------------------------- hold-to-scroll timing ------------------------- */
 // ITGmania `_fallback` [ScreenNameEntryTraditional]: RepeatDelay=1/4, RepeatRate=15.
@@ -30,6 +38,7 @@ const WHEEL_NUM_ITEMS: usize = 7;
 const WHEEL_FOCUS_POS: usize = 3; // Simply Love's sick_wheel focus_pos for num_items=7
 const WHEEL_SLIDE_SECONDS: f32 = 0.075; // SL: AlphabetCharacterMT.lua linear(0.075)
 const WHEEL_HIDE_FADE_SECONDS: f32 = 0.25;
+const TEXT_CACHE_LIMIT: usize = 256;
 
 // Layout (Simply Love semantics)
 const PLAYER_FRAME_X_OFF: f32 = 160.0;
@@ -58,6 +67,14 @@ const POSSIBLE_CHARS: [&str; 40] = [
     "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z", "0", "1", "2", "3", "4", "5", "6", "7",
     "8", "9", "?", "!",
 ];
+
+static POSSIBLE_CHAR_TEXT: LazyLock<[Arc<str>; POSSIBLE_CHARS.len()]> =
+    LazyLock::new(|| POSSIBLE_CHARS.map(Arc::<str>::from));
+
+thread_local! {
+    static STR_REF_CACHE: RefCell<SharedStrCache> =
+        RefCell::new(HashMap::with_capacity(64));
+}
 
 #[derive(Clone, Copy, Debug)]
 struct WheelItem {
@@ -96,7 +113,7 @@ struct PlayerEntry {
 #[derive(Clone, Debug)]
 struct ChartScoreCache {
     chart_hash: String,
-    entries: Vec<scores::LeaderboardEntry>,
+    entries: Vec<score_data::LeaderboardEntry>,
     used: Vec<bool>,
 }
 
@@ -116,39 +133,22 @@ struct StageHighScores {
 
 pub struct State {
     pub active_color_index: i32,
-    bg: heart_bg::State,
+    bg: visual_style_bg::State,
     elapsed: f32,
     finish_hold_elapsed: Option<f32>,
     players: [PlayerEntry; 2],
     highscore_lists: [Vec<Option<StageHighScores>>; 2],
 }
 
-#[inline(always)]
-const fn side_ix(side: profile::PlayerSide) -> usize {
+fn player_color_rgba(side: profile_data::PlayerSide, active_color_index: i32) -> [f32; 4] {
     match side {
-        profile::PlayerSide::P1 => 0,
-        profile::PlayerSide::P2 => 1,
-    }
-}
-
-fn player_color_rgba(side: profile::PlayerSide, active_color_index: i32) -> [f32; 4] {
-    match side {
-        profile::PlayerSide::P1 => color::simply_love_rgba(active_color_index),
-        profile::PlayerSide::P2 => color::simply_love_rgba(active_color_index - 2),
+        profile_data::PlayerSide::P1 => color::simply_love_rgba(active_color_index),
+        profile_data::PlayerSide::P2 => color::simply_love_rgba(active_color_index - 2),
     }
 }
 
 fn sanitize_name(raw: &str) -> String {
-    let mut out = String::with_capacity(CHARACTER_LIMIT);
-    for ch in raw.chars() {
-        if out.len() >= CHARACTER_LIMIT {
-            break;
-        }
-        if ch.is_ascii_alphanumeric() || ch == '?' || ch == '!' {
-            out.push(ch.to_ascii_uppercase());
-        }
-    }
-    out
+    profile_data::sanitize_player_initials(raw)
 }
 
 #[inline(always)]
@@ -297,9 +297,22 @@ impl Wheel {
     }
 }
 
-const MONTH_ABBR: [&str; 12] = [
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-];
+fn month_abbr(index: usize) -> std::sync::Arc<str> {
+    const KEYS: [&str; 12] = [
+        "MonthJan", "MonthFeb", "MonthMar", "MonthApr", "MonthMay", "MonthJun", "MonthJul",
+        "MonthAug", "MonthSep", "MonthOct", "MonthNov", "MonthDec",
+    ];
+    if index < KEYS.len() {
+        tr("Initials", KEYS[index])
+    } else {
+        std::sync::Arc::from("???")
+    }
+}
+
+#[inline(always)]
+fn cached_str_ref(text: &str) -> Arc<str> {
+    cached_shared_str(&STR_REF_CACHE, text, TEXT_CACHE_LIMIT)
+}
 
 fn format_highscore_date(date: &str) -> String {
     let trimmed = date.trim();
@@ -317,7 +330,7 @@ fn format_highscore_date(date: &str) -> String {
         .parse::<usize>()
         .ok()
         .and_then(|m| m.checked_sub(1))
-        .filter(|m| *m < MONTH_ABBR.len())
+        .filter(|m| *m < 12)
     else {
         return trimmed.to_string();
     };
@@ -325,7 +338,7 @@ fn format_highscore_date(date: &str) -> String {
         return trimmed.to_string();
     };
 
-    format!("{} {}, {}", MONTH_ABBR[month_idx], day_num, year)
+    format!("{} {}, {}", month_abbr(month_idx), day_num, year)
 }
 
 #[inline(always)]
@@ -379,7 +392,7 @@ fn find_chart_score_cache<'a>(
 }
 
 fn consume_highlight_rank(
-    entries: &[scores::LeaderboardEntry],
+    entries: &[score_data::LeaderboardEntry],
     used: &mut [bool],
     initials: &str,
     target_score_10000: f64,
@@ -405,7 +418,7 @@ fn consume_highlight_rank(
 }
 
 fn build_stage_highscores(
-    entries: &[scores::LeaderboardEntry],
+    entries: &[score_data::LeaderboardEntry],
     highlight_rank: Option<u32>,
 ) -> StageHighScores {
     let (lower, upper) = highscore_rank_window(highlight_rank);
@@ -448,13 +461,13 @@ fn build_stage_highscores(
 }
 
 fn build_side_highscore_lists(
-    side: profile::PlayerSide,
+    side: profile_data::PlayerSide,
     initials: &str,
     stages: &[stage_stats::StageSummary],
 ) -> Vec<Option<StageHighScores>> {
     let mut out = vec![None; stages.len()];
     let mut chart_caches: Vec<ChartScoreCache> = Vec::with_capacity(stages.len());
-    let side_idx = side_ix(side);
+    let side_idx = profile_data::player_side_index(side);
 
     for stage_idx in (0..stages.len()).rev() {
         let Some(player_stage) = stages
@@ -481,16 +494,20 @@ fn build_side_highscore_lists(
 }
 
 pub fn set_highscore_lists(state: &mut State, stages: &[stage_stats::StageSummary]) {
-    let p1_initials = state.players[side_ix(profile::PlayerSide::P1)].name.clone();
-    let p2_initials = state.players[side_ix(profile::PlayerSide::P2)].name.clone();
+    let p1_initials = state.players[profile_data::player_side_index(profile_data::PlayerSide::P1)]
+        .name
+        .clone();
+    let p2_initials = state.players[profile_data::player_side_index(profile_data::PlayerSide::P2)]
+        .name
+        .clone();
 
-    state.highscore_lists[side_ix(profile::PlayerSide::P1)] =
-        build_side_highscore_lists(profile::PlayerSide::P1, p1_initials.as_str(), stages);
-    state.highscore_lists[side_ix(profile::PlayerSide::P2)] =
-        build_side_highscore_lists(profile::PlayerSide::P2, p2_initials.as_str(), stages);
+    state.highscore_lists[profile_data::player_side_index(profile_data::PlayerSide::P1)] =
+        build_side_highscore_lists(profile_data::PlayerSide::P1, p1_initials.as_str(), stages);
+    state.highscore_lists[profile_data::player_side_index(profile_data::PlayerSide::P2)] =
+        build_side_highscore_lists(profile_data::PlayerSide::P2, p2_initials.as_str(), stages);
 }
 
-fn player_entry_for(side: profile::PlayerSide) -> PlayerEntry {
+fn player_entry_for(side: profile_data::PlayerSide) -> PlayerEntry {
     let joined = profile::is_session_side_joined(side);
     let persistent = joined && !profile::is_session_side_guest(side);
     let can_enter = persistent;
@@ -575,13 +592,13 @@ fn update_hold_scroll(p: &mut PlayerEntry) {
 
 pub fn init() -> State {
     State {
-        active_color_index: color::DEFAULT_COLOR_INDEX, // overwritten by app.rs
-        bg: heart_bg::State::new(),
+        active_color_index: color::DEFAULT_COLOR_INDEX, // overwritten by app
+        bg: visual_style_bg::State::new(),
         elapsed: 0.0,
         finish_hold_elapsed: None,
         players: [
-            player_entry_for(profile::PlayerSide::P1),
-            player_entry_for(profile::PlayerSide::P2),
+            player_entry_for(profile_data::PlayerSide::P1),
+            player_entry_for(profile_data::PlayerSide::P2),
         ],
         highscore_lists: [Vec::new(), Vec::new()],
     }
@@ -596,8 +613,8 @@ fn start_finish(state: &mut State) {
         return;
     }
 
-    for side in [profile::PlayerSide::P1, profile::PlayerSide::P2] {
-        let ix = side_ix(side);
+    for side in [profile_data::PlayerSide::P1, profile_data::PlayerSide::P2] {
+        let ix = profile_data::player_side_index(side);
         let p = &state.players[ix];
         if !(p.joined && p.can_enter) {
             continue;
@@ -692,16 +709,14 @@ pub fn handle_input(state: &mut State, ev: &InputEvent) -> ScreenAction {
         return ScreenAction::None;
     }
 
-    let mut handle_for = |side: profile::PlayerSide, f: fn(&mut PlayerEntry)| {
-        let ix = side_ix(side);
+    let mut handle_for = |side: profile_data::PlayerSide, f: fn(&mut PlayerEntry)| {
+        let ix = profile_data::player_side_index(side);
         let p = &mut state.players[ix];
         if !(p.joined && p.can_enter) || p.done {
             return;
         }
         f(p);
-        if all_done(state) {
-            return;
-        }
+        if all_done(state) {}
     };
 
     match ev.action {
@@ -709,7 +724,7 @@ pub fn handle_input(state: &mut State, ev: &InputEvent) -> ScreenAction {
         | VirtualAction::p1_left
         | VirtualAction::p1_menu_up
         | VirtualAction::p1_up => {
-            let ix = side_ix(profile::PlayerSide::P1);
+            let ix = profile_data::player_side_index(profile_data::PlayerSide::P1);
             let p = &mut state.players[ix];
             if p.joined && p.can_enter && !p.done {
                 if ev.pressed {
@@ -727,7 +742,7 @@ pub fn handle_input(state: &mut State, ev: &InputEvent) -> ScreenAction {
         | VirtualAction::p1_right
         | VirtualAction::p1_menu_down
         | VirtualAction::p1_down => {
-            let ix = side_ix(profile::PlayerSide::P1);
+            let ix = profile_data::player_side_index(profile_data::PlayerSide::P1);
             let p = &mut state.players[ix];
             if p.joined && p.can_enter && !p.done {
                 if ev.pressed {
@@ -743,12 +758,12 @@ pub fn handle_input(state: &mut State, ev: &InputEvent) -> ScreenAction {
         }
         VirtualAction::p1_start => {
             if ev.pressed {
-                handle_for(profile::PlayerSide::P1, handle_start);
+                handle_for(profile_data::PlayerSide::P1, handle_start);
             }
         }
         VirtualAction::p1_select => {
             if ev.pressed {
-                handle_for(profile::PlayerSide::P1, handle_delete);
+                handle_for(profile_data::PlayerSide::P1, handle_delete);
             }
         }
 
@@ -756,7 +771,7 @@ pub fn handle_input(state: &mut State, ev: &InputEvent) -> ScreenAction {
         | VirtualAction::p2_left
         | VirtualAction::p2_menu_up
         | VirtualAction::p2_up => {
-            let ix = side_ix(profile::PlayerSide::P2);
+            let ix = profile_data::player_side_index(profile_data::PlayerSide::P2);
             let p = &mut state.players[ix];
             if p.joined && p.can_enter && !p.done {
                 if ev.pressed {
@@ -774,7 +789,7 @@ pub fn handle_input(state: &mut State, ev: &InputEvent) -> ScreenAction {
         | VirtualAction::p2_right
         | VirtualAction::p2_menu_down
         | VirtualAction::p2_down => {
-            let ix = side_ix(profile::PlayerSide::P2);
+            let ix = profile_data::player_side_index(profile_data::PlayerSide::P2);
             let p = &mut state.players[ix];
             if p.joined && p.can_enter && !p.done {
                 if ev.pressed {
@@ -790,12 +805,12 @@ pub fn handle_input(state: &mut State, ev: &InputEvent) -> ScreenAction {
         }
         VirtualAction::p2_start => {
             if ev.pressed {
-                handle_for(profile::PlayerSide::P2, handle_start);
+                handle_for(profile_data::PlayerSide::P2, handle_start);
             }
         }
         VirtualAction::p2_select => {
             if ev.pressed {
-                handle_for(profile::PlayerSide::P2, handle_delete);
+                handle_for(profile_data::PlayerSide::P2, handle_delete);
             }
         }
 
@@ -840,9 +855,10 @@ fn build_banner_and_title(state: &State, stages: &[stage_stats::StageSummary]) -
     ));
 
     if stages.is_empty() {
+        let no_data = tr("EvaluationSummary", "NoStageDataAvailable");
         actors.push(act!(text:
             font("miso"):
-            settext("NO STAGE DATA AVAILABLE"):
+            settext(no_data):
             align(0.5, 0.5):
             xy(cx, 54.0):
             zoom(0.8):
@@ -875,7 +891,7 @@ fn build_banner_and_title(state: &State, stages: &[stage_stats::StageSummary]) -
         .display_title(crate::config::get().translated_titles);
     actors.push(act!(text:
         font("miso"):
-        settext(title):
+        settext(cached_str_ref(title)):
         align(0.5, 0.5):
         xy(cx, 54.0):
         zoom(1.0):
@@ -890,7 +906,7 @@ fn build_banner_and_title(state: &State, stages: &[stage_stats::StageSummary]) -
 }
 
 fn build_wheel(
-    _side: profile::PlayerSide,
+    _side: profile_data::PlayerSide,
     player_frame_x: f32,
     p: &PlayerEntry,
     alpha: f32,
@@ -912,7 +928,7 @@ fn build_wheel(
     for item_index in 1..=WHEEL_NUM_ITEMS {
         let it = &p.wheel.items[item_index - 1];
         let x = it.x;
-        let content = POSSIBLE_CHARS[it.info_index];
+        let content = POSSIBLE_CHAR_TEXT[it.info_index].clone();
 
         // Mirror AlphabetCharacterMT.lua visibility: hide the right-most two items.
         let visible = item_index < (WHEEL_NUM_ITEMS - 1);
@@ -924,7 +940,7 @@ fn build_wheel(
         };
 
         let mut actor = act!(text:
-            font("wendy_white"):
+            font(current_machine_font_key(FontRole::Headline)):
             settext(content):
             align(0.5, 0.5):
             xy(x, 0.0):
@@ -950,17 +966,17 @@ fn build_wheel(
 }
 
 #[inline(always)]
-fn player_frame_x(side: profile::PlayerSide) -> f32 {
+fn player_frame_x(side: profile_data::PlayerSide) -> f32 {
     let cx = screen_center_x();
     match side {
-        profile::PlayerSide::P1 => cx - PLAYER_FRAME_X_OFF,
-        profile::PlayerSide::P2 => cx + PLAYER_FRAME_X_OFF,
+        profile_data::PlayerSide::P1 => cx - PLAYER_FRAME_X_OFF,
+        profile_data::PlayerSide::P2 => cx + PLAYER_FRAME_X_OFF,
     }
 }
 
 #[inline(always)]
 fn highlight_row_color(
-    side: profile::PlayerSide,
+    side: profile_data::PlayerSide,
     active_color_index: i32,
     elapsed: f32,
 ) -> [f32; 4] {
@@ -977,7 +993,7 @@ fn highlight_row_color(
 }
 
 fn build_highscore_list(
-    side: profile::PlayerSide,
+    side: profile_data::PlayerSide,
     state: &State,
     stages_len: usize,
 ) -> Option<Actor> {
@@ -988,7 +1004,7 @@ fn build_highscore_list(
     let stage_idx = stage_index_for(state.elapsed, stages_len);
     let list = state
         .highscore_lists
-        .get(side_ix(side))
+        .get(profile_data::player_side_index(side))
         .and_then(|all| all.get(stage_idx))
         .and_then(|list| list.as_ref())?;
 
@@ -1061,8 +1077,8 @@ fn build_highscore_list(
     })
 }
 
-fn build_player_frame(side: profile::PlayerSide, state: &State) -> Actor {
-    let ix = side_ix(side);
+fn build_player_frame(side: profile_data::PlayerSide, state: &State) -> Actor {
+    let ix = profile_data::player_side_index(side);
     let p = &state.players[ix];
     let px = player_frame_x(side);
     let cy = screen_center_y();
@@ -1095,7 +1111,7 @@ fn build_player_frame(side: profile::PlayerSide, state: &State) -> Actor {
     if p.can_enter {
         // PlayerName text (stays visible even after finishing input).
         children.push(act!(text:
-            font("wendy_white"):
+            font(current_machine_font_key(FontRole::Headline)):
             settext(p.name.clone()):
             align(0.0, 0.5):
             xy(PLAYERNAME_X, 0.0):
@@ -1127,9 +1143,10 @@ fn build_player_frame(side: profile::PlayerSide, state: &State) -> Actor {
         }
     } else if p.joined {
         let pc = player_color_rgba(side, state.active_color_index);
+        let out_of_ranking = tr("Initials", "OutOfRanking");
         children.push(act!(text:
             font("miso"):
-            settext("Out of Ranking"):
+            settext(out_of_ranking):
             align(0.5, 0.5):
             xy(0.0, CURSOR_Y_IN_FRAME):
             zoom(0.7):
@@ -1149,59 +1166,58 @@ fn build_player_frame(side: profile::PlayerSide, state: &State) -> Actor {
     }
 }
 
-pub fn get_actors(
+pub fn push_actors(
+    actors: &mut Vec<Actor>,
     state: &State,
     stages: &[stage_stats::StageSummary],
     _asset_manager: &AssetManager,
-) -> Vec<Actor> {
-    let mut actors: Vec<Actor> = Vec::with_capacity(64);
+) {
+    actors.reserve(64);
 
     // Background
-    actors.extend(state.bg.build(heart_bg::Params {
-        active_color_index: state.active_color_index,
-        backdrop_rgba: [0.0, 0.0, 0.0, 1.0],
-        alpha_mul: 1.0,
-    }));
+    state.bg.push(
+        actors,
+        visual_style_bg::Params {
+            active_color_index: state.active_color_index,
+            backdrop_rgba: [0.0, 0.0, 0.0, 1.0],
+            alpha_mul: 1.0,
+        },
+    );
 
     // Banner + title cycling (Simply Love behavior)
     actors.extend(build_banner_and_title(state, stages));
 
-    for side in [profile::PlayerSide::P1, profile::PlayerSide::P2] {
-        if !state.players[side_ix(side)].joined {
+    for side in [profile_data::PlayerSide::P1, profile_data::PlayerSide::P2] {
+        if !state.players[profile_data::player_side_index(side)].joined {
             continue;
         }
         actors.push(build_player_frame(side, state));
     }
 
-    for side in [profile::PlayerSide::P1, profile::PlayerSide::P2] {
-        if !state.players[side_ix(side)].joined {
+    for side in [profile_data::PlayerSide::P1, profile_data::PlayerSide::P2] {
+        if !state.players[profile_data::player_side_index(side)].joined {
             continue;
         }
         if let Some(list) = build_highscore_list(side, state, stages.len()) {
             actors.push(list);
         }
     }
+}
 
+pub fn get_actors(
+    state: &State,
+    stages: &[stage_stats::StageSummary],
+    asset_manager: &AssetManager,
+) -> Vec<Actor> {
+    let mut actors = Vec::with_capacity(64);
+    push_actors(&mut actors, state, stages, asset_manager);
     actors
 }
 
 pub fn in_transition() -> (Vec<Actor>, f32) {
-    let actor = act!(quad:
-        align(0.0, 0.0): xy(0.0, 0.0):
-        zoomto(screen_width(), screen_height()):
-        diffuse(0.0, 0.0, 0.0, 1.0): z(1100):
-        linear(TRANSITION_IN_DURATION): alpha(0.0):
-        linear(0.0): visible(false)
-    );
-    (vec![actor], TRANSITION_IN_DURATION)
+    transitions::fade_in_black(TRANSITION_IN_DURATION, 1100)
 }
 
 pub fn out_transition() -> (Vec<Actor>, f32) {
-    let actor = act!(quad:
-        align(0.0, 0.0): xy(0.0, 0.0):
-        zoomto(screen_width(), screen_height()):
-        diffuse(0.0, 0.0, 0.0, 0.0): z(1100):
-        linear(TRANSITION_OUT_DURATION): alpha(1.0)
-    );
-    (vec![actor], TRANSITION_OUT_DURATION)
+    transitions::fade_out_black(TRANSITION_OUT_DURATION, 1100)
 }

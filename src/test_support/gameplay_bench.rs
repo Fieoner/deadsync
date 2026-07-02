@@ -1,67 +1,79 @@
 use crate::assets::AssetManager;
-use crate::core::gfx::MeshVertex;
-use crate::game::{gameplay, profile};
+use crate::game::profile;
 use crate::screens::gameplay as gameplay_screen;
 use crate::test_support::{compose_scenarios, notefield_bench};
-use crate::ui::actors::Actor;
+use deadlib_present::actors::Actor;
+use deadlib_render::MeshVertex;
+use deadsync_gameplay::AutosyncMode;
+use deadsync_profile as profile_data;
 use std::sync::Arc;
 
 pub const SCENARIO_NAME: &str = "gameplay";
 
 pub struct GameplayBenchFixture {
-    base: notefield_bench::NotefieldBenchFixture,
+    state: gameplay_screen::State,
     asset_manager: AssetManager,
 }
 
 impl GameplayBenchFixture {
-    pub fn build(&self, retained: bool) -> Vec<Actor> {
+    pub fn build(&mut self, retained: bool) -> Vec<Actor> {
         if !retained {
-            for cache in &self.base.state().notefield_model_cache {
+            for cache in &self.state.notefield_model_cache {
                 cache.borrow_mut().clear();
             }
         }
-        gameplay_screen::get_actors(self.base.state(), &self.asset_manager)
+        let mut actors = Vec::new();
+        gameplay_screen::push_actors(
+            &mut actors,
+            &mut self.state,
+            &self.asset_manager,
+            gameplay_screen::ActorViewOverride::default(),
+        );
+        actors
     }
 }
 
 pub fn fixture() -> GameplayBenchFixture {
-    profile::set_session_play_style(profile::PlayStyle::Single);
-    profile::set_session_player_side(profile::PlayerSide::P1);
+    profile::set_session_play_style(profile_data::PlayStyle::Single);
+    profile::set_session_player_side(profile_data::PlayerSide::P1);
     profile::set_session_joined(true, false);
 
     let mut base = notefield_bench::fixture();
     {
         let state = base.state_mut();
-        state.song_full_title = Arc::from("Gameplay Screen Benchmark");
-        state.stage_intro_text = Arc::from("STAGE 1");
-        state.background_texture_key = "bench/gameplay_bg.png".to_string();
-        state.autoplay_enabled = true;
-        state.replay_status_text = Some(Arc::from("REPLAY BENCH"));
-        state.sync_overlay_message = Some(Arc::from("Clock drift stable"));
-        state.autosync_mode = gameplay::AutosyncMode::Machine;
-        state.initial_global_offset_seconds = -0.021;
-        state.global_offset_seconds = -0.012;
-        state.autosync_standard_deviation = 0.004;
-        state.autosync_offset_sample_count = 11;
-        state.music_rate = 1.15;
-        state.current_music_time_display = 48.25;
-        state.current_music_time_visible[0] = 48.25;
-        state.density_graph_first_second = 0.0;
-        state.density_graph_last_second = 120.0;
-        state.density_graph_top_h = 30.0;
-        state.density_graph_top_w[0] = 214.0;
-        state.density_graph_top_scale_y[0] = 0.85;
-        state.density_graph_top_mesh[0] = Some(top_graph_mesh());
-        state.players[0].life = 0.734;
-        state.player_profiles[0].nps_graph_at_top = true;
-        state.player_profiles[0].show_ex_score = true;
-        state.player_profiles[0].show_hard_ex_score = true;
-        state.player_profiles[0].show_life_percent = true;
-        state.player_profiles[0].hide_score = false;
-        state.player_profiles[0].hide_lifebar = false;
-        state.player_profiles[0].hide_song_bg = false;
-        state.player_profiles[0].data_visualizations = profile::DataVisualizations::None;
+        state.set_autoplay_enabled_for_benchmark(true);
+        state.set_global_offsets(-0.021, -0.012);
+        state.set_autosync_state_for_benchmark(AutosyncMode::Machine, 0.004, 11);
+        state.set_music_rate(1.15);
+        state.set_song_position_for_benchmark(
+            state.current_beat(),
+            state.current_music_time_ns(),
+            state.current_beat_display(),
+            48.25,
+        );
+        state.set_visible_time(0, 48_250_000_000, 48.25, state.visible_beat(0));
+        state.set_density_graph_top_for_benchmark(0.0, 120.0, 0, 214.0, 30.0, 0.85);
+        state.update_player(0, |player| {
+            player.life = 0.734;
+        });
+        state.update_profile(0, |profile| {
+            profile.nps_graph_at_top = true;
+            profile.show_ex_score = true;
+            profile.show_hard_ex_score = true;
+            profile.show_life_percent = true;
+            profile.hide_score = false;
+            profile.hide_lifebar = false;
+            profile.hide_song_bg = false;
+            profile.step_statistics = profile_data::StepStatisticsMask::empty();
+        });
     }
+    let (state, noteskin_assets, _) = base.into_parts();
+    let mut state = gameplay_screen::State::from_gameplay(state, noteskin_assets);
+    state.song_full_title = Arc::from("Gameplay Screen Benchmark");
+    state.stage_intro_text = Arc::from("STAGE 1");
+    state.replay_status_text = Some(Arc::from("REPLAY BENCH"));
+    state.background_texture_key = Arc::from("bench/gameplay_bg.png");
+    state.density_graph.top_mesh[0] = Some(top_graph_mesh());
 
     let mut asset_manager = AssetManager::new();
     for (name, font) in compose_scenarios::bench_fonts() {
@@ -69,7 +81,7 @@ pub fn fixture() -> GameplayBenchFixture {
     }
 
     GameplayBenchFixture {
-        base,
+        state,
         asset_manager,
     }
 }

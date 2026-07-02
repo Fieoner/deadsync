@@ -1,0 +1,19 @@
+[package]
+name = "deadsync-audio"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0"
+
+[dependencies]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    "cfg(has_jack_audio)",
+    "cfg(has_pipewire_audio)",
+    "cfg(has_pulse_audio)",
+] }
+
+[lints.clippy]
+perf = { level = "warn", priority = -1 }
+
+inline_always = "allow"

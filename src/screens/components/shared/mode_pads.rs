@@ -1,12 +1,14 @@
 use crate::act;
-use crate::core::space::{screen_width, widescale};
+use crate::assets::{FontRole, current_machine_font_key};
 use crate::game::profile;
 use crate::screens::components::shared::pad_display;
-use crate::ui::actors::Actor;
+use deadlib_present::actors::Actor;
+use deadlib_present::space::{screen_width, widescale};
+use deadsync_profile as profile_data;
 
-pub fn build_label(text: &str) -> Actor {
+pub fn build_label(text: String) -> Actor {
     act!(text:
-        font("wendy"):
+        font(current_machine_font_key(FontRole::Header)):
         settext(text):
         align(1.0, 0.5):
         xy(screen_width() - widescale(55.0, 62.0), 15.0):
@@ -17,12 +19,12 @@ pub fn build_label(text: &str) -> Actor {
 }
 
 fn states() -> [bool; 2] {
-    if profile::get_session_play_style() == profile::PlayStyle::Double {
+    if profile::get_session_play_style() == profile_data::PlayStyle::Double {
         return [true, true];
     }
     [
-        profile::is_session_side_joined(profile::PlayerSide::P1),
-        profile::is_session_side_joined(profile::PlayerSide::P2),
+        profile::is_session_side_joined(profile_data::PlayerSide::P1),
+        profile::is_session_side_joined(profile_data::PlayerSide::P2),
     ]
 }
 

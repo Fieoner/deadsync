@@ -1,6 +1,9 @@
 use crate::act;
-use crate::core::space::{is_wide, screen_height, screen_width, widescale};
-use crate::ui::actors::Actor;
+use crate::assets::i18n::tr;
+use crate::assets::{FontRole, current_machine_font_key};
+use deadlib_present::actors::Actor;
+use deadlib_present::space::{is_wide, screen_height, screen_width, widescale};
+use std::sync::Arc;
 
 #[derive(Clone, Copy)]
 pub struct PaneLayout {
@@ -12,21 +15,20 @@ pub struct PaneLayout {
     pub rows: [f32; 3],
 }
 
-#[derive(Clone, Copy)]
-pub struct StatsValues<'a> {
-    pub steps: &'a str,
-    pub mines: &'a str,
-    pub jumps: &'a str,
-    pub hands: &'a str,
-    pub holds: &'a str,
-    pub rolls: &'a str,
+pub struct StatsValues {
+    pub steps: Arc<str>,
+    pub mines: Arc<str>,
+    pub jumps: Arc<str>,
+    pub hands: Arc<str>,
+    pub holds: Arc<str>,
+    pub rolls: Arc<str>,
 }
 
-pub struct StatsPaneParams<'a> {
+pub struct StatsPaneParams {
     pub pane_cx: f32,
     pub accent_color: [f32; 4],
-    pub values: StatsValues<'a>,
-    pub meter: Option<&'a str>,
+    pub values: StatsValues,
+    pub meter: Option<Arc<str>>,
 }
 
 #[inline(always)]
@@ -46,55 +48,60 @@ pub fn layout() -> PaneLayout {
     }
 }
 
-pub fn build_base(p: StatsPaneParams<'_>) -> Vec<Actor> {
+pub fn push_base(out: &mut Vec<Actor>, p: StatsPaneParams) {
+    let StatsPaneParams {
+        pane_cx,
+        accent_color,
+        values,
+        meter,
+    } = p;
     let l = layout();
-    let mut out = Vec::with_capacity(16);
     out.push(act!(quad:
         align(0.5, 0.0):
-        xy(p.pane_cx, l.pane_top):
+        xy(pane_cx, l.pane_top):
         setsize(l.pane_width, l.pane_height):
         z(120):
-        diffuse(p.accent_color[0], p.accent_color[1], p.accent_color[2], 1.0)
+        diffuse(accent_color[0], accent_color[1], accent_color[2], 1.0)
     ));
 
     let stats = [
-        ("Steps", p.values.steps),
-        ("Mines", p.values.mines),
-        ("Jumps", p.values.jumps),
-        ("Hands", p.values.hands),
-        ("Holds", p.values.holds),
-        ("Rolls", p.values.rolls),
+        (tr("Gameplay", "StatsSteps"), values.steps),
+        (tr("Gameplay", "StatsMines"), values.mines),
+        (tr("Gameplay", "StatsJumps"), values.jumps),
+        (tr("Gameplay", "StatsHands"), values.hands),
+        (tr("Gameplay", "StatsHolds"), values.holds),
+        (tr("Gameplay", "StatsRolls"), values.rolls),
     ];
-    for (i, (label, value)) in stats.iter().enumerate() {
+    for (i, (label, value)) in stats.into_iter().enumerate() {
         let (c, r) = (i % 2, i / 2);
         out.push(act!(text:
             font("miso"):
-            settext(*value):
+            settext(value):
             align(1.0, 0.5):
             horizalign(right):
-            xy(p.pane_cx + l.cols[c], l.pane_top + l.rows[r]):
+            xy(pane_cx + l.cols[c], l.pane_top + l.rows[r]):
             zoom(l.text_zoom):
             z(121):
             diffuse(0.0, 0.0, 0.0, 1.0)
         ));
         out.push(act!(text:
             font("miso"):
-            settext(*label):
+            settext(label.clone()):
             align(0.0, 0.5):
-            xy(p.pane_cx + l.cols[c] + 3.0, l.pane_top + l.rows[r]):
+            xy(pane_cx + l.cols[c] + 3.0, l.pane_top + l.rows[r]):
             zoom(l.text_zoom):
             z(121):
             diffuse(0.0, 0.0, 0.0, 1.0)
         ));
     }
 
-    if let Some(meter) = p.meter {
+    if let Some(meter) = meter {
         let mut meter_actor = act!(text:
-            font("wendy"):
+            font(current_machine_font_key(FontRole::Header)):
             settext(meter):
             align(1.0, 0.5):
             horizalign(right):
-            xy(p.pane_cx + l.cols[3], l.pane_top + l.rows[1]):
+            xy(pane_cx + l.cols[3], l.pane_top + l.rows[1]):
             z(121):
             diffuse(0.0, 0.0, 0.0, 1.0)
         );
@@ -105,5 +112,4 @@ pub fn build_base(p: StatsPaneParams<'_>) -> Vec<Actor> {
         }
         out.push(meter_actor);
     }
-    out
 }

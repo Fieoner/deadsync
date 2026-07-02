@@ -1,0 +1,130 @@
+name: release-windows
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_call:
+    inputs:
+      tag:
+        description: "Release tag (example: v0.2.22)"
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (example: v0.2.22)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows
+            arch: x86_64
+            target: ""
+            install_vulkan: true
+          - platform: win7
+            arch: x86_64
+            target: x86_64-win7-windows-msvc
+            install_vulkan: false
+          - platform: win7
+            arch: i686
+            target: i686-win7-windows-msvc
+            install_vulkan: false
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: true
+
+      - name: Install Vulkan SDK
+        if: ${{ matrix.install_vulkan }}
+        shell: pwsh
+        run: scripts/install-vulkan-sdk.ps1
+
+      - name: Install Ninja
+        shell: pwsh
+        run: scripts/install-ninja.ps1
+
+      - name: Install CMake
+        shell: pwsh
+        run: scripts/install-cmake.ps1
+
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ github.event.inputs.tag }}"
+          elif [ "${{ github.event_name }}" = "workflow_call" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+          tag="${tag#refs/tags/}"
+          if [ -z "${tag}" ]; then
+            echo "Release tag is required." >&2
+            exit 1
+          fi
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Rust nightly for Windows 7
+        if: ${{ matrix.platform == 'win7' }}
+        shell: pwsh
+        run: |
+          rustup toolchain install nightly
+          rustup +nightly component add rust-src
+
+      - name: Build release
+        shell: pwsh
+        run: |
+          if ("${{ matrix.target }}" -eq "") {
+            cargo build --release --locked
+          } else {
+            cargo +nightly build -Z build-std=std,panic_abort --release --locked --target "${{ matrix.target }}"
+          }
+
+      - name: Package Windows release
+        id: package
+        shell: pwsh
+        run: |
+          if ("${{ matrix.target }}" -eq "") {
+            scripts/package-windows-release.ps1 -Tag "${{ steps.tag.outputs.tag }}" -Arch "${{ matrix.arch }}" -Platform "${{ matrix.platform }}"
+          } else {
+            scripts/package-windows-release.ps1 -Tag "${{ steps.tag.outputs.tag }}" -Arch "${{ matrix.arch }}" -Platform "${{ matrix.platform }}" -Target "${{ matrix.target }}"
+          }
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: deadsync-${{ matrix.platform }}-${{ steps.tag.outputs.tag }}-${{ matrix.arch }}
+          if-no-files-found: error
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.checksum }}
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          files: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.checksum }}
+          generate_release_notes: true
+          prerelease: ${{ contains(steps.tag.outputs.tag, '-') }}
+          fail_on_unmatched_files: true

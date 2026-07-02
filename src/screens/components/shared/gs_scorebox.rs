@@ -1,21 +1,25 @@
 use crate::act;
 use crate::assets;
+use crate::config::{self, SrpgVariant};
 use crate::game::{profile, scores};
-use crate::ui::actors::Actor;
-use crate::ui::color;
+use deadlib_present::actors::Actor;
+use deadlib_present::cache::{TextCache, cached_text};
+use deadlib_present::color;
+use deadsync_profile as profile_data;
+use deadsync_score as score_data;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
-use std::thread::LocalKey;
 
-const SCOREBOX_NUM_ENTRIES: usize = 5;
+pub(crate) const SCOREBOX_NUM_ENTRIES: usize = 5;
+const SCOREBOX_FETCH_NUM_ENTRIES: usize = 13;
 const SCOREBOX_LOOP_SECONDS: f32 = 5.0;
 const SCOREBOX_TRANSITION_SECONDS: f32 = 1.0;
 const SCOREBOX_W: f32 = 162.0;
 const SCOREBOX_H: f32 = 80.0;
 const SCOREBOX_BORDER: f32 = 5.0;
 const SCOREBOX_GS_BLUE: [f32; 4] = color::rgba_hex("#007b85");
-const SCOREBOX_RPG_YELLOW: [f32; 4] = [1.0, 0.972, 0.792, 1.0];
+const SCOREBOX_SRPG_YELLOW: [f32; 4] = [1.0, 0.972, 0.792, 1.0];
 const SCOREBOX_ITL_PINK: [f32; 4] = [1.0, 0.2, 0.406, 1.0];
 const SCOREBOX_SELF: [f32; 4] = color::rgba_hex("#A1FF94");
 const SCOREBOX_RIVAL: [f32; 4] = color::rgba_hex("#C29CFF");
@@ -25,38 +29,17 @@ const SCOREBOX_EX_TEXT_ALPHA: f32 = 0.3;
 const SCOREBOX_HARD_EX_TEXT_ALPHA: f32 = 0.32;
 const SCOREBOX_ARROWCLOUD_LOGO_ALPHA: f32 = 0.5;
 const SCOREBOX_ARROWCLOUD_LOGO_ZOOM: f32 = 0.06;
-const SCOREBOX_RPG_LOGO_ALPHA: f32 = 0.5;
+const SCOREBOX_SRPG_LOGO_ALPHA: f32 = 0.5;
 const SCOREBOX_ITL_LOGO_ALPHA: f32 = 0.2;
 const SCOREBOX_LOGO_MAX_W_FRAC: f32 = 0.94;
 const SCOREBOX_LOGO_MAX_H_FRAC: f32 = 0.94;
 const SCOREBOX_HARD_EX_BORDER_TINT: f32 = 0.35;
 const TEXT_CACHE_LIMIT: usize = 8192;
 
-type TextCache<K> = HashMap<K, Arc<str>>;
-
 thread_local! {
     static SCORE_PERCENT_TEXT_CACHE: RefCell<TextCache<u64>> = RefCell::new(HashMap::with_capacity(2048));
     static SCORE_VALUE_TEXT_CACHE: RefCell<TextCache<u64>> = RefCell::new(HashMap::with_capacity(2048));
     static RANK_TEXT_CACHE: RefCell<TextCache<u32>> = RefCell::new(HashMap::with_capacity(512));
-}
-
-#[inline(always)]
-fn cached_text<K, F>(cache: &'static LocalKey<RefCell<TextCache<K>>>, key: K, build: F) -> Arc<str>
-where
-    K: Copy + Eq + std::hash::Hash,
-    F: FnOnce() -> String,
-{
-    cache.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if let Some(text) = cache.get(&key) {
-            return text.clone();
-        }
-        let text: Arc<str> = Arc::<str>::from(build());
-        if cache.len() < TEXT_CACHE_LIMIT {
-            cache.insert(key, text.clone());
-        }
-        text
-    })
 }
 
 #[inline(always)]
@@ -78,15 +61,18 @@ fn cached_percent_text(percent: f64) -> Arc<str> {
     } else {
         0.0
     };
-    cached_text(&SCORE_PERCENT_TEXT_CACHE, percent.to_bits(), || {
-        format!("{percent:.2}%")
-    })
+    cached_text(
+        &SCORE_PERCENT_TEXT_CACHE,
+        percent.to_bits(),
+        TEXT_CACHE_LIMIT,
+        || format!("{percent:.2}%"),
+    )
 }
 
 #[derive(Clone, Debug)]
-struct GameplayScoreboxRow<'a> {
+struct GameplayScoreboxRow {
     rank: Arc<str>,
-    name: &'a str,
+    name: Arc<str>,
     score: Arc<str>,
     rank_color: [f32; 4],
     name_color: [f32; 4],
@@ -94,11 +80,12 @@ struct GameplayScoreboxRow<'a> {
 }
 
 #[derive(Clone, Debug)]
-struct GameplayScoreboxPane<'a> {
+struct GameplayScoreboxPane {
     kind: PaneKind,
-    mode_text: &'a str,
+    is_arrowcloud: bool,
+    mode_text: Arc<str>,
     border_color: [f32; 4],
-    rows: [GameplayScoreboxRow<'a>; SCOREBOX_NUM_ENTRIES],
+    rows: [GameplayScoreboxRow; SCOREBOX_NUM_ENTRIES],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -115,7 +102,7 @@ enum PaneKind {
     Gs,
     Ex,
     HardEx,
-    Rpg,
+    Srpg,
     Itl,
     Other,
 }
@@ -172,14 +159,14 @@ const fn select_music_filter_allows_kind(kind: PaneKind, filter: SelectMusicPane
         PaneKind::Gs => filter.itg,
         PaneKind::Ex => filter.ex,
         PaneKind::HardEx => filter.hard_ex,
-        PaneKind::Rpg | PaneKind::Itl | PaneKind::Other => filter.tournaments,
+        PaneKind::Srpg | PaneKind::Itl | PaneKind::Other => filter.tournaments,
     }
 }
 
-fn select_music_filtered_panes<'a>(
-    panes: &'a [scores::LeaderboardPane],
+fn select_music_filtered_panes(
+    panes: &[score_data::LeaderboardPane],
     filter: SelectMusicPaneFilter,
-) -> Vec<&'a scores::LeaderboardPane> {
+) -> Vec<&score_data::LeaderboardPane> {
     let mut out = Vec::with_capacity(panes.len());
     for pane in panes {
         if select_music_filter_allows_kind(pane_kind(pane), filter) {
@@ -190,9 +177,15 @@ fn select_music_filtered_panes<'a>(
 }
 
 #[inline(always)]
-fn pane_kind(pane: &scores::LeaderboardPane) -> PaneKind {
+fn pane_kind(pane: &score_data::LeaderboardPane) -> PaneKind {
     if pane.is_arrowcloud() {
-        return PaneKind::HardEx;
+        return if pane.is_hard_ex() {
+            PaneKind::HardEx
+        } else if pane.is_ex {
+            PaneKind::Ex
+        } else {
+            PaneKind::Gs
+        };
     }
     if pane.is_groovestats() {
         return if pane.is_ex {
@@ -202,8 +195,8 @@ fn pane_kind(pane: &scores::LeaderboardPane) -> PaneKind {
         };
     }
     let lower = pane.name.to_ascii_lowercase();
-    if lower.contains("rpg") {
-        PaneKind::Rpg
+    if lower.contains("srpg") || lower.contains("rpg") {
+        PaneKind::Srpg
     } else if lower.contains("itl") {
         PaneKind::Itl
     } else if pane.is_ex {
@@ -214,12 +207,12 @@ fn pane_kind(pane: &scores::LeaderboardPane) -> PaneKind {
 }
 
 #[inline(always)]
-fn pane_mode_text<'a>(kind: PaneKind, pane: &'a scores::LeaderboardPane) -> &'a str {
+fn pane_mode_text(kind: PaneKind, pane: &score_data::LeaderboardPane) -> &str {
     match kind {
         PaneKind::Gs => "ITG",
         PaneKind::Ex => "EX",
         PaneKind::HardEx => "H.EX",
-        PaneKind::Rpg => "RPG",
+        PaneKind::Srpg => "SRPG",
         PaneKind::Itl => "ITL",
         PaneKind::Other => pane.name.as_str(),
     }
@@ -241,7 +234,7 @@ fn pane_color(kind: PaneKind) -> [f32; 4] {
                     * SCOREBOX_HARD_EX_BORDER_TINT,
             1.0,
         ],
-        PaneKind::Rpg => SCOREBOX_RPG_YELLOW,
+        PaneKind::Srpg => SCOREBOX_SRPG_YELLOW,
         PaneKind::Itl => SCOREBOX_ITL_PINK,
     }
 }
@@ -271,20 +264,143 @@ fn score_text_without_percent(score_10000: f64) -> Arc<str> {
     } else {
         0.0
     };
-    cached_text(&SCORE_VALUE_TEXT_CACHE, score.to_bits(), || {
-        format!("{score:.2}")
-    })
+    cached_text(
+        &SCORE_VALUE_TEXT_CACHE,
+        score.to_bits(),
+        TEXT_CACHE_LIMIT,
+        || format!("{score:.2}"),
+    )
 }
 
 #[inline(always)]
 fn rank_text(rank: u32) -> Arc<str> {
-    cached_text(&RANK_TEXT_CACHE, rank, || format!("{rank}."))
+    cached_text(&RANK_TEXT_CACHE, rank, TEXT_CACHE_LIMIT, || {
+        format!("{rank}.")
+    })
+}
+
+#[inline(always)]
+fn owned_text(text: &str) -> Arc<str> {
+    Arc::<str>::from(text)
+}
+
+fn local_self_machine_tag(side: profile_data::PlayerSide) -> Option<String> {
+    let initials = profile::get_for_side(side).player_initials;
+    let initials = initials.trim();
+    if initials.is_empty() {
+        None
+    } else {
+        Some(initials.to_string())
+    }
+}
+
+fn local_self_scorebox_name(side: profile_data::PlayerSide) -> String {
+    let profile = profile::get_for_side(side);
+    let fallback = [
+        profile.display_name.as_str(),
+        profile.groovestats_username.as_str(),
+        profile.player_initials.as_str(),
+    ]
+    .into_iter()
+    .map(str::trim)
+    .find(|value| !value.is_empty())
+    .unwrap_or("----");
+    let tag = local_self_machine_tag(side);
+    machine_tag(tag.as_deref(), fallback)
+}
+
+fn leaderboard_entry_matches_local_self(
+    side: profile_data::PlayerSide,
+    entry: &score_data::LeaderboardEntry,
+) -> bool {
+    let profile = profile::get_for_side(side);
+    let name = entry.name.trim();
+    if name.is_empty() {
+        return false;
+    }
+    [
+        profile.groovestats_username.as_str(),
+        profile.display_name.as_str(),
+        profile.player_initials.as_str(),
+    ]
+    .into_iter()
+    .map(str::trim)
+    .any(|candidate| !candidate.is_empty() && candidate.eq_ignore_ascii_case(name))
+}
+
+fn local_self_score_10000(
+    side: profile_data::PlayerSide,
+    chart_hash: &str,
+    kind: PaneKind,
+) -> Option<(f64, bool)> {
+    match kind {
+        PaneKind::Gs => {
+            let score = scores::get_cached_local_score_for_side(chart_hash, side)?;
+            Some((
+                score.score_percent * 10000.0,
+                score.grade == score_data::Grade::Failed,
+            ))
+        }
+        PaneKind::Ex => {
+            let score = scores::get_cached_local_ex_score_for_side(chart_hash, side)?;
+            Some((score.percent * 100.0, score.is_fail))
+        }
+        PaneKind::HardEx => {
+            let score = scores::get_cached_local_hard_ex_score_for_side(chart_hash, side)?;
+            Some((score.percent * 100.0, score.is_fail))
+        }
+        PaneKind::Itl => scores::get_cached_itl_score_for_side(chart_hash, side)
+            .map(|score| (f64::from(score.ex_hundredths), false)),
+        PaneKind::Srpg | PaneKind::Other => None,
+    }
+}
+
+pub(crate) fn entries_with_local_self_state(
+    side: profile_data::PlayerSide,
+    chart_hash: Option<&str>,
+    pane: &score_data::LeaderboardPane,
+) -> Vec<score_data::LeaderboardEntry> {
+    let kind = pane_kind(pane);
+    let mut entries = pane.entries.clone();
+    let local_self = chart_hash.and_then(|hash| local_self_score_10000(side, hash, kind));
+
+    if let Some(entry) = entries.iter_mut().find(|entry| entry.is_self) {
+        if let Some((local_score_10000, local_is_fail)) = local_self
+            && local_is_fail
+            && score_data::same_score_10000(entry.score, local_score_10000)
+        {
+            entry.is_fail = true;
+            if entry.machine_tag.is_none() {
+                entry.machine_tag = local_self_machine_tag(side);
+            }
+        }
+        return entries;
+    }
+
+    if let Some(entry) = entries
+        .iter_mut()
+        .find(|entry| leaderboard_entry_matches_local_self(side, entry))
+    {
+        entry.is_self = true;
+        if entry.machine_tag.is_none() {
+            entry.machine_tag = local_self_machine_tag(side);
+        }
+        if let Some((local_score_10000, local_is_fail)) = local_self
+            && local_is_fail
+            && score_data::same_score_10000(entry.score, local_score_10000)
+        {
+            entry.is_fail = true;
+        }
+        return entries;
+    }
+
+    entries
 }
 
 fn preferred_primary_pane<'a>(
-    panes: &'a [&'a scores::LeaderboardPane],
+    panes: &'a [&'a score_data::LeaderboardPane],
     show_ex: bool,
-) -> Option<&'a scores::LeaderboardPane> {
+) -> Option<&'a score_data::LeaderboardPane> {
     let want = if show_ex { PaneKind::Ex } else { PaneKind::Gs };
     panes
         .iter()
@@ -306,16 +422,17 @@ fn preferred_primary_pane<'a>(
 }
 
 #[inline(always)]
-fn default_mode_text_for_side(side: profile::PlayerSide) -> &'static str {
-    if profile::get_for_side(side).show_ex_score {
-        "EX"
-    } else {
-        "ITG"
-    }
+fn default_mode_text(show_ex_score: bool) -> &'static str {
+    if show_ex_score { "EX" } else { "ITG" }
+}
+
+#[inline(always)]
+fn default_mode_text_for_side(side: profile_data::PlayerSide) -> &'static str {
+    default_mode_text(profile::get_for_side(side).show_ex_score)
 }
 
 pub fn select_music_scorebox_view(
-    side: profile::PlayerSide,
+    side: profile_data::PlayerSide,
     chart_hash: Option<&str>,
     fallback_machine: (String, Arc<str>),
     fallback_player: (String, Arc<str>),
@@ -348,7 +465,7 @@ pub fn select_music_scorebox_view(
         return view;
     };
     let Some(snapshot) =
-        scores::get_or_fetch_player_leaderboards_for_side(hash, side, SCOREBOX_NUM_ENTRIES)
+        scores::get_or_fetch_player_leaderboards_for_side(hash, side, SCOREBOX_FETCH_NUM_ENTRIES)
     else {
         return view;
     };
@@ -373,23 +490,29 @@ pub fn select_music_scorebox_view(
     };
 
     let kind = pane_kind(pane);
+    let entries = entries_with_local_self_state(side, Some(hash), pane);
     view.mode_text = pane_mode_text(kind, pane).to_string();
+    if entries.is_empty() {
+        view.loading_text = Some("No Scores".to_string());
+        return view;
+    }
 
-    if let Some(world) = pane
-        .entries
+    if let Some(world) = entries
         .iter()
         .find(|entry| entry.rank == 1)
-        .or_else(|| pane.entries.first())
+        .or_else(|| entries.first())
     {
         view.machine_name = machine_tag(world.machine_tag.as_deref(), &world.name);
         view.machine_score = score_text_with_percent(world.score);
     }
-    if let Some(player_entry) = pane.entries.iter().find(|entry| entry.is_self) {
+    if let Some(player_entry) = entries.iter().find(|entry| entry.is_self) {
         view.player_name = machine_tag(player_entry.machine_tag.as_deref(), &player_entry.name);
         view.player_score = score_text_with_percent(player_entry.score);
+    } else if let Some((local_score_10000, _)) = local_self_score_10000(side, hash, kind) {
+        view.player_name = local_self_scorebox_name(side);
+        view.player_score = score_text_with_percent(local_score_10000);
     }
-    for (idx, rival) in pane
-        .entries
+    for (idx, rival) in entries
         .iter()
         .filter(|entry| entry.is_rival)
         .take(3)
@@ -403,7 +526,7 @@ pub fn select_music_scorebox_view(
     view
 }
 
-pub fn select_music_mode_text(side: profile::PlayerSide, chart_hash: Option<&str>) -> String {
+pub fn select_music_mode_text(side: profile_data::PlayerSide, chart_hash: Option<&str>) -> String {
     select_music_scorebox_view(
         side,
         chart_hash,
@@ -414,10 +537,10 @@ pub fn select_music_mode_text(side: profile::PlayerSide, chart_hash: Option<&str
 }
 
 #[inline(always)]
-fn gameplay_empty_row<'a>() -> GameplayScoreboxRow<'a> {
+fn gameplay_empty_row() -> GameplayScoreboxRow {
     GameplayScoreboxRow {
         rank: empty_text(),
-        name: "",
+        name: empty_text(),
         score: empty_text(),
         rank_color: [1.0; 4],
         name_color: [1.0; 4],
@@ -426,10 +549,10 @@ fn gameplay_empty_row<'a>() -> GameplayScoreboxRow<'a> {
 }
 
 #[inline(always)]
-fn gameplay_status_row<'a>(text: &'a str) -> GameplayScoreboxRow<'a> {
+fn gameplay_status_row(text: &str) -> GameplayScoreboxRow {
     GameplayScoreboxRow {
         rank: empty_text(),
-        name: text,
+        name: owned_text(text),
         score: empty_text(),
         rank_color: [1.0; 4],
         name_color: [1.0; 4],
@@ -437,30 +560,38 @@ fn gameplay_status_row<'a>(text: &'a str) -> GameplayScoreboxRow<'a> {
     }
 }
 
-fn empty_rows<'a>() -> [GameplayScoreboxRow<'a>; SCOREBOX_NUM_ENTRIES] {
+fn empty_rows() -> [GameplayScoreboxRow; SCOREBOX_NUM_ENTRIES] {
     std::array::from_fn(|_| gameplay_empty_row())
 }
 
-fn gameplay_status_pane<'a>(side: profile::PlayerSide, text: &'a str) -> GameplayScoreboxPane<'a> {
+fn gameplay_status_pane(show_ex_score: bool, text: &str) -> GameplayScoreboxPane {
     let mut rows = empty_rows();
     rows[0] = gameplay_status_row(text);
-    let kind = if profile::get_for_side(side).show_ex_score {
+    let kind = if show_ex_score {
         PaneKind::Ex
     } else {
         PaneKind::Gs
     };
     GameplayScoreboxPane {
         kind,
-        mode_text: default_mode_text_for_side(side),
+        is_arrowcloud: false,
+        mode_text: owned_text(default_mode_text(show_ex_score)),
         border_color: SCOREBOX_GS_BLUE,
         rows,
     }
 }
 
-fn gameplay_row_from_entry<'a>(
-    entry: &'a scores::LeaderboardEntry,
+fn gameplay_status_pane_for_side(
+    side: profile_data::PlayerSide,
+    text: &str,
+) -> GameplayScoreboxPane {
+    gameplay_status_pane(profile::get_for_side(side).show_ex_score, text)
+}
+
+fn gameplay_row_from_entry(
+    entry: &score_data::LeaderboardEntry,
     kind: PaneKind,
-) -> GameplayScoreboxRow<'a> {
+) -> GameplayScoreboxRow {
     let mut rank_color = [1.0; 4];
     let mut name_color = [1.0; 4];
     if entry.is_self {
@@ -473,7 +604,7 @@ fn gameplay_row_from_entry<'a>(
 
     let score_color = if entry.is_fail {
         [1.0, 0.0, 0.0, 1.0]
-    } else if matches!(kind, PaneKind::Ex) {
+    } else if matches!(kind, PaneKind::Ex | PaneKind::Itl) {
         color::JUDGMENT_RGBA[0]
     } else if matches!(kind, PaneKind::HardEx) {
         color::HARD_EX_SCORE_RGBA
@@ -492,7 +623,7 @@ fn gameplay_row_from_entry<'a>(
 
     GameplayScoreboxRow {
         rank: rank_text(entry.rank),
-        name,
+        name: owned_text(name),
         score: score_text_without_percent(entry.score),
         rank_color,
         name_color,
@@ -501,13 +632,16 @@ fn gameplay_row_from_entry<'a>(
 }
 
 #[inline(always)]
-fn same_leaderboard_entry(a: &scores::LeaderboardEntry, b: &scores::LeaderboardEntry) -> bool {
+fn same_leaderboard_entry(
+    a: &score_data::LeaderboardEntry,
+    b: &score_data::LeaderboardEntry,
+) -> bool {
     a.rank == b.rank && a.name.eq_ignore_ascii_case(b.name.as_str())
 }
 
 fn selected_contains(
-    selected: &[Option<&scores::LeaderboardEntry>; SCOREBOX_NUM_ENTRIES],
-    entry: &scores::LeaderboardEntry,
+    selected: &[Option<&score_data::LeaderboardEntry>; SCOREBOX_NUM_ENTRIES],
+    entry: &score_data::LeaderboardEntry,
 ) -> bool {
     selected
         .iter()
@@ -516,9 +650,9 @@ fn selected_contains(
 }
 
 fn push_selected_entry<'a>(
-    selected: &mut [Option<&'a scores::LeaderboardEntry>; SCOREBOX_NUM_ENTRIES],
+    selected: &mut [Option<&'a score_data::LeaderboardEntry>; SCOREBOX_NUM_ENTRIES],
     len: &mut usize,
-    entry: &'a scores::LeaderboardEntry,
+    entry: &'a score_data::LeaderboardEntry,
 ) {
     if *len >= SCOREBOX_NUM_ENTRIES || selected_contains(selected, entry) {
         return;
@@ -528,33 +662,27 @@ fn push_selected_entry<'a>(
 }
 
 fn next_best_entry<'a>(
-    entries: &'a [scores::LeaderboardEntry],
-    selected: &[Option<&'a scores::LeaderboardEntry>; SCOREBOX_NUM_ENTRIES],
-    include: impl Fn(&scores::LeaderboardEntry) -> bool,
-) -> Option<&'a scores::LeaderboardEntry> {
+    entries: &'a [score_data::LeaderboardEntry],
+    selected: &[Option<&'a score_data::LeaderboardEntry>; SCOREBOX_NUM_ENTRIES],
+    include: impl Fn(&score_data::LeaderboardEntry) -> bool,
+) -> Option<&'a score_data::LeaderboardEntry> {
     entries
         .iter()
         .filter(|entry| include(entry) && !selected_contains(selected, entry))
         .min_by_key(|entry| entry.rank)
 }
 
-fn scorebox_rows_for_kind<'a>(
-    entries: &'a [scores::LeaderboardEntry],
+fn scorebox_rows_for_kind(
+    entries: &[score_data::LeaderboardEntry],
     kind: PaneKind,
-) -> [GameplayScoreboxRow<'a>; SCOREBOX_NUM_ENTRIES] {
+) -> [GameplayScoreboxRow; SCOREBOX_NUM_ENTRIES] {
     let mut rows = empty_rows();
     if entries.is_empty() {
         rows[0] = gameplay_status_row("No Scores");
         return rows;
     }
-    if !matches!(kind, PaneKind::HardEx) {
-        for (slot, entry) in rows.iter_mut().zip(entries.iter()) {
-            *slot = gameplay_row_from_entry(entry, kind);
-        }
-        return rows;
-    }
 
-    let mut selected: [Option<&scores::LeaderboardEntry>; SCOREBOX_NUM_ENTRIES] =
+    let mut selected: [Option<&score_data::LeaderboardEntry>; SCOREBOX_NUM_ENTRIES] =
         [None; SCOREBOX_NUM_ENTRIES];
     let mut len = 0usize;
 
@@ -591,56 +719,84 @@ fn scorebox_rows_for_kind<'a>(
     rows
 }
 
-fn gameplay_pane_from_leaderboard<'a>(
-    pane: &'a scores::LeaderboardPane,
-) -> GameplayScoreboxPane<'a> {
+fn gameplay_pane_from_leaderboard(
+    pane: &score_data::LeaderboardPane,
+    entries: &[score_data::LeaderboardEntry],
+) -> GameplayScoreboxPane {
     let kind = pane_kind(pane);
     GameplayScoreboxPane {
         kind,
-        mode_text: pane_mode_text(kind, pane),
+        is_arrowcloud: pane.is_arrowcloud(),
+        mode_text: owned_text(pane_mode_text(kind, pane)),
         border_color: pane_color(kind),
-        rows: scorebox_rows_for_kind(pane.entries.as_slice(), kind),
+        rows: scorebox_rows_for_kind(entries, kind),
     }
 }
 
-fn gameplay_panes_from_snapshot<'a>(
-    snapshot: &'a scores::CachedPlayerLeaderboardData,
-    side: profile::PlayerSide,
-) -> Vec<GameplayScoreboxPane<'a>> {
+fn gameplay_panes_from_snapshot(
+    snapshot: &score_data::CachedPlayerLeaderboardData,
+    profile_snapshot: &score_data::GameplayScoreboxProfileSnapshot,
+) -> Vec<GameplayScoreboxPane> {
     if snapshot.loading {
-        return vec![gameplay_status_pane(side, "Loading ...")];
+        return vec![gameplay_status_pane(
+            profile_snapshot.show_ex_score,
+            "Loading ...",
+        )];
     }
     if let Some(error) = snapshot.error.as_deref() {
         let text = error_text(error);
-        return vec![gameplay_status_pane(side, &text)];
+        return vec![gameplay_status_pane(profile_snapshot.show_ex_score, text)];
     }
     let Some(data) = snapshot.data.as_ref() else {
-        return vec![gameplay_status_pane(side, "No Scores")];
+        return vec![gameplay_status_pane(
+            profile_snapshot.show_ex_score,
+            "No Scores",
+        )];
     };
     if data.panes.is_empty() {
-        return vec![gameplay_status_pane(side, "No Scores")];
+        return vec![gameplay_status_pane(
+            profile_snapshot.show_ex_score,
+            "No Scores",
+        )];
     }
 
-    let mut panes = Vec::with_capacity(data.panes.len());
-    for pane in &data.panes {
-        panes.push(gameplay_pane_from_leaderboard(pane));
+    let filter = select_music_pane_filter();
+    if !select_music_filter_has_any(filter) {
+        return Vec::new();
+    }
+
+    let filtered = select_music_filtered_panes(data.panes.as_slice(), filter);
+    if filtered.is_empty() {
+        return vec![gameplay_status_pane(
+            profile_snapshot.show_ex_score,
+            "No Scores",
+        )];
+    }
+
+    let mut panes = Vec::with_capacity(filtered.len());
+    for pane in filtered {
+        panes.push(gameplay_pane_from_leaderboard(
+            pane,
+            pane.entries.as_slice(),
+        ));
     }
     panes
 }
 
-fn select_music_panes_from_snapshot<'a>(
-    snapshot: &'a scores::CachedPlayerLeaderboardData,
-    side: profile::PlayerSide,
-) -> Vec<GameplayScoreboxPane<'a>> {
+fn select_music_panes_from_snapshot(
+    snapshot: &score_data::CachedPlayerLeaderboardData,
+    side: profile_data::PlayerSide,
+    chart_hash: Option<&str>,
+) -> Vec<GameplayScoreboxPane> {
     if snapshot.loading {
-        return vec![gameplay_status_pane(side, "Loading ...")];
+        return vec![gameplay_status_pane_for_side(side, "Loading ...")];
     }
     if let Some(error) = snapshot.error.as_deref() {
         let text = error_text(error);
-        return vec![gameplay_status_pane(side, &text)];
+        return vec![gameplay_status_pane_for_side(side, text)];
     }
     let Some(data) = snapshot.data.as_ref() else {
-        return vec![gameplay_status_pane(side, "No Scores")];
+        return vec![gameplay_status_pane_for_side(side, "No Scores")];
     };
     let filter = select_music_pane_filter();
     if !select_music_filter_has_any(filter) {
@@ -649,11 +805,12 @@ fn select_music_panes_from_snapshot<'a>(
 
     let filtered = select_music_filtered_panes(data.panes.as_slice(), filter);
     if filtered.is_empty() {
-        return vec![gameplay_status_pane(side, "No Scores")];
+        return vec![gameplay_status_pane_for_side(side, "No Scores")];
     }
     let mut panes = Vec::with_capacity(filtered.len());
     for pane in filtered {
-        panes.push(gameplay_pane_from_leaderboard(pane));
+        let entries = entries_with_local_self_state(side, chart_hash, pane);
+        panes.push(gameplay_pane_from_leaderboard(pane, entries.as_slice()));
     }
     panes
 }
@@ -686,27 +843,27 @@ fn color_with_alpha(mut rgba: [f32; 4], alpha: f32) -> [f32; 4] {
 }
 
 #[inline(always)]
-fn is_gs_logo(kind: PaneKind) -> bool {
-    matches!(kind, PaneKind::Gs | PaneKind::Ex)
+fn is_gs_logo(pane: &GameplayScoreboxPane) -> bool {
+    !pane.is_arrowcloud && matches!(pane.kind, PaneKind::Gs | PaneKind::Ex)
 }
 
 #[inline(always)]
-fn is_ex_text(kind: PaneKind) -> bool {
-    matches!(kind, PaneKind::Ex)
+fn is_ex_text(pane: &GameplayScoreboxPane) -> bool {
+    matches!(pane.kind, PaneKind::Ex)
 }
 
-fn is_arrowcloud_logo(kind: PaneKind) -> bool {
-    matches!(kind, PaneKind::HardEx)
-}
-
-#[inline(always)]
-fn is_hard_ex_text(kind: PaneKind) -> bool {
-    matches!(kind, PaneKind::HardEx)
+fn is_arrowcloud_logo(pane: &GameplayScoreboxPane) -> bool {
+    pane.is_arrowcloud
 }
 
 #[inline(always)]
-fn is_rpg_logo(kind: PaneKind) -> bool {
-    matches!(kind, PaneKind::Rpg)
+fn is_hard_ex_text(pane: &GameplayScoreboxPane) -> bool {
+    matches!(pane.kind, PaneKind::HardEx)
+}
+
+#[inline(always)]
+fn is_srpg_logo(kind: PaneKind) -> bool {
+    matches!(kind, PaneKind::Srpg)
 }
 
 #[inline(always)]
@@ -715,8 +872,9 @@ fn is_itl_logo(kind: PaneKind) -> bool {
 }
 
 #[inline(always)]
-fn is_fallback_text(kind: PaneKind) -> bool {
-    matches!(kind, PaneKind::Other)
+fn is_fallback_text(pane: &GameplayScoreboxPane) -> bool {
+    matches!(pane.kind, PaneKind::Other)
+        || (pane.is_arrowcloud && matches!(pane.kind, PaneKind::Gs))
 }
 
 fn logo_alpha(
@@ -816,7 +974,7 @@ fn push_mode_text(
     let c = color_with_alpha([1.0, 1.0, 1.0, SCOREBOX_MODE_ALPHA], alpha);
     actors.push(act!(text:
         font("miso"):
-        settext(text):
+        settext(text.to_owned()):
         align(0.5, 0.5):
         xy(center_x + 2.0 * zoom, center_y - 5.0 * zoom):
         zoom(0.9 * zoom):
@@ -875,7 +1033,7 @@ fn push_mode_overlay(
     let c = color_with_alpha(rgba, alpha);
     actors.push(act!(text:
         font("miso"):
-        settext(text):
+        settext(text.to_owned()):
         align(0.5, 0.5):
         xy(center_x + 2.0 * zoom, center_y - 5.0 * zoom):
         zoom(0.9 * zoom):
@@ -888,17 +1046,17 @@ fn push_mode_overlay(
 fn push_fallback_mode_text(
     actors: &mut Vec<Actor>,
     cycle: ScoreboxCycleState,
-    cur: &GameplayScoreboxPane<'_>,
-    next: &GameplayScoreboxPane<'_>,
+    cur: &GameplayScoreboxPane,
+    next: &GameplayScoreboxPane,
     center_x: f32,
     center_y: f32,
     zoom: f32,
     z_base: i16,
 ) {
-    if is_fallback_text(cur.kind) {
+    if is_fallback_text(cur) {
         push_mode_text(
             actors,
-            cur.mode_text,
+            cur.mode_text.as_ref(),
             center_x,
             center_y,
             zoom,
@@ -906,10 +1064,10 @@ fn push_fallback_mode_text(
             cycle.cur_alpha,
         );
     }
-    if cycle.next_idx != cycle.cur_idx && is_fallback_text(next.kind) {
+    if cycle.next_idx != cycle.cur_idx && is_fallback_text(next) {
         push_mode_text(
             actors,
-            next.mode_text,
+            next.mode_text.as_ref(),
             center_x,
             center_y,
             zoom,
@@ -922,8 +1080,8 @@ fn push_fallback_mode_text(
 fn push_gs_logo_overlay(
     actors: &mut Vec<Actor>,
     cycle: ScoreboxCycleState,
-    cur: PaneKind,
-    next: PaneKind,
+    cur: &GameplayScoreboxPane,
+    next: &GameplayScoreboxPane,
     center_x: f32,
     center_y: f32,
     zoom: f32,
@@ -951,8 +1109,8 @@ fn push_gs_logo_overlay(
 fn push_arrowcloud_logo_overlay(
     actors: &mut Vec<Actor>,
     cycle: ScoreboxCycleState,
-    cur: PaneKind,
-    next: PaneKind,
+    cur: &GameplayScoreboxPane,
+    next: &GameplayScoreboxPane,
     center_x: f32,
     center_y: f32,
     zoom: f32,
@@ -980,8 +1138,8 @@ fn push_arrowcloud_logo_overlay(
 fn push_ex_header_overlay(
     actors: &mut Vec<Actor>,
     cycle: ScoreboxCycleState,
-    cur: PaneKind,
-    next: PaneKind,
+    cur: &GameplayScoreboxPane,
+    next: &GameplayScoreboxPane,
     center_x: f32,
     center_y: f32,
     zoom: f32,
@@ -1002,8 +1160,8 @@ fn push_ex_header_overlay(
 fn push_hard_ex_header_overlay(
     actors: &mut Vec<Actor>,
     cycle: ScoreboxCycleState,
-    cur: PaneKind,
-    next: PaneKind,
+    cur: &GameplayScoreboxPane,
+    next: &GameplayScoreboxPane,
     center_x: f32,
     center_y: f32,
     zoom: f32,
@@ -1028,7 +1186,7 @@ fn push_hard_ex_header_overlay(
     );
 }
 
-fn push_rpg_logo_overlay(
+fn push_srpg_logo_overlay(
     actors: &mut Vec<Actor>,
     cycle: ScoreboxCycleState,
     cur: PaneKind,
@@ -1040,14 +1198,14 @@ fn push_rpg_logo_overlay(
 ) {
     let alpha = logo_alpha(
         cycle,
-        is_rpg_logo(cur),
-        is_rpg_logo(next),
-        SCOREBOX_RPG_LOGO_ALPHA,
+        is_srpg_logo(cur),
+        is_srpg_logo(next),
+        SCOREBOX_SRPG_LOGO_ALPHA,
         false,
     );
     push_centered_logo(
         actors,
-        "srpg9_logo_alt.png",
+        srpg_logo_texture(),
         center_x,
         center_y,
         zoom,
@@ -1055,6 +1213,14 @@ fn push_rpg_logo_overlay(
         z_base,
         alpha,
     );
+}
+
+fn srpg_logo_texture() -> &'static str {
+    let cfg = config::get();
+    match cfg.srpg_variant {
+        SrpgVariant::Srpg10 if cfg.visual_style.is_srpg() => "srpg10_logo_alt.png",
+        _ => "srpg9_logo_alt.png",
+    }
 }
 
 fn push_itl_logo_overlay(
@@ -1082,26 +1248,18 @@ fn push_itl_logo_overlay(
 fn push_header_overlays(
     actors: &mut Vec<Actor>,
     cycle: ScoreboxCycleState,
-    cur: &GameplayScoreboxPane<'_>,
-    next: &GameplayScoreboxPane<'_>,
+    cur: &GameplayScoreboxPane,
+    next: &GameplayScoreboxPane,
     center_x: f32,
     center_y: f32,
     zoom: f32,
     z_base: i16,
 ) {
-    push_gs_logo_overlay(
-        actors, cycle, cur.kind, next.kind, center_x, center_y, zoom, z_base,
-    );
-    push_arrowcloud_logo_overlay(
-        actors, cycle, cur.kind, next.kind, center_x, center_y, zoom, z_base,
-    );
-    push_ex_header_overlay(
-        actors, cycle, cur.kind, next.kind, center_x, center_y, zoom, z_base,
-    );
-    push_hard_ex_header_overlay(
-        actors, cycle, cur.kind, next.kind, center_x, center_y, zoom, z_base,
-    );
-    push_rpg_logo_overlay(
+    push_gs_logo_overlay(actors, cycle, cur, next, center_x, center_y, zoom, z_base);
+    push_arrowcloud_logo_overlay(actors, cycle, cur, next, center_x, center_y, zoom, z_base);
+    push_ex_header_overlay(actors, cycle, cur, next, center_x, center_y, zoom, z_base);
+    push_hard_ex_header_overlay(actors, cycle, cur, next, center_x, center_y, zoom, z_base);
+    push_srpg_logo_overlay(
         actors, cycle, cur.kind, next.kind, center_x, center_y, zoom, z_base,
     );
     push_itl_logo_overlay(
@@ -1112,7 +1270,7 @@ fn push_header_overlays(
 
 fn push_rank_marker(
     actors: &mut Vec<Actor>,
-    row: &GameplayScoreboxRow<'_>,
+    row: &GameplayScoreboxRow,
     index: usize,
     center_x: f32,
     y: f32,
@@ -1150,7 +1308,7 @@ fn push_rank_marker(
 
 fn push_rows(
     actors: &mut Vec<Actor>,
-    rows: &[GameplayScoreboxRow<'_>],
+    rows: &[GameplayScoreboxRow],
     center_x: f32,
     center_y: f32,
     zoom: f32,
@@ -1173,7 +1331,7 @@ fn push_rows(
         push_rank_marker(actors, row, i, center_x, y, zoom, z_base, rank_x, rank_col);
         actors.push(act!(text:
             font("miso"):
-            settext(row.name):
+            settext(row.name.clone()):
             align(0.0, 0.5):
             xy(name_x, y):
             zoom(0.87 * zoom):
@@ -1196,7 +1354,7 @@ fn push_rows(
 }
 
 pub fn select_music_scorebox_actors(
-    side: profile::PlayerSide,
+    side: profile_data::PlayerSide,
     chart_hash: Option<&str>,
     show_scorebox: bool,
     center_x: f32,
@@ -1211,32 +1369,31 @@ pub fn select_music_scorebox_actors(
         return Vec::new();
     };
     let Some(snapshot) =
-        scores::get_or_fetch_player_leaderboards_for_side(hash, side, SCOREBOX_NUM_ENTRIES)
+        scores::get_or_fetch_player_leaderboards_for_side(hash, side, SCOREBOX_FETCH_NUM_ENTRIES)
     else {
         return Vec::new();
     };
-    let panes = select_music_panes_from_snapshot(&snapshot, side);
+    let panes = select_music_panes_from_snapshot(&snapshot, side, Some(hash));
     gameplay_scorebox_actors_from_panes(&panes, center_x, center_y, zoom, elapsed_seconds)
 }
 
 pub fn gameplay_scorebox_actors_from_snapshot(
-    side: profile::PlayerSide,
-    snapshot: Option<&scores::CachedPlayerLeaderboardData>,
-    show_scorebox: bool,
+    snapshot: Option<&score_data::CachedPlayerLeaderboardData>,
+    profile_snapshot: &score_data::GameplayScoreboxProfileSnapshot,
     center_x: f32,
     center_y: f32,
     zoom: f32,
     elapsed_seconds: f32,
 ) -> Vec<Actor> {
-    if !show_scorebox || !scores::is_gs_active_for_side(side) {
+    if !profile_snapshot.display_scorebox || !profile_snapshot.gs_active {
         return Vec::new();
     }
     let Some(snapshot) = snapshot else {
         return Vec::new();
     };
     gameplay_scorebox_actors_from_cached_snapshot(
-        side,
         snapshot,
+        profile_snapshot,
         center_x,
         center_y,
         zoom,
@@ -1245,19 +1402,19 @@ pub fn gameplay_scorebox_actors_from_snapshot(
 }
 
 pub(crate) fn gameplay_scorebox_actors_from_cached_snapshot(
-    side: profile::PlayerSide,
-    snapshot: &scores::CachedPlayerLeaderboardData,
+    snapshot: &score_data::CachedPlayerLeaderboardData,
+    profile_snapshot: &score_data::GameplayScoreboxProfileSnapshot,
     center_x: f32,
     center_y: f32,
     zoom: f32,
     elapsed_seconds: f32,
 ) -> Vec<Actor> {
-    let panes = gameplay_panes_from_snapshot(snapshot, side);
+    let panes = gameplay_panes_from_snapshot(snapshot, profile_snapshot);
     gameplay_scorebox_actors_from_panes(&panes, center_x, center_y, zoom, elapsed_seconds)
 }
 
 fn gameplay_scorebox_actors_from_panes(
-    panes: &[GameplayScoreboxPane<'_>],
+    panes: &[GameplayScoreboxPane],
     center_x: f32,
     center_y: f32,
     zoom: f32,
@@ -1329,4 +1486,163 @@ fn gameplay_scorebox_actors_from_panes(
     }
 
     actors
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(rank: u32, name: &str, is_self: bool, is_rival: bool) -> score_data::LeaderboardEntry {
+        score_data::LeaderboardEntry {
+            rank,
+            name: name.to_string(),
+            machine_tag: None,
+            score: 10000.0 - rank as f64,
+            date: String::new(),
+            is_rival,
+            is_self,
+            is_fail: false,
+        }
+    }
+
+    fn pane(name: &str, entries: Vec<score_data::LeaderboardEntry>) -> score_data::LeaderboardPane {
+        score_data::LeaderboardPane {
+            name: name.to_string(),
+            entries,
+            is_ex: false,
+            disabled: false,
+            personalized: true,
+            arrowcloud_kind: None,
+        }
+    }
+
+    fn scorebox_profile(show_ex_score: bool) -> score_data::GameplayScoreboxProfileSnapshot {
+        let mut player_profile = profile_data::Profile::default();
+        player_profile.show_ex_score = show_ex_score;
+        player_profile.display_scorebox = true;
+        scores::scorebox_profile_snapshot(&player_profile, true, None)
+    }
+
+    #[test]
+    fn non_hard_ex_scorebox_keeps_self_row() {
+        let entries = vec![
+            entry(1, "world", false, false),
+            entry(2, "rival-a", false, true),
+            entry(3, "rival-b", false, true),
+            entry(4, "rival-c", false, true),
+            entry(5, "rival-d", false, true),
+            entry(473, "self", true, false),
+        ];
+
+        let rows = scorebox_rows_for_kind(entries.as_slice(), PaneKind::Itl);
+        let ranks = rows
+            .iter()
+            .filter_map(|row| row.rank.strip_suffix('.'))
+            .map(|rank| rank.parse::<u32>().unwrap())
+            .collect::<Vec<_>>();
+        let names = rows
+            .iter()
+            .map(|row| row.name.as_ref().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ranks, vec![1, 2, 3, 4, 473]);
+        assert!(names.iter().any(|name| name == "self"));
+    }
+
+    #[test]
+    fn itl_scorebox_uses_ex_score_color() {
+        let entries = vec![
+            entry(1, "world", false, false),
+            entry(2, "self", true, false),
+            entry(3, "rival", false, true),
+        ];
+
+        let rows = scorebox_rows_for_kind(entries.as_slice(), PaneKind::Itl);
+
+        for row in rows.iter().take(3) {
+            assert_eq!(row.score_color, color::JUDGMENT_RGBA[0]);
+        }
+    }
+
+    #[test]
+    fn entries_with_local_self_state_marks_matching_online_name_as_self() {
+        let side = profile_data::PlayerSide::P1;
+        let profile = profile::get_for_side(side);
+        let name = [
+            profile.groovestats_username.trim(),
+            profile.display_name.trim(),
+            profile.player_initials.trim(),
+        ]
+        .into_iter()
+        .find(|candidate| !candidate.is_empty())
+        .unwrap_or("self");
+        let pane = pane("GrooveStats", vec![entry(7, name, false, false)]);
+
+        let entries = entries_with_local_self_state(side, None, &pane);
+
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].is_self);
+        assert_eq!(entries[0].machine_tag, local_self_machine_tag(side));
+    }
+
+    #[test]
+    fn entries_with_local_self_state_does_not_add_missing_self_row() {
+        let pane = pane(
+            "GrooveStats",
+            vec![
+                entry(1, "world", false, false),
+                entry(2, "rival", false, true),
+            ],
+        );
+
+        let entries = entries_with_local_self_state(profile_data::PlayerSide::P1, None, &pane);
+
+        assert_eq!(entries.len(), 2);
+        assert!(!entries.iter().any(|entry| entry.is_self));
+    }
+
+    #[test]
+    fn gameplay_panes_respect_select_music_leaderboard_filter() {
+        let prev = crate::config::get();
+        crate::config::update_select_music_scorebox_cycle_itg(false);
+        crate::config::update_select_music_scorebox_cycle_ex(false);
+        crate::config::update_select_music_scorebox_cycle_hard_ex(true);
+        crate::config::update_select_music_scorebox_cycle_tournaments(false);
+
+        let snapshot = score_data::CachedPlayerLeaderboardData {
+            loading: false,
+            error: None,
+            data: Some(score_data::PlayerLeaderboardData {
+                panes: vec![
+                    pane("GrooveStats", vec![entry(1, "itg", false, false)]),
+                    score_data::LeaderboardPane {
+                        name: "ArrowCloud".to_string(),
+                        entries: vec![entry(1, "hard-ex", false, false)],
+                        is_ex: false,
+                        disabled: false,
+                        personalized: true,
+                        arrowcloud_kind: Some(score_data::ArrowCloudPaneKind::HardEx),
+                    },
+                ],
+                itl_self_score: None,
+                itl_self_rank: None,
+            }),
+        };
+
+        let profile_snapshot = scorebox_profile(false);
+        let panes = gameplay_panes_from_snapshot(&snapshot, &profile_snapshot);
+
+        crate::config::update_select_music_scorebox_cycle_itg(prev.select_music_scorebox_cycle_itg);
+        crate::config::update_select_music_scorebox_cycle_ex(prev.select_music_scorebox_cycle_ex);
+        crate::config::update_select_music_scorebox_cycle_hard_ex(
+            prev.select_music_scorebox_cycle_hard_ex,
+        );
+        crate::config::update_select_music_scorebox_cycle_tournaments(
+            prev.select_music_scorebox_cycle_tournaments,
+        );
+
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].kind, PaneKind::HardEx);
+        assert_eq!(panes[0].mode_text.as_ref(), "H.EX");
+    }
 }

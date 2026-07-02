@@ -1,26 +1,23 @@
 use crate::act;
-use crate::core::space::{screen_center_x, screen_center_y, screen_height, screen_width};
+use crate::assets::i18n::tr;
+use crate::assets::visual_styles;
 use crate::game::profile;
-// Screen navigation handled in app.rs
+use deadlib_present::space::{screen_center_x, screen_center_y, screen_height, screen_width};
+// Screen navigation handled in app
 use crate::screens::components::shared::screen_bar::{
     AvatarParams, ScreenBarPosition, ScreenBarTitlePlacement,
 };
-use crate::screens::components::shared::{heart_bg, screen_bar};
-use crate::ui::actors::Actor;
-use crate::ui::color;
-// Keyboard handling is centralized in app.rs via virtual actions
-use crate::core::input::{InputEvent, VirtualAction};
+use crate::screens::components::shared::{screen_bar, transitions, visual_style_bg};
+use deadlib_present::actors::Actor;
+use deadlib_present::color;
+// Keyboard handling is centralized in app via virtual actions
 use crate::screens::{Screen, ScreenAction};
-use crate::ui::actors;
+use deadsync_input::{InputEvent, VirtualAction};
+use deadsync_profile as profile_data;
 
 /* ---------------------------- transitions ---------------------------- */
 const TRANSITION_IN_DURATION: f32 = 0.4;
 const TRANSITION_OUT_DURATION: f32 = 0.4;
-
-// Native art size of heart.png (for aspect-correct sizing)
-const HEART_NATIVE_W: f32 = 668.0;
-const HEART_NATIVE_H: f32 = 566.0;
-const HEART_ASPECT: f32 = HEART_NATIVE_W / HEART_NATIVE_H;
 
 // Wheel tuning (baseline behavior)
 // Simply Love uses `finishtweening(); linear(0.2)` when a new scroll input arrives.
@@ -60,7 +57,7 @@ pub struct State {
     scroll_to: f32,
     scroll_t: f32, // [0, SCROLL_TWEEN_DURATION]
     exit_requested: bool,
-    bg: heart_bg::State,
+    bg: visual_style_bg::State,
     /// Background fade: from -> to over `BG_FADE_DURATION`
     pub bg_from_index: i32,
     pub bg_to_index: i32,
@@ -68,17 +65,18 @@ pub struct State {
 }
 
 pub fn init() -> State {
-    let scroll = color::DEFAULT_COLOR_INDEX as f32;
+    let active_color_index = crate::config::get().simply_love_color;
+    let scroll = active_color_index as f32;
     State {
-        active_color_index: color::DEFAULT_COLOR_INDEX,
+        active_color_index,
         scroll,
         scroll_from: scroll,
         scroll_to: scroll,
         scroll_t: SCROLL_TWEEN_DURATION, // start "finished"
         exit_requested: false,
-        bg: heart_bg::State::new(),
-        bg_from_index: color::DEFAULT_COLOR_INDEX,
-        bg_to_index: color::DEFAULT_COLOR_INDEX,
+        bg: visual_style_bg::State::new(),
+        bg_from_index: active_color_index,
+        bg_to_index: active_color_index,
         bg_fade_t: BG_FADE_DURATION, // start "finished"
     }
 }
@@ -100,122 +98,61 @@ pub fn exit_anim_duration() -> f32 {
     WHEEL_OFF_STAGGER.mul_add(num_slots as f32, WHEEL_OFF_FADE_DURATION)
 }
 
-// Keyboard input is handled centrally via the virtual dispatcher in app.rs
+// Keyboard input is handled centrally via the virtual dispatcher in app
 
 /* ------------------------------- drawing ------------------------------- */
 
-/// Helper to recursively apply an alpha multiplier to an actor and its children.
-fn apply_alpha_to_actor(actor: &mut Actor, alpha: f32) {
-    match actor {
-        Actor::Sprite { tint, .. } => tint[3] *= alpha,
-        Actor::Text { color, .. } => color[3] *= alpha,
-        Actor::Mesh { vertices, .. } => {
-            let mut out: Vec<crate::core::gfx::MeshVertex> = Vec::with_capacity(vertices.len());
-            for v in vertices.iter() {
-                let mut c = v.color;
-                c[3] *= alpha;
-                out.push(crate::core::gfx::MeshVertex {
-                    pos: v.pos,
-                    color: c,
-                });
-            }
-            *vertices = std::sync::Arc::from(out);
-        }
-        Actor::TexturedMesh { vertices, .. } => {
-            let mut out: Vec<crate::core::gfx::TexturedMeshVertex> =
-                Vec::with_capacity(vertices.len());
-            for v in vertices.iter() {
-                let mut c = v.color;
-                c[3] *= alpha;
-                out.push(crate::core::gfx::TexturedMeshVertex {
-                    pos: v.pos,
-                    uv: v.uv,
-                    tex_matrix_scale: v.tex_matrix_scale,
-                    color: c,
-                });
-            }
-            *vertices = std::sync::Arc::from(out);
-        }
-        Actor::Frame {
-            background,
-            children,
-            ..
-        } => {
-            if let Some(actors::Background::Color(c)) = background {
-                c[3] *= alpha;
-            }
-            for child in children {
-                apply_alpha_to_actor(child, alpha);
-            }
-        }
-        Actor::Camera { children, .. } => {
-            for child in children {
-                apply_alpha_to_actor(child, alpha);
-            }
-        }
-        Actor::Shadow { color, child, .. } => {
-            color[3] *= alpha;
-            apply_alpha_to_actor(child, alpha);
-        }
-    }
-}
-
 pub fn in_transition() -> (Vec<Actor>, f32) {
-    let actor = act!(quad:
-        align(0.0, 0.0): xy(0.0, 0.0):
-        zoomto(screen_width(), screen_height()):
-        diffuse(0.0, 0.0, 0.0, 1.0):
-        z(1100):
-        linear(TRANSITION_IN_DURATION): alpha(0.0):
-        linear(0.0): visible(false)
-    );
-    (vec![actor], TRANSITION_IN_DURATION)
+    transitions::fade_in_black(TRANSITION_IN_DURATION, 1100)
 }
 
 pub fn out_transition() -> (Vec<Actor>, f32) {
-    let actor = act!(quad:
-        align(0.0, 0.0): xy(0.0, 0.0):
-        zoomto(screen_width(), screen_height()):
-        diffuse(0.0, 0.0, 0.0, 0.0):
-        z(1200):
-        linear(TRANSITION_OUT_DURATION): alpha(1.0)
-    );
-    (vec![actor], TRANSITION_OUT_DURATION)
+    transitions::fade_out_black(TRANSITION_OUT_DURATION, 1200)
 }
 
-pub fn get_actors(state: &State, alpha_multiplier: f32) -> Vec<Actor> {
-    let mut actors: Vec<Actor> = Vec::with_capacity(64);
+pub fn push_actors(actors: &mut Vec<Actor>, state: &State, alpha_multiplier: f32) {
+    actors.reserve(64);
 
     // 1) Animated heart background with a short cross-fade between colors.
     let a = (state.bg_fade_t / BG_FADE_DURATION).clamp(0.0, 1.0);
     if a >= 1.0 || state.bg_from_index == state.bg_to_index {
         // No active fade: draw a single layer + normal backdrop
-        actors.extend(state.bg.build(heart_bg::Params {
-            active_color_index: state.bg_to_index,
-            backdrop_rgba: [0.0, 0.0, 0.0, 1.0],
-            alpha_mul: 1.0,
-        }));
+        state.bg.push(
+            actors,
+            visual_style_bg::Params {
+                active_color_index: state.bg_to_index,
+                backdrop_rgba: [0.0, 0.0, 0.0, 1.0],
+                alpha_mul: 1.0,
+            },
+        );
     } else {
         let alpha_from = 1.0 - a;
         let alpha_to = a;
         // Bottom: previous color + full backdrop
-        actors.extend(state.bg.build(heart_bg::Params {
-            active_color_index: state.bg_from_index,
-            backdrop_rgba: [0.0, 0.0, 0.0, 1.0],
-            alpha_mul: alpha_from,
-        }));
+        state.bg.push(
+            actors,
+            visual_style_bg::Params {
+                active_color_index: state.bg_from_index,
+                backdrop_rgba: [0.0, 0.0, 0.0, 1.0],
+                alpha_mul: alpha_from,
+            },
+        );
         // Top: new color + NO backdrop (avoid double darkening)
-        actors.extend(state.bg.build(heart_bg::Params {
-            active_color_index: state.bg_to_index,
-            backdrop_rgba: [0.0, 0.0, 0.0, 0.0],
-            alpha_mul: alpha_to,
-        }));
+        state.bg.push(
+            actors,
+            visual_style_bg::Params {
+                active_color_index: state.bg_to_index,
+                backdrop_rgba: [0.0, 0.0, 0.0, 0.0],
+                alpha_mul: alpha_to,
+            },
+        );
     }
 
     // 2) Bars (top + bottom)
     const FG: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+    let title = tr("ScreenTitles", "SelectAColor");
     actors.push(screen_bar::build(screen_bar::ScreenBarParams {
-        title: "SELECT A COLOR",
+        title: &title,
         title_placement: ScreenBarTitlePlacement::Left, // big title on the left
         position: ScreenBarPosition::Top,
         transparent: false,
@@ -227,8 +164,8 @@ pub fn get_actors(state: &State, alpha_multiplier: f32) -> Vec<Actor> {
         fg_color: FG,
     }));
 
-    let p1_profile = profile::get_for_side(profile::PlayerSide::P1);
-    let p2_profile = profile::get_for_side(profile::PlayerSide::P2);
+    let p1_profile = profile::get_for_side(profile_data::PlayerSide::P1);
+    let p2_profile = profile::get_for_side(profile_data::PlayerSide::P2);
     let p1_avatar = p1_profile
         .avatar_texture_key
         .as_deref()
@@ -238,37 +175,41 @@ pub fn get_actors(state: &State, alpha_multiplier: f32) -> Vec<Actor> {
         .as_deref()
         .map(|texture_key| AvatarParams { texture_key });
 
-    let p1_joined = profile::is_session_side_joined(profile::PlayerSide::P1);
-    let p2_joined = profile::is_session_side_joined(profile::PlayerSide::P2);
-    let p1_guest = profile::is_session_side_guest(profile::PlayerSide::P1);
-    let p2_guest = profile::is_session_side_guest(profile::PlayerSide::P2);
+    let p1_joined = profile::is_session_side_joined(profile_data::PlayerSide::P1);
+    let p2_joined = profile::is_session_side_joined(profile_data::PlayerSide::P2);
+    let p1_guest = profile::is_session_side_guest(profile_data::PlayerSide::P1);
+    let p2_guest = profile::is_session_side_guest(profile_data::PlayerSide::P2);
+
+    let insert_card = tr("Common", "InsertCard");
+    let press_start = tr("Common", "PressStart");
 
     let (footer_left, left_avatar) = if p1_joined {
         (
             Some(if p1_guest {
-                "INSERT CARD"
+                insert_card.as_ref()
             } else {
                 p1_profile.display_name.as_str()
             }),
             if p1_guest { None } else { p1_avatar },
         )
     } else {
-        (Some("PRESS START"), None)
+        (Some(press_start.as_ref()), None)
     };
     let (footer_right, right_avatar) = if p2_joined {
         (
             Some(if p2_guest {
-                "INSERT CARD"
+                insert_card.as_ref()
             } else {
                 p2_profile.display_name.as_str()
             }),
             if p2_guest { None } else { p2_avatar },
         )
     } else {
-        (Some("PRESS START"), None)
+        (Some(press_start.as_ref()), None)
     };
+    let event_mode = tr("Common", "EventMode");
     actors.push(screen_bar::build(screen_bar::ScreenBarParams {
-        title: "EVENT MODE",
+        title: &event_mode,
         title_placement: ScreenBarTitlePlacement::Center,
         position: ScreenBarPosition::Bottom,
         transparent: false,
@@ -292,19 +233,20 @@ pub fn get_actors(state: &State, alpha_multiplier: f32) -> Vec<Actor> {
 
     #[inline(always)]
     fn wheel_form_p() -> f32 {
-        use crate::ui::{anim, runtime};
+        use deadlib_present::{anim, runtime};
         static STEPS: std::sync::OnceLock<Vec<anim::Step>> = std::sync::OnceLock::new();
         let steps = STEPS.get_or_init(|| vec![anim::linear(WHEEL_FORM_DURATION).x(1.0).build()]);
 
         let mut init = anim::TweenState::default();
         init.x = 0.0;
-        let sid = runtime::site_id(file!(), line!(), column!(), 0x53434F4C464F524Du64); // "SCOLFORM"
+        const SITE_BASE: u64 = runtime::site_base(file!(), line!(), column!());
+        let sid = runtime::site_id(SITE_BASE, 0x53434F4C464F524Du64); // "SCOLFORM"
         runtime::materialize(sid, init, steps).x.clamp(0.0, 1.0)
     }
 
     #[inline(always)]
     fn wheel_exit_t(wide: bool) -> f32 {
-        use crate::ui::{anim, runtime};
+        use deadlib_present::{anim, runtime};
         static STEPS_WIDE: std::sync::OnceLock<Vec<anim::Step>> = std::sync::OnceLock::new();
         static STEPS_NARROW: std::sync::OnceLock<Vec<anim::Step>> = std::sync::OnceLock::new();
 
@@ -319,10 +261,9 @@ pub fn get_actors(state: &State, alpha_multiplier: f32) -> Vec<Actor> {
 
         let mut init = anim::TweenState::default();
         init.x = 0.0;
+        const SITE_BASE: u64 = runtime::site_base(file!(), line!(), column!());
         let sid = runtime::site_id(
-            file!(),
-            line!(),
-            column!(),
+            SITE_BASE,
             if wide {
                 0x53434F4C45584954u64
             } else {
@@ -348,6 +289,9 @@ pub fn get_actors(state: &State, alpha_multiplier: f32) -> Vec<Actor> {
     } else {
         0.0
     };
+    let visual_style = visual_styles::current_style();
+    let select_color_texture = visual_styles::select_color_texture_key();
+    let select_color_aspect = visual_styles::select_color_aspect(visual_style);
 
     let x_spacing = w_screen / (num_slots as f32 - 1.0);
 
@@ -392,7 +336,7 @@ pub fn get_actors(state: &State, alpha_multiplier: f32) -> Vec<Actor> {
         let a = o.abs();
 
         // palette color for this slot (stick to integer to avoid “color lerp” look)
-        let tint = color::decorative_rgba(base_i + offset_i);
+        let tint = select_color_tint(base_i + offset_i);
 
         // X centered via distance samples (sign from side)
         let x_off = super::select_color::sample_linear(&x_samples, a);
@@ -411,9 +355,8 @@ pub fn get_actors(state: &State, alpha_multiplier: f32) -> Vec<Actor> {
         // depth so near-center draws on top
         let z_layer = WHEEL_Z_BASE - (a.round() as i16);
 
-        // correct aspect (don’t stretch tall)
-        let base_h = 168.0; // overall heart height (tweak)
-        let base_w = base_h * HEART_ASPECT;
+        let base_h = 168.0;
+        let base_w = base_h * select_color_aspect;
 
         // Soft fade near edges so hearts slide on/off
         let start_fade = (max_off_all - 1.0).max(0.0); // begin fade
@@ -440,7 +383,7 @@ pub fn get_actors(state: &State, alpha_multiplier: f32) -> Vec<Actor> {
         let rot_deg = lerp(0.0, rot_deg_final, form_p);
         let zoom = lerp(1.0, zoom_final, form_p);
 
-        wheel_actors.push(act!(sprite("heart.png"):
+        wheel_actors.push(act!(sprite(select_color_texture):
             align(0.5, 0.5):
             xy(x, y):
             rotationz(rot_deg):
@@ -452,10 +395,15 @@ pub fn get_actors(state: &State, alpha_multiplier: f32) -> Vec<Actor> {
     }
 
     for actor in &mut wheel_actors {
-        apply_alpha_to_actor(actor, alpha_multiplier);
+        actor.mul_alpha(alpha_multiplier);
     }
     actors.extend(wheel_actors);
+    push_srpg10_faction_label(actors, state.active_color_index, alpha_multiplier);
+}
 
+pub fn get_actors(state: &State, alpha_multiplier: f32) -> Vec<Actor> {
+    let mut actors = Vec::with_capacity(64);
+    push_actors(&mut actors, state, alpha_multiplier);
     actors
 }
 
@@ -464,6 +412,36 @@ pub fn get_actors(state: &State, alpha_multiplier: f32) -> Vec<Actor> {
 #[inline(always)]
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
     (b - a).mul_add(t, a)
+}
+
+#[inline(always)]
+fn select_color_tint(color_index: i32) -> [f32; 4] {
+    if visual_styles::srpg10_active() {
+        color::srpg10_rgba(color_index)
+    } else {
+        color::decorative_rgba(color_index)
+    }
+}
+
+fn push_srpg10_faction_label(actors: &mut Vec<Actor>, color_index: i32, alpha_multiplier: f32) {
+    if !visual_styles::srpg10_active() {
+        return;
+    }
+    let alpha = 0.94 * alpha_multiplier;
+    let max_width = (screen_width() - 96.0).max(220.0);
+    let y = (screen_center_y() + 160.0).min(screen_height() - 72.0);
+    actors.push(act!(text:
+        font("miso"):
+        settext(visual_styles::srpg10_faction_name(color_index)):
+        align(0.5, 0.5):
+        xy(screen_center_x(), y):
+        zoom(0.9):
+        maxwidth(max_width):
+        horizalign(center):
+        shadowlength(1.0):
+        diffuse(1.0, 1.0, 1.0, alpha):
+        z(140)
+    ));
 }
 
 #[inline(always)]
@@ -551,7 +529,7 @@ fn scroll_by(state: &mut State, delta: i32) {
     state.active_color_index += delta;
     state.scroll_to = state.active_color_index as f32;
     state.scroll_t = 0.0;
-    crate::core::audio::play_sfx("assets/sounds/expand.ogg");
+    deadsync_audio_stream::play_sfx("assets/sounds/expand.ogg");
     crate::config::update_simply_love_color(state.active_color_index.rem_euclid(num_colors));
     state.bg_from_index = current_visible_bg_index(state);
     state.bg_to_index = state.active_color_index;
@@ -565,21 +543,22 @@ pub fn handle_input(state: &mut State, ev: &InputEvent) -> ScreenAction {
     if state.exit_requested {
         return ScreenAction::None;
     }
-    let nav = match crate::game::profile::get_session_player_side() {
-        crate::game::profile::PlayerSide::P2 => match ev.action {
-            VirtualAction::p2_left | VirtualAction::p2_menu_left => Some(Nav::Left),
-            VirtualAction::p2_right | VirtualAction::p2_menu_right => Some(Nav::Right),
-            VirtualAction::p2_start => Some(Nav::Confirm),
-            VirtualAction::p2_back => Some(Nav::Back),
-            _ => None,
-        },
-        crate::game::profile::PlayerSide::P1 => match ev.action {
-            VirtualAction::p1_left | VirtualAction::p1_menu_left => Some(Nav::Left),
-            VirtualAction::p1_right | VirtualAction::p1_menu_right => Some(Nav::Right),
-            VirtualAction::p1_start => Some(Nav::Confirm),
-            VirtualAction::p1_back => Some(Nav::Back),
-            _ => None,
-        },
+    let nav = match ev.action {
+        VirtualAction::p1_left
+        | VirtualAction::p2_left
+        | VirtualAction::p1_menu_left
+        | VirtualAction::p2_menu_left => Some(Nav::Left),
+
+        VirtualAction::p1_right
+        | VirtualAction::p2_right
+        | VirtualAction::p1_menu_right
+        | VirtualAction::p2_menu_right => Some(Nav::Right),
+
+        VirtualAction::p1_start | VirtualAction::p2_start => Some(Nav::Confirm),
+
+        VirtualAction::p1_back | VirtualAction::p2_back => Some(Nav::Back),
+
+        _ => None,
     };
 
     match nav {
@@ -596,7 +575,7 @@ pub fn handle_input(state: &mut State, ev: &InputEvent) -> ScreenAction {
             state.scroll = state.scroll_to;
             state.scroll_from = state.scroll;
             state.scroll_t = SCROLL_TWEEN_DURATION;
-            crate::core::audio::play_sfx("assets/sounds/start.ogg");
+            deadsync_audio_stream::play_sfx("assets/sounds/start.ogg");
             ScreenAction::Navigate(Screen::SelectStyle)
         }
         Some(Nav::Back) => {

@@ -1,8 +1,9 @@
-use crate::core::gfx::{BlendMode, MeshMode};
-use crate::core::space::screen_center_x;
-use crate::game::timing::{TimingData, TimingSegments};
-use crate::screens::components::shared::density_graph::{self, DensityHistCache};
-use crate::ui::actors::{Actor, SizeSpec};
+use deadlib_present::actors::{Actor, SizeSpec};
+use deadlib_present::density::{self, DensityHistCache};
+use deadlib_present::space::screen_center_x;
+use deadlib_render::BlendMode;
+use deadsync_rules::timing::{TimingData, TimingSegments};
+use std::cell::RefCell;
 use std::sync::Arc;
 
 pub const SCENARIO_NAME: &str = "density-graph";
@@ -12,23 +13,26 @@ pub struct DensityGraphBenchFixture {
     offset: f32,
     visible_width: f32,
     offset_xy: [f32; 2],
+    mesh: RefCell<Option<Arc<[deadlib_render::MeshVertex]>>>,
 }
 
 impl DensityGraphBenchFixture {
     pub fn build(&self) -> Vec<Actor> {
-        let Some(cache) = self.cache.as_ref() else {
+        let mut mesh = self.mesh.borrow_mut();
+        density::update_density_hist_mesh(
+            &mut mesh,
+            self.cache.as_ref(),
+            self.offset,
+            self.visible_width,
+        );
+        let Some(vertices) = mesh.as_ref() else {
             return Vec::new();
         };
-        let verts = cache.mesh(self.offset, self.visible_width);
-        if verts.is_empty() {
-            return Vec::new();
-        }
         vec![Actor::Mesh {
             align: [0.0, 0.0],
             offset: self.offset_xy,
             size: [SizeSpec::Px(0.0), SizeSpec::Px(0.0)],
-            vertices: Arc::from(verts.into_boxed_slice()),
-            mode: MeshMode::Triangles,
+            vertices: Arc::clone(vertices),
             visible: true,
             blend: BlendMode::Alpha,
             z: 40,
@@ -51,14 +55,18 @@ pub fn fixture() -> DensityGraphBenchFixture {
             speeds: Vec::new(),
             scrolls: Vec::new(),
             fakes: Vec::new(),
+            ..TimingSegments::default()
         },
         &[],
     );
+    let measure_seconds: Vec<f32> = (0..measure_nps.len())
+        .map(|measure| timing.get_time_for_beat((measure as f32) * 4.0))
+        .collect();
     let visible_width = 286.0_f32;
-    let cache = density_graph::build_density_histogram_cache(
+    let cache = density::build_density_histogram_cache(
         &measure_nps,
         peak_nps,
-        &timing,
+        &measure_seconds,
         0.0,
         timing.get_time_for_beat(measure_nps.len() as f32 * 4.0),
         1144.0,
@@ -72,6 +80,7 @@ pub fn fixture() -> DensityGraphBenchFixture {
         offset: 319.0,
         visible_width,
         offset_xy: [screen_center_x() - visible_width * 0.5, 128.0],
+        mesh: RefCell::new(None),
     }
 }
 

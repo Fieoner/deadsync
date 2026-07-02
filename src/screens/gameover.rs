@@ -1,14 +1,17 @@
 use crate::act;
 use crate::assets::AssetManager;
-use crate::core::input::{InputEvent, VirtualAction};
-use crate::core::space::{screen_center_x, screen_center_y, screen_height, screen_width};
+use crate::assets::i18n::{tr, tr_fmt};
+use crate::assets::{FontRole, current_machine_font_key, visual_styles};
 use crate::game::profile;
 use crate::game::scores;
 use crate::game::stage_stats;
-use crate::screens::components::shared::heart_bg;
+use crate::screens::components::shared::{transitions, visual_style_bg};
 use crate::screens::{Screen, ScreenAction};
-use crate::ui::actors::Actor;
-use crate::ui::color;
+use deadlib_present::actors::Actor;
+use deadlib_present::color;
+use deadlib_present::space::{screen_center_x, screen_center_y, screen_height, screen_width};
+use deadsync_input::{InputEvent, VirtualAction};
+use deadsync_profile as profile_data;
 
 /* ---------------------------- transitions ---------------------------- */
 const TRANSITION_IN_DURATION: f32 = 0.4;
@@ -16,6 +19,7 @@ const TRANSITION_OUT_DURATION: f32 = 0.4;
 
 // Simply Love: ScreenGameOver TimerSeconds = 23 (non-SRPG9)
 const GAMEOVER_SECONDS: f32 = 23.0;
+const SRPG10_GAMEOVER_SECONDS: f32 = 135.0;
 
 // Layout (Simply Love)
 const SIDE_BG_W: f32 = 160.0;
@@ -31,18 +35,10 @@ const STATS_TEXT_ZOOM: f32 = 0.95;
 const AVATAR_DIM: f32 = 110.0;
 const AVATAR_Y: f32 = 12.0;
 
-#[inline(always)]
-const fn side_ix(side: profile::PlayerSide) -> usize {
+fn player_color_rgba(side: profile_data::PlayerSide, active_color_index: i32) -> [f32; 4] {
     match side {
-        profile::PlayerSide::P1 => 0,
-        profile::PlayerSide::P2 => 1,
-    }
-}
-
-fn player_color_rgba(side: profile::PlayerSide, active_color_index: i32) -> [f32; 4] {
-    match side {
-        profile::PlayerSide::P1 => color::simply_love_rgba(active_color_index),
-        profile::PlayerSide::P2 => color::simply_love_rgba(active_color_index - 2),
+        profile_data::PlayerSide::P1 => color::simply_love_rgba(active_color_index),
+        profile_data::PlayerSide::P2 => color::simply_love_rgba(active_color_index - 2),
     }
 }
 
@@ -63,7 +59,7 @@ fn is_course_summary_stage(stage: &stage_stats::StageSummary) -> bool {
 }
 
 fn session_stats_for_side(
-    side: profile::PlayerSide,
+    side: profile_data::PlayerSide,
     stages: &[stage_stats::StageSummary],
 ) -> SessionStats {
     let mut out = SessionStats::default();
@@ -71,7 +67,11 @@ fn session_stats_for_side(
         if is_course_summary_stage(s) {
             continue;
         }
-        let Some(p) = s.players.get(side_ix(side)).and_then(|p| p.as_ref()) else {
+        let Some(p) = s
+            .players
+            .get(profile_data::player_side_index(side))
+            .and_then(|p| p.as_ref())
+        else {
             continue;
         };
         out.songs_played = out.songs_played.saturating_add(1);
@@ -88,14 +88,31 @@ fn format_time_spent(seconds_total: f32) -> String {
     let seconds = total % 60;
 
     if hours > 0 {
-        format!("{hours}hr. {minutes}min. {seconds}sec.")
+        tr_fmt(
+            "GameOver",
+            "TimeFormatHMS",
+            &[
+                ("hours", &hours.to_string()),
+                ("minutes", &minutes.to_string()),
+                ("seconds", &seconds.to_string()),
+            ],
+        )
+        .to_string()
     } else {
-        format!("{minutes}min. {seconds}sec.")
+        tr_fmt(
+            "GameOver",
+            "TimeFormatMS",
+            &[
+                ("minutes", &minutes.to_string()),
+                ("seconds", &seconds.to_string()),
+            ],
+        )
+        .to_string()
     }
 }
 
 fn build_player_lines(
-    side: profile::PlayerSide,
+    side: profile_data::PlayerSide,
     stages: &[stage_stats::StageSummary],
     total_songs_played: u32,
 ) -> (Vec<String>, Vec<String>) {
@@ -113,19 +130,31 @@ fn build_player_lines(
             } else {
                 0
             };
-            profile_lines.push(format!("Calories Burned Today\n{cals}"));
+            profile_lines.push(format!("{}\n{cals}", tr("GameOver", "CaloriesBurnedToday")));
         }
 
-        profile_lines.push(format!("Total Songs Played\n{total_songs_played}"));
+        profile_lines.push(format!(
+            "{}\n{total_songs_played}",
+            tr("GameOver", "TotalSongsPlayed")
+        ));
     }
 
     // General stats (no profile required)
     let stats = session_stats_for_side(side, stages);
     let general_lines: Vec<String> = vec![
-        format!("Songs Played This Game\n{}", stats.songs_played),
-        format!("Notes Hit This Game\n{}", stats.notes_hit),
         format!(
-            "Time Spent This Game\n{}",
+            "{}\n{}",
+            tr("GameOver", "SongsPlayedThisGame"),
+            stats.songs_played
+        ),
+        format!(
+            "{}\n{}",
+            tr("GameOver", "NotesHitThisGame"),
+            stats.notes_hit
+        ),
+        format!(
+            "{}\n{}",
+            tr("GameOver", "TimeSpentThisGame"),
             format_time_spent(stats.duration_seconds)
         ),
     ];
@@ -135,7 +164,7 @@ fn build_player_lines(
 
 pub struct State {
     pub active_color_index: i32,
-    bg: heart_bg::State,
+    bg: visual_style_bg::State,
     elapsed: f32,
     total_songs_played: [u32; 2],
 }
@@ -143,16 +172,16 @@ pub struct State {
 fn init_inner(scan_totals: bool) -> State {
     let total_songs_played = if scan_totals {
         [
-            scores::total_songs_played_for_side(profile::PlayerSide::P1),
-            scores::total_songs_played_for_side(profile::PlayerSide::P2),
+            scores::total_songs_played_for_side(profile_data::PlayerSide::P1),
+            scores::total_songs_played_for_side(profile_data::PlayerSide::P2),
         ]
     } else {
         [0, 0]
     };
 
     State {
-        active_color_index: color::DEFAULT_COLOR_INDEX, // overwritten by app.rs
-        bg: heart_bg::State::new(),
+        active_color_index: color::DEFAULT_COLOR_INDEX, // overwritten by app
+        bg: visual_style_bg::State::new(),
         elapsed: 0.0,
         total_songs_played,
     }
@@ -168,10 +197,19 @@ pub fn init_blank() -> State {
 
 pub fn update(state: &mut State, dt: f32) -> Option<ScreenAction> {
     state.elapsed = (state.elapsed + dt).max(0.0);
-    if state.elapsed >= GAMEOVER_SECONDS {
+    if state.elapsed >= gameover_seconds() {
         return Some(ScreenAction::Navigate(Screen::Menu));
     }
     None
+}
+
+#[inline(always)]
+fn gameover_seconds() -> f32 {
+    if visual_styles::srpg10_active() {
+        SRPG10_GAMEOVER_SECONDS
+    } else {
+        GAMEOVER_SECONDS
+    }
 }
 
 pub fn handle_input(_state: &mut State, ev: &InputEvent) -> ScreenAction {
@@ -188,19 +226,23 @@ pub fn handle_input(_state: &mut State, ev: &InputEvent) -> ScreenAction {
     }
 }
 
-pub fn get_actors(
+pub fn push_actors(
+    actors: &mut Vec<Actor>,
     state: &State,
     stages: &[stage_stats::StageSummary],
     _asset_manager: &AssetManager,
-) -> Vec<Actor> {
-    let mut actors: Vec<Actor> = Vec::with_capacity(64);
+) {
+    actors.reserve(64);
 
     // Background (Simply Love: ScreenWithMenuElements background)
-    actors.extend(state.bg.build(heart_bg::Params {
-        active_color_index: state.active_color_index,
-        backdrop_rgba: [0.0, 0.0, 0.0, 1.0],
-        alpha_mul: 1.0,
-    }));
+    state.bg.push(
+        actors,
+        visual_style_bg::Params {
+            active_color_index: state.active_color_index,
+            backdrop_rgba: [0.0, 0.0, 0.0, 1.0],
+            alpha_mul: 1.0,
+        },
+    );
 
     // Side stat backdrops (Simply Love: two quads at x=80 and x=w-80)
     {
@@ -221,44 +263,48 @@ pub fn get_actors(
         ));
     }
 
-    // GAME OVER text (Simply Love: Wendy/_wendy white, crop reveal)
+    // GAME OVER text (Arrow Cloud: ThemeFont headline, crop reveal)
     {
         let cx = screen_center_x();
         let cy = screen_center_y();
+        let zoom = match crate::config::get().machine_font {
+            crate::config::MachineFont::Wendy => 1.2,
+            crate::config::MachineFont::Mega => 1.95,
+        };
 
         actors.push(act!(text:
-            font("wendy_white"):
-            settext("GAME"):
+            font(current_machine_font_key(FontRole::Headline)):
+            settext(tr("GameOver", "GameText")):
             align(0.5, 0.5):
             xy(cx, cy - 40.0):
             croptop(1.0): fadetop(1.0):
-            zoom(1.2):
+            zoom(zoom):
             shadowlength(1.0):
             z(20):
             decelerate(0.5): croptop(0.0): fadetop(0.0)
         ));
         actors.push(act!(text:
-            font("wendy_white"):
-            settext("OVER"):
+            font(current_machine_font_key(FontRole::Headline)):
+            settext(tr("GameOver", "OverText")):
             align(0.5, 0.5):
             xy(cx, cy + 40.0):
             croptop(1.0): fadetop(1.0):
-            zoom(1.2):
+            zoom(zoom):
             shadowlength(1.0):
             z(20):
             decelerate(0.5): croptop(0.0): fadetop(0.0)
         ));
     }
 
-    for side in [profile::PlayerSide::P1, profile::PlayerSide::P2] {
+    for side in [profile_data::PlayerSide::P1, profile_data::PlayerSide::P2] {
         if !profile::is_session_side_joined(side) {
             continue;
         }
 
         let pc = player_color_rgba(side, state.active_color_index);
         let x_pos = match side {
-            profile::PlayerSide::P1 => SIDE_BG_X_PAD,
-            profile::PlayerSide::P2 => screen_width() - SIDE_BG_X_PAD,
+            profile_data::PlayerSide::P1 => SIDE_BG_X_PAD,
+            profile_data::PlayerSide::P2 => screen_width() - SIDE_BG_X_PAD,
         };
 
         // Avatar (persistent profiles only)
@@ -281,7 +327,7 @@ pub fn get_actors(
                 ));
                 actors.push(act!(text:
                     font("miso"):
-                    settext("No Avatar"):
+                    settext(tr("GameOver", "NoAvatar")):
                     align(0.5, 0.5):
                     xy(x_pos, AVATAR_Y + AVATAR_DIM - 18.0):
                     zoom(0.9):
@@ -300,8 +346,11 @@ pub fn get_actors(
             z(12)
         ));
 
-        let (profile_lines, general_lines) =
-            build_player_lines(side, stages, state.total_songs_played[side_ix(side)]);
+        let (profile_lines, general_lines) = build_player_lines(
+            side,
+            stages,
+            state.total_songs_played[profile_data::player_side_index(side)],
+        );
 
         for (i, line) in profile_lines.iter().enumerate() {
             let y = (LINE_HEIGHT * (i as f32)) + PROFILE_STATS_Y;
@@ -333,27 +382,22 @@ pub fn get_actors(
             ));
         }
     }
+}
 
+pub fn get_actors(
+    state: &State,
+    stages: &[stage_stats::StageSummary],
+    asset_manager: &AssetManager,
+) -> Vec<Actor> {
+    let mut actors = Vec::with_capacity(64);
+    push_actors(&mut actors, state, stages, asset_manager);
     actors
 }
 
 pub fn in_transition() -> (Vec<Actor>, f32) {
-    let actor = act!(quad:
-        align(0.0, 0.0): xy(0.0, 0.0):
-        zoomto(screen_width(), screen_height()):
-        diffuse(0.0, 0.0, 0.0, 1.0): z(1100):
-        linear(TRANSITION_IN_DURATION): alpha(0.0):
-        linear(0.0): visible(false)
-    );
-    (vec![actor], TRANSITION_IN_DURATION)
+    transitions::fade_in_black(TRANSITION_IN_DURATION, 1100)
 }
 
 pub fn out_transition() -> (Vec<Actor>, f32) {
-    let actor = act!(quad:
-        align(0.0, 0.0): xy(0.0, 0.0):
-        zoomto(screen_width(), screen_height()):
-        diffuse(0.0, 0.0, 0.0, 0.0): z(1100):
-        linear(TRANSITION_OUT_DURATION): alpha(1.0)
-    );
-    (vec![actor], TRANSITION_OUT_DURATION)
+    transitions::fade_out_black(TRANSITION_OUT_DURATION, 1100)
 }

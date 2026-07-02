@@ -1,8 +1,9 @@
 use crate::assets::AssetManager;
-use crate::core::input::InputEvent;
 use crate::screens::ScreenAction;
 use crate::screens::components::shared::profile_boxes;
-use crate::ui::actors::Actor;
+use deadlib_present::actors::Actor;
+use deadsync_input::InputEvent;
+use deadsync_profile as profile_data;
 
 pub type State = profile_boxes::State;
 
@@ -19,6 +20,11 @@ pub fn init() -> State {
 #[inline(always)]
 pub fn set_joined(state: &mut State, p1_joined: bool, p2_joined: bool) {
     profile_boxes::set_joined(state, p1_joined, p2_joined);
+}
+
+#[inline(always)]
+pub fn enter_late_join(state: &mut State, joining_side: profile_data::PlayerSide) {
+    profile_boxes::enter_late_join(state, joining_side);
 }
 
 #[inline(always)]
@@ -39,6 +45,16 @@ pub fn out_transition() -> (Vec<Actor>, f32) {
 #[inline(always)]
 pub fn handle_input(state: &mut State, ev: &InputEvent) -> ScreenAction {
     profile_boxes::handle_input(state, ev)
+}
+
+#[inline(always)]
+pub fn push_actors(
+    actors: &mut Vec<Actor>,
+    state: &State,
+    asset_manager: &AssetManager,
+    alpha_multiplier: f32,
+) {
+    profile_boxes::push_actors(actors, state, asset_manager, alpha_multiplier);
 }
 
 #[inline(always)]

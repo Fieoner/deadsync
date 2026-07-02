@@ -1,101 +1,27 @@
-use deadsync::{app, config, core, game};
+// Ship release builds as a Windows GUI-subsystem app so launching the game
+// doesn't pop up a console window. Debug builds keep the console for developer
+// convenience. Runtime output is still reachable: see `deadlib_platform::console`
+// (reattaches to a parent terminal, or opens a console when `ShowConsole`/
+// `--console` is set). No effect on non-Windows targets.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+use deadlib_platform::logging::{self, StartupBuildInfo};
+use deadsync::{app, assets, config, game};
 use std::backtrace::Backtrace;
 use std::panic::PanicHookInfo;
 
-#[cfg(windows)]
-struct WindowsTimingGuard {
-    timer_period_ms: u32,
-    _thread_policy: core::windows_rt::ThreadPolicyGuard,
-}
-
-#[cfg(windows)]
-impl Drop for WindowsTimingGuard {
-    fn drop(&mut self) {
-        use windows::Win32::Media::timeEndPeriod;
-
-        // SAFETY: `timeEndPeriod` takes only the timer-resolution value. We pass
-        // the same value we requested at startup and ignore any OS-level failure
-        // because this is best-effort cleanup during shutdown.
-        unsafe {
-            let _ = timeEndPeriod(self.timer_period_ms);
-        }
-    }
-}
-
-#[cfg(windows)]
-fn boost_windows_runtime_timing() -> WindowsTimingGuard {
-    use windows::Win32::Media::timeBeginPeriod;
-
-    let timer_period_ms = 1u32;
-    // SAFETY: `timeBeginPeriod` takes only the requested resolution and does not
-    // retain pointers into Rust memory. We handle the return code explicitly.
-    unsafe {
-        let timer_result = timeBeginPeriod(timer_period_ms);
-        if timer_result == 0 {
-            log::debug!("Requested Windows timer resolution: {}ms", timer_period_ms);
-        } else {
-            log::warn!(
-                "Failed to request Windows timer resolution {}ms: MMRESULT={}",
-                timer_period_ms,
-                timer_result
-            );
-        }
-    }
-
-    WindowsTimingGuard {
-        timer_period_ms,
-        _thread_policy: core::windows_rt::boost_current_thread(core::windows_rt::ThreadRole::Main),
-    }
-}
-
-#[cfg(debug_assertions)]
-fn set_runtime_dir() -> Result<(), Box<dyn std::error::Error>> {
-    let exe_path = std::env::current_exe()?;
-    let exe_dir = exe_path.parent().ok_or_else(|| {
-        std::io::Error::other(format!(
-            "Cannot resolve executable directory from '{}'",
-            exe_path.display()
-        ))
-    })?;
-    let cwd = std::env::current_dir()?;
-    if cwd == exe_dir {
-        return Ok(());
-    }
-
-    let exe_has_markers = exe_dir.join("assets").is_dir()
-        || exe_dir.join("songs").is_dir()
-        || exe_dir.join("Songs").is_dir()
-        || exe_dir.join("save").is_dir()
-        || exe_dir.join("deadsync.ini").is_file();
-    let cwd_has_markers =
-        cwd.join("assets").is_dir() || cwd.join("songs").is_dir() || cwd.join("Songs").is_dir();
-    if exe_has_markers || !cwd_has_markers {
-        std::env::set_current_dir(exe_dir)?;
-    }
-    Ok(())
-}
-
-#[cfg(not(debug_assertions))]
-fn set_runtime_dir() -> Result<(), Box<dyn std::error::Error>> {
-    let exe_path = std::env::current_exe()?;
-    let exe_dir = exe_path.parent().ok_or_else(|| {
-        std::io::Error::other(format!(
-            "Cannot resolve executable directory from '{}'",
-            exe_path.display()
-        ))
-    })?;
-    std::env::set_current_dir(exe_dir)?;
-    Ok(())
-}
-
 fn startup_lines(cfg: &config::Config) -> Vec<String> {
+    let dirs = deadlib_platform::dirs::app_dirs();
     vec![
+        format!("Portable mode: {}", dirs.portable),
+        format!("Data directory: {}", dirs.data_dir.display()),
+        format!("Cache directory: {}", dirs.cache_dir.display()),
         format!(
             "Log file: {}",
             if cfg.log_to_file {
-                "deadsync.log"
+                dirs.log_path().display().to_string()
             } else {
-                "disabled"
+                "disabled".to_string()
             }
         ),
         format!("Log level: {}", cfg.log_level.as_str()),
@@ -135,11 +61,11 @@ fn audio_request_line(cfg: &config::Config) -> String {
         .map_or_else(|| "Auto".to_string(), |hz| format!("{hz} Hz"));
     #[cfg(target_os = "linux")]
     {
-        return format!(
+        format!(
             "Audio request: device={device}, mode={}, backend={}, rate={rate}",
             cfg.audio_output_mode.as_str(),
             cfg.linux_audio_backend.as_str()
-        );
+        )
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -150,7 +76,7 @@ fn audio_request_line(cfg: &config::Config) -> String {
     }
 }
 
-fn audio_device_lines(devices: &[core::audio::OutputDeviceInfo]) -> Vec<String> {
+fn audio_device_lines(devices: &[deadsync_audio_stream::OutputDeviceInfo]) -> Vec<String> {
     devices
         .iter()
         .enumerate()
@@ -200,31 +126,126 @@ fn install_panic_hook() {
     }));
 }
 
+/// Resolve whether the console window should be shown at startup. An explicit
+/// `--console` argument wins; otherwise fall back to the `ShowConsole` config
+/// preference (default off).
+fn resolve_show_console() -> bool {
+    if std::env::args().skip(1).any(|arg| arg == "--console") {
+        return true;
+    }
+    config::bootstrap_show_console()
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    set_runtime_dir()?;
-    core::host_time::init();
+    let cli = deadsync_updater::cli::UpdaterCli::from_env();
+    deadlib_platform::runtime_dir::set_current_dir_to_exe_dir()?;
+    deadlib_platform::host_time::init();
+
+    // Resolve and create platform-native data/cache directories.
+    deadlib_platform::dirs::ensure_dirs_exist();
+
+    // Reconcile the GUI-subsystem release build with terminal/opt-in output
+    // before the logger starts, so the first log lines land in the console when
+    // one is wanted (and no window appears when it isn't).
+    deadlib_platform::console::init(resolve_show_console());
 
     // Install logger immediately, then set runtime max level from config after loading it.
-    core::logging::init(config::bootstrap_log_to_file());
+    logging::init(
+        config::bootstrap_log_to_file(),
+        deadlib_platform::dirs::app_dirs().log_path(),
+    );
     install_panic_hook();
     // Startup default when config is missing or malformed.
     log::set_max_level(log::LevelFilter::Warn);
 
+    if let Some(request) = cli.apply_update.clone() {
+        let code = deadsync_updater::cli::run_apply_helper(request);
+        log::logger().flush();
+        std::process::exit(code);
+    }
+
     config::load();
     let cfg = config::get();
+    deadsync_updater::action::set_install_enabled(cfg.updater_install_enabled);
     log::set_max_level(cfg.log_level.as_level_filter());
-    core::logging::write_startup_report(&startup_lines(&cfg));
-    #[cfg(windows)]
-    let _windows_timing = boost_windows_runtime_timing();
-    game::profile::load();
-    if let Err(e) = core::audio::init() {
-        // The game can run without audio; log the error and continue.
-        log::error!("Failed to initialize audio engine: {e}");
-    } else {
-        core::logging::write_report_block(
-            "Startup audio devices",
-            &audio_device_lines(&core::audio::startup_output_devices()),
+    logging::write_startup_report(
+        StartupBuildInfo {
+            name: "deadsync",
+            version: env!("CARGO_PKG_VERSION"),
+            build_hash: option_env!("DEADSYNC_BUILD_HASH").unwrap_or("unknown"),
+            build_stamp: option_env!("DEADSYNC_BUILD_STAMP").unwrap_or("unknown"),
+        },
+        &startup_lines(&cfg),
+    );
+
+    if cli.restart {
+        log::info!(
+            "Restarted after self-update to {}",
+            deadsync_version::current_tag()
         );
     }
+
+    if let Some(exe_dir) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(std::path::PathBuf::from))
+    {
+        let _ = cli.cleanup_old.as_deref();
+        let report = deadsync_updater::apply_journal::recover(&exe_dir);
+        if report.journal_removed {
+            log::info!(
+                "Updater recovery: backups_removed={} backups_restored={} installed_removed={} staging_removed={}",
+                report.backups_removed,
+                report.backups_restored,
+                report.installed_removed,
+                report.staging_removed,
+            );
+        }
+    }
+
+    deadsync_updater::state::load_persisted_cache();
+    if cli.no_update_check {
+        log::info!("Startup update check disabled by --no-update-check");
+    } else {
+        deadsync_updater::state::spawn_startup_check();
+    }
+
+    // Initialize localization after config (which provides the language preference)
+    // and before profile/audio/screens which may use tr() for display strings.
+    let locale = assets::i18n::resolve_locale(cfg.language_flag);
+    assets::i18n::init(&locale);
+
+    #[cfg(windows)]
+    let _windows_timing = deadlib_platform::windows_rt::boost_main_thread_timing();
+    game::profile::load();
+    if let Err(e) = deadsync_audio_stream::init(deadsync_audio_stream::InitConfig {
+        output_device_index: cfg.audio_output_device_index,
+        output_mode: cfg.audio_output_mode,
+        #[cfg(target_os = "linux")]
+        linux_backend: cfg.linux_audio_backend,
+        sample_rate_hz: cfg.audio_sample_rate_hz,
+    }) {
+        // The game can run without audio; log the error and continue.
+        log::error!("Failed to initialize audio runtime: {e}");
+    } else {
+        logging::write_report_block(
+            "Startup audio devices",
+            &audio_device_lines(&deadsync_audio_stream::startup_output_devices()),
+        );
+
+        // Pre-warm ReplayGain for the bundled menu/background music so the
+        // first time one plays (fresh install, or after the cache was cleared)
+        // it doesn't audibly adjust loudness a few seconds in. Background
+        // priority keeps the foreground song preview ahead of this; already
+        // cached tracks are a cheap disk hit, so this is a no-op once warmed.
+        // Gated on the audio runtime initializing, since that is what sets up
+        // the ReplayGain subsystem the prewarm workers depend on.
+        if cfg.enable_replaygain {
+            deadsync_audio_replaygain::prewarm_paths(
+                assets::visual_styles::bundled_music_paths(),
+                deadsync_audio_replaygain::Priority::Background,
+            );
+        }
+    }
+
     app::run()
 }

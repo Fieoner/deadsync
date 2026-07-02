@@ -1,5 +1,5 @@
 use crate::screens::menu;
-use crate::ui::actors::Actor;
+use deadlib_present::actors::Actor;
 
 pub const SCENARIO_NAME: &str = "menu";
 
@@ -8,12 +8,17 @@ pub struct MenuBenchFixture {
 }
 
 impl MenuBenchFixture {
-    pub fn build(&self, retained: bool) -> Vec<Actor> {
+    pub fn push(&self, actors: &mut Vec<Actor>, retained: bool) {
         if !retained {
             menu::clear_render_cache(&self.state);
         }
-        let mut actors = menu::get_actors(&self.state, 1.0);
+        menu::push_actors(actors, &self.state, 1.0);
         actors.retain(|actor| actor_z(actor) >= 0);
+    }
+
+    pub fn build(&self, retained: bool) -> Vec<Actor> {
+        let mut actors = Vec::with_capacity(96);
+        self.push(&mut actors, retained);
         actors
     }
 }
@@ -30,8 +35,9 @@ fn actor_z(actor: &Actor) -> i16 {
         | Actor::Text { z, .. }
         | Actor::Mesh { z, .. }
         | Actor::TexturedMesh { z, .. }
-        | Actor::Frame { z, .. } => *z,
-        Actor::Camera { .. } => 0,
+        | Actor::Frame { z, .. }
+        | Actor::SharedFrame { z, .. } => *z,
+        Actor::Camera { .. } | Actor::CameraPush { .. } | Actor::CameraPop => 0,
         Actor::Shadow { child, .. } => actor_z(child),
     }
 }

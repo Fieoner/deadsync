@@ -1,10 +1,11 @@
 use crate::act;
-use crate::core::input::{InputEvent, VirtualAction};
-use crate::core::space::{screen_center_x, screen_height, screen_width};
-use crate::screens::components::shared::heart_bg;
+use crate::assets::i18n::tr;
+use crate::screens::components::shared::{transitions, visual_style_bg};
 use crate::screens::{Screen, ScreenAction};
-use crate::ui::actors::Actor;
-use crate::ui::color;
+use deadlib_present::actors::Actor;
+use deadlib_present::color;
+use deadlib_present::space::{screen_center_x, screen_height, screen_width};
+use deadsync_input::{InputEvent, VirtualAction};
 
 /* ---------------------------- transitions ---------------------------- */
 const TRANSITION_IN_DURATION: f32 = 0.4;
@@ -77,26 +78,46 @@ const CREDITS: &[CreditLine] = &[
     spacer(),
     spacer(),
     section("DeadSync Founding Members"),
+    name("flashitude"),
+    name("Reikwaza"),
+    name("fingy"),
     name("BSG"),
     name("RootReducer"),
+    name("dimo"),
+    name("topher123890"),
+    name("chickenmcbiscuts"),
     spacer(),
     spacer(),
     section("DeadSync Gold Patrons"),
     name("Wafles"),
+    name("nabulator"),
+    name("CernaML"),
     spacer(),
     spacer(),
     section("DeadSync Supporters"),
+    name("Lisek"),
     name("cookie"),
     spacer(),
     spacer(),
     section("DeadSync Contributors"),
-    name("Mason Boeman (maboesanman)"),
     name("adstep"),
-    name("DolphinChips"),
+    name("Fernando Chorney (SenPi)"),
+    name("Ben Pryor (Bkid)"),
+    name("DanPeriod"),
+    name("Mason Boeman (maboesanman)"),
+    name("saucepan"),
     name("rehtlaw"),
+    name("DolphinChips"),
+    name("din"),
+    name("madewithlinux"),
+    name("sabrina-440"),
+    name("Scott Brenner"),
+    name("Sereni"),
+    name("Romain Roffé (rofferom)"),
     spacer(),
     spacer(),
     section("rssp Contributors"),
+    name("adstep"),
     name("Celeste Clark (celex3)"),
     spacer(),
     spacer(),
@@ -147,7 +168,7 @@ const TOTAL_SCROLL_ITEMS: f32 = CREDITS.len() as f32 + ITEM_PADDING_START + ITEM
 
 pub struct State {
     pub active_color_index: i32,
-    bg: heart_bg::State,
+    bg: visual_style_bg::State,
     enter_elapsed: f32,
     scroll_items: f32,
 }
@@ -155,7 +176,7 @@ pub struct State {
 pub fn init() -> State {
     State {
         active_color_index: color::DEFAULT_COLOR_INDEX,
-        bg: heart_bg::State::new(),
+        bg: visual_style_bg::State::new(),
         enter_elapsed: 0.0,
         scroll_items: 0.0,
     }
@@ -207,16 +228,19 @@ pub fn handle_input(_state: &mut State, ev: &InputEvent) -> ScreenAction {
     }
 }
 
-pub fn get_actors(state: &State) -> Vec<Actor> {
-    let mut actors = Vec::with_capacity(CREDITS.len() * 2 + 12);
+pub fn push_actors(actors: &mut Vec<Actor>, state: &State) {
+    actors.reserve(CREDITS.len() * 2 + 12);
     let screen_w = screen_width();
     let screen_h = screen_height();
 
-    actors.extend(state.bg.build(heart_bg::Params {
-        active_color_index: state.active_color_index,
-        backdrop_rgba: [0.0, 0.0, 0.0, 1.0],
-        alpha_mul: 1.0,
-    }));
+    state.bg.push(
+        actors,
+        visual_style_bg::Params {
+            active_color_index: state.active_color_index,
+            backdrop_rgba: [0.0, 0.0, 0.0, 1.0],
+            alpha_mul: 1.0,
+        },
+    );
 
     let cinematic_t =
         ease_out_cubic((state.enter_elapsed / CINEMATIC_ANIM_SECONDS).clamp(0.0, 1.0));
@@ -291,9 +315,10 @@ pub fn get_actors(state: &State) -> Vec<Actor> {
         ));
     }
 
+    let return_prompt = tr("Credits", "ReturnPrompt");
     actors.push(act!(text:
         font("miso"):
-        settext("Press &START; and &BACK; to return"):
+        settext(return_prompt):
         align(0.5, 0.5):
         xy(screen_center_x(), screen_h - CINEMATIC_BAR_MAX_H * 0.5):
         zoom(0.7):
@@ -301,29 +326,18 @@ pub fn get_actors(state: &State) -> Vec<Actor> {
         diffuse(1.0, 1.0, 1.0, 0.8):
         z(40)
     ));
+}
 
+pub fn get_actors(state: &State) -> Vec<Actor> {
+    let mut actors = Vec::with_capacity(CREDITS.len() * 2 + 12);
+    push_actors(&mut actors, state);
     actors
 }
 
 pub fn in_transition() -> (Vec<Actor>, f32) {
-    let actor = act!(quad:
-        align(0.0, 0.0): xy(0.0, 0.0):
-        zoomto(screen_width(), screen_height()):
-        diffuse(0.0, 0.0, 0.0, 1.0):
-        z(1100):
-        linear(TRANSITION_IN_DURATION): alpha(0.0):
-        linear(0.0): visible(false)
-    );
-    (vec![actor], TRANSITION_IN_DURATION)
+    transitions::fade_in_black(TRANSITION_IN_DURATION, 1100)
 }
 
 pub fn out_transition() -> (Vec<Actor>, f32) {
-    let actor = act!(quad:
-        align(0.0, 0.0): xy(0.0, 0.0):
-        zoomto(screen_width(), screen_height()):
-        diffuse(0.0, 0.0, 0.0, 0.0):
-        z(1200):
-        linear(TRANSITION_OUT_DURATION): alpha(1.0)
-    );
-    (vec![actor], TRANSITION_OUT_DURATION)
+    transitions::fade_out_black(TRANSITION_OUT_DURATION, 1200)
 }

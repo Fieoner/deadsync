@@ -1,7 +1,8 @@
 use crate::assets::AssetManager;
-use crate::core::input::{InputEvent, InputSource, VirtualAction};
 use crate::screens::options;
-use crate::ui::actors::Actor;
+use deadlib_present::actors::Actor;
+use deadsync_core::input::InputSource;
+use deadsync_input::{InputEvent, VirtualAction};
 use std::time::Instant;
 
 use crate::test_support::compose_scenarios;
@@ -49,6 +50,7 @@ fn press(state: &mut options::State, asset_manager: &AssetManager, action: Virtu
     let now = Instant::now();
     let ev = InputEvent {
         action,
+        input_slot: 0,
         pressed: true,
         source: InputSource::Keyboard,
         timestamp: now,
@@ -65,8 +67,9 @@ fn actor_z(actor: &Actor) -> i16 {
         | Actor::Text { z, .. }
         | Actor::Mesh { z, .. }
         | Actor::TexturedMesh { z, .. }
-        | Actor::Frame { z, .. } => *z,
-        Actor::Camera { .. } => 0,
+        | Actor::Frame { z, .. }
+        | Actor::SharedFrame { z, .. } => *z,
+        Actor::Camera { .. } | Actor::CameraPush { .. } | Actor::CameraPop => 0,
         Actor::Shadow { child, .. } => actor_z(child),
     }
 }

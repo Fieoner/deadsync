@@ -1,0 +1,17 @@
+[package]
+name = "deadsync-smx"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0"
+
+[dependencies]
+deadsync-input = { path = "../deadsync-input" }
+deadsync-input-native = { path = "../deadsync-input-native" }
+deadlib-platform = { path = "../deadlib-platform" }
+log = "0.4.33"
+rustmaniax-sdk = "2.0.0"
+
+[lints.clippy]
+perf = { level = "warn", priority = -1 }
+
+inline_always = "allow"

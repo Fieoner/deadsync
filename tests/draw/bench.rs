@@ -1,12 +1,12 @@
-use deadsync::core::gfx::draw_prep::{
-    self, DrawOp, GlScratch, PrepareStats, SpriteInstanceRaw, TexturedMeshInstanceRaw,
-    TexturedMeshVertexRaw,
+use deadlib_present::compose;
+use deadlib_render::draw_prep::{self, DrawOp, DrawScratch, PrepareStats, TexturedMeshSource};
+use deadlib_render::{
+    BlendMode, MeshVertex, RenderList, SpriteInstanceRaw, TexturedMeshInstanceRaw,
+    TexturedMeshVertex,
 };
-use deadsync::core::gfx::{BlendMode, MeshMode, RenderList, TextureHandle};
+use deadsync::assets::PRESENT_TEXTURE_CONTEXT;
 use deadsync::test_support::{compose_case, compose_scenarios};
-use deadsync::ui::compose;
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::collections::HashMap;
 use std::error::Error;
 use std::hash::Hasher;
 use std::hint::black_box;
@@ -85,8 +85,10 @@ struct VerificationResult {
 #[derive(serde::Serialize)]
 struct PlanSnapshot {
     dynamic_upload_vertices: u64,
+    cached_upload_vertices: u64,
     sprite_instances: Vec<SpriteInstanceRaw>,
-    tmesh_vertices: Vec<TexturedMeshVertexRaw>,
+    mesh_vertices: Vec<MeshVertex>,
+    tmesh_vertices: Vec<TexturedMeshVertex>,
     tmesh_instances: Vec<TexturedMeshInstanceRaw>,
     ops: Vec<PlanOpSnapshot>,
 }
@@ -101,18 +103,31 @@ enum PlanOpSnapshot {
         camera: u8,
     },
     Mesh {
-        index: usize,
-    },
-    TexturedMesh {
         vertex_start: u32,
         vertex_count: u32,
-        geom_key: u64,
+        blend: &'static str,
+        camera: u8,
+    },
+    TexturedMesh {
+        source: PlanTMeshSourceSnapshot,
         instance_start: u32,
         instance_count: u32,
-        mode: &'static str,
         blend: &'static str,
         texture: u64,
         camera: u8,
+    },
+}
+
+#[derive(serde::Serialize)]
+enum PlanTMeshSourceSnapshot {
+    Transient {
+        vertex_start: u32,
+        vertex_count: u32,
+        geom_key: u64,
+    },
+    Cached {
+        cache_key: u64,
+        vertex_count: u32,
     },
 }
 
@@ -249,12 +264,13 @@ fn run_scenario(args: &Args, name: &str) -> Result<BenchmarkResult, Box<dyn Erro
             compose_scenarios::scenario_names().join(", ")
         )
     })?;
-    let render = compose::build_screen(
+    let render = compose::build_screen_with_texture_context(
         &scenario.actors,
         scenario.clear_color,
         &scenario.metrics,
         &scenario.fonts,
         scenario.total_elapsed,
+        &PRESENT_TEXTURE_CONTEXT,
     );
     benchmark_draw(
         scenario.name,
@@ -298,17 +314,16 @@ fn run_case(args: &Args, case_path: &str) -> Result<BenchmarkResult, Box<dyn Err
 
 fn benchmark_draw(
     name: &str,
-    render: &RenderList<'_>,
+    render: &RenderList,
     iters: u64,
     warmup: u64,
-    flip_texture_keys: bool,
+    _flip_texture_keys: bool,
     expect_plan_hash: Option<&str>,
     write_plan: Option<&str>,
     verification: Option<VerificationResult>,
 ) -> Result<BenchmarkResult, Box<dyn Error>> {
-    let texture_ids = texture_ids(render, flip_texture_keys);
     let mut render = render.clone();
-    resolve_texture_handles(&mut render, &texture_ids);
+    ensure_texture_handles(&mut render);
     let initial = build_plan(&render)?;
     let plan_hash = plan_snapshot_hash(&initial.snapshot)?;
     if let Some(expected) = expect_plan_hash
@@ -324,25 +339,25 @@ fn benchmark_draw(
         write_json(std::path::Path::new(path), &initial.snapshot)?;
     }
 
-    let mut scratch = GlScratch::with_capacity(
-        initial.snapshot.sprite_instances.len().max(256),
+    let mut scratch = DrawScratch::with_capacity(
+        initial.snapshot.mesh_vertices.len().max(1024),
         initial.snapshot.tmesh_vertices.len().max(1024),
         initial.snapshot.tmesh_instances.len().max(256),
         initial.snapshot.ops.len().max(64),
     );
     for _ in 0..warmup {
-        let stats = draw_prep::prepare_gl(&render, &mut scratch, Some);
-        black_box(checksum_plan(&scratch, stats));
+        let stats = draw_prep::prepare(&render, &mut scratch, |_, _| true);
+        black_box(checksum_plan(&render, &scratch, stats));
     }
 
     let start_alloc = ALLOC.begin_measurement();
     let started = Instant::now();
     let mut checksum = 0u64;
     for _ in 0..iters {
-        let stats = draw_prep::prepare_gl(black_box(&render), &mut scratch, Some);
+        let stats = draw_prep::prepare(black_box(&render), &mut scratch, |_, _| true);
         checksum = checksum
             .wrapping_mul(131)
-            .wrapping_add(checksum_plan(&scratch, stats));
+            .wrapping_add(checksum_plan(&render, &scratch, stats));
         black_box(checksum);
     }
 
@@ -375,18 +390,20 @@ struct BuiltPlan {
     snapshot: PlanSnapshot,
 }
 
-fn build_plan(render: &RenderList<'_>) -> Result<BuiltPlan, Box<dyn Error>> {
-    let mut scratch = GlScratch::with_capacity(256, 1024, 256, 64);
-    let stats = draw_prep::prepare_gl(render, &mut scratch, Some);
+fn build_plan(render: &RenderList) -> Result<BuiltPlan, Box<dyn Error>> {
+    let mut scratch = DrawScratch::with_capacity(1024, 1024, 256, 64);
+    let stats = draw_prep::prepare(render, &mut scratch, |_, _| true);
     Ok(BuiltPlan {
-        snapshot: plan_snapshot(&scratch, stats),
+        snapshot: plan_snapshot(render, &scratch, stats),
     })
 }
 
-fn plan_snapshot(scratch: &GlScratch<u64>, stats: PrepareStats) -> PlanSnapshot {
+fn plan_snapshot(render: &RenderList, scratch: &DrawScratch, stats: PrepareStats) -> PlanSnapshot {
     PlanSnapshot {
         dynamic_upload_vertices: stats.dynamic_upload_vertices,
-        sprite_instances: scratch.sprite_instances.clone(),
+        cached_upload_vertices: stats.cached_upload_vertices,
+        sprite_instances: render.sprite_instances.clone(),
+        mesh_vertices: scratch.mesh_vertices.clone(),
         tmesh_vertices: scratch.tmesh_vertices.clone(),
         tmesh_instances: scratch.tmesh_instances.clone(),
         ops: scratch
@@ -397,19 +414,21 @@ fn plan_snapshot(scratch: &GlScratch<u64>, stats: PrepareStats) -> PlanSnapshot 
                     instance_start: run.instance_start,
                     instance_count: run.instance_count,
                     blend: blend_name(run.blend),
-                    texture: run.texture,
+                    texture: run.texture_handle,
                     camera: run.camera,
                 },
-                DrawOp::Mesh(index) => PlanOpSnapshot::Mesh { index },
-                DrawOp::TexturedMesh(run) => PlanOpSnapshot::TexturedMesh {
+                DrawOp::Mesh(run) => PlanOpSnapshot::Mesh {
                     vertex_start: run.vertex_start,
                     vertex_count: run.vertex_count,
-                    geom_key: run.geom_key,
+                    blend: blend_name(run.blend),
+                    camera: run.camera,
+                },
+                DrawOp::TexturedMesh(run) => PlanOpSnapshot::TexturedMesh {
+                    source: tmesh_source_snapshot(run.source),
                     instance_start: run.instance_start,
                     instance_count: run.instance_count,
-                    mode: mesh_mode_name(run.mode),
                     blend: blend_name(run.blend),
-                    texture: run.texture,
+                    texture: run.texture_handle,
                     camera: run.camera,
                 },
             })
@@ -417,11 +436,17 @@ fn plan_snapshot(scratch: &GlScratch<u64>, stats: PrepareStats) -> PlanSnapshot 
     }
 }
 
-fn checksum_plan(scratch: &GlScratch<u64>, stats: PrepareStats) -> u64 {
+fn checksum_plan(render: &RenderList, scratch: &DrawScratch, stats: PrepareStats) -> u64 {
     let mut sum = stats.dynamic_upload_vertices;
     sum = sum
         .wrapping_mul(131)
-        .wrapping_add(scratch.sprite_instances.len() as u64);
+        .wrapping_add(stats.cached_upload_vertices);
+    sum = sum
+        .wrapping_mul(131)
+        .wrapping_add(render.sprite_instances.len() as u64);
+    sum = sum
+        .wrapping_mul(131)
+        .wrapping_add(scratch.mesh_vertices.len() as u64);
     sum = sum
         .wrapping_mul(131)
         .wrapping_add(scratch.tmesh_vertices.len() as u64);
@@ -431,12 +456,51 @@ fn checksum_plan(scratch: &GlScratch<u64>, stats: PrepareStats) -> u64 {
     sum = sum.wrapping_mul(131).wrapping_add(scratch.ops.len() as u64);
     if let Some(first) = scratch.ops.first() {
         sum = sum.wrapping_mul(131).wrapping_add(match *first {
-            DrawOp::Sprite(run) => run.texture,
-            DrawOp::Mesh(index) => index as u64,
-            DrawOp::TexturedMesh(run) => run.geom_key ^ run.texture,
+            DrawOp::Sprite(run) => run.texture_handle,
+            DrawOp::Mesh(run) => {
+                u64::from(run.vertex_start)
+                    ^ (u64::from(run.vertex_count) << 32)
+                    ^ u64::from(run.camera)
+            }
+            DrawOp::TexturedMesh(run) => tmesh_source_hash(run.source) ^ run.texture_handle,
         });
     }
     sum
+}
+
+fn tmesh_source_snapshot(source: TexturedMeshSource) -> PlanTMeshSourceSnapshot {
+    match source {
+        TexturedMeshSource::Transient {
+            vertex_start,
+            vertex_count,
+            geom_key,
+        } => PlanTMeshSourceSnapshot::Transient {
+            vertex_start,
+            vertex_count,
+            geom_key,
+        },
+        TexturedMeshSource::Cached {
+            cache_key,
+            vertex_count,
+        } => PlanTMeshSourceSnapshot::Cached {
+            cache_key,
+            vertex_count,
+        },
+    }
+}
+
+fn tmesh_source_hash(source: TexturedMeshSource) -> u64 {
+    match source {
+        TexturedMeshSource::Transient {
+            vertex_start,
+            vertex_count,
+            geom_key,
+        } => geom_key ^ u64::from(vertex_start) ^ (u64::from(vertex_count) << 32),
+        TexturedMeshSource::Cached {
+            cache_key,
+            vertex_count,
+        } => cache_key ^ (u64::from(vertex_count) << 32),
+    }
 }
 
 fn plan_snapshot_hash(snapshot: &PlanSnapshot) -> Result<String, Box<dyn Error>> {
@@ -446,66 +510,22 @@ fn plan_snapshot_hash(snapshot: &PlanSnapshot) -> Result<String, Box<dyn Error>>
     Ok(format!("{:016x}", hasher.finish()))
 }
 
-fn texture_ids(render: &RenderList<'_>, flip_texture_keys: bool) -> HashMap<String, u64> {
-    let mut ids = HashMap::new();
-    let mut next_id = 1u64;
-    for obj in &render.objects {
-        let key = match &obj.object_type {
-            deadsync::core::gfx::ObjectType::Sprite { texture_id, .. } => Some(texture_id.as_ref()),
-            deadsync::core::gfx::ObjectType::TexturedMesh { texture_id, .. } => {
-                Some(texture_id.as_ref())
-            }
-            deadsync::core::gfx::ObjectType::Mesh { .. } => None,
-        };
-        let Some(key) = key else {
-            continue;
-        };
-        let key = if flip_texture_keys {
-            flip_ascii_case(key)
-        } else {
-            key.to_string()
-        };
-        if ids.contains_key(key.as_str()) {
+fn ensure_texture_handles(render: &mut RenderList) {
+    let mut next_handle = 1u64;
+    for obj in &mut render.objects {
+        if obj.texture_handle != deadlib_render::INVALID_TEXTURE_HANDLE {
             continue;
         }
-        ids.insert(key, next_id);
-        next_id = next_id.wrapping_add(1).max(1);
-    }
-    ids
-}
-
-fn resolve_texture_handles(render: &mut RenderList<'_>, textures: &HashMap<String, TextureHandle>) {
-    for obj in &mut render.objects {
         obj.texture_handle = match &obj.object_type {
-            deadsync::core::gfx::ObjectType::Sprite { texture_id, .. }
-            | deadsync::core::gfx::ObjectType::TexturedMesh { texture_id, .. } => textures
-                .get(texture_id.as_ref())
-                .copied()
-                .or_else(|| {
-                    textures.iter().find_map(|(candidate, texture)| {
-                        candidate
-                            .eq_ignore_ascii_case(texture_id.as_ref())
-                            .then_some(*texture)
-                    })
-                })
-                .unwrap_or(deadsync::core::gfx::INVALID_TEXTURE_HANDLE),
-            deadsync::core::gfx::ObjectType::Mesh { .. } => {
-                deadsync::core::gfx::INVALID_TEXTURE_HANDLE
+            deadlib_render::ObjectType::Sprite(_)
+            | deadlib_render::ObjectType::TexturedMesh { .. } => {
+                let handle = next_handle;
+                next_handle = next_handle.wrapping_add(1).max(1);
+                handle
             }
+            deadlib_render::ObjectType::Mesh { .. } => deadlib_render::INVALID_TEXTURE_HANDLE,
         };
     }
-}
-
-fn flip_ascii_case(s: &str) -> String {
-    let mut out = Vec::with_capacity(s.len());
-    for b in s.bytes() {
-        out.push(match b {
-            b'a'..=b'z' => b - 32,
-            b'A'..=b'Z' => b + 32,
-            _ => b,
-        });
-    }
-    String::from_utf8(out).expect("ascii flip should preserve utf8")
 }
 
 fn blend_name(blend: BlendMode) -> &'static str {
@@ -514,12 +534,6 @@ fn blend_name(blend: BlendMode) -> &'static str {
         BlendMode::Add => "add",
         BlendMode::Multiply => "multiply",
         BlendMode::Subtract => "subtract",
-    }
-}
-
-fn mesh_mode_name(mode: MeshMode) -> &'static str {
-    match mode {
-        MeshMode::Triangles => "triangles",
     }
 }
 

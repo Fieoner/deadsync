@@ -1,8 +1,11 @@
 use crate::act;
-use crate::core::space::{screen_center_x, screen_center_y, screen_height, screen_width};
+use crate::assets::i18n::tr;
+use crate::assets::{FontRole, current_machine_font_key};
 use crate::game::profile;
 use crate::screens::{Screen, ScreenAction};
-use crate::ui::actors::Actor;
+use deadlib_present::actors::Actor;
+use deadlib_present::space::{screen_center_x, screen_center_y, screen_height, screen_width};
+use deadsync_profile as profile_data;
 use std::sync::mpsc;
 
 // Simply Love: BGAnimations/ScreenProfileLoad overlay.lua
@@ -28,7 +31,7 @@ enum PreparedState {
 
 pub fn init() -> State {
     State {
-        active_color_index: crate::ui::color::DEFAULT_COLOR_INDEX,
+        active_color_index: deadlib_present::color::DEFAULT_COLOR_INDEX,
         elapsed: 0.0,
         rx: None,
         prepared_select_music: None,
@@ -43,18 +46,18 @@ pub fn on_enter(state: &mut State) {
     state.prepared_select_course = None;
     state.rx = None;
     state.next_screen = match profile::get_session_play_mode() {
-        profile::PlayMode::Marathon => Screen::SelectCourse,
-        profile::PlayMode::Regular => Screen::SelectMusic,
+        profile_data::PlayMode::Marathon => Screen::SelectCourse,
+        profile_data::PlayMode::Regular => Screen::SelectMusic,
     };
 
     let (tx, rx) = mpsc::channel();
     let play_mode = profile::get_session_play_mode();
     std::thread::spawn(move || {
         let prepared = match play_mode {
-            profile::PlayMode::Marathon => {
+            profile_data::PlayMode::Marathon => {
                 PreparedState::Course(crate::screens::select_course::init())
             }
-            profile::PlayMode::Regular => {
+            profile_data::PlayMode::Regular => {
                 crate::game::scores::prewarm_select_music_score_caches();
                 PreparedState::Music(crate::screens::select_music::init())
             }
@@ -119,7 +122,7 @@ pub fn update(state: &mut State, dt: f32) -> Option<ScreenAction> {
     None
 }
 
-pub fn handle_input(_: &mut State, _: &crate::core::input::InputEvent) -> ScreenAction {
+pub fn handle_input(_: &mut State, _: &deadsync_input::InputEvent) -> ScreenAction {
     ScreenAction::None
 }
 
@@ -131,48 +134,49 @@ pub fn out_transition() -> (Vec<Actor>, f32) {
     (vec![], 0.0)
 }
 
-pub fn get_actors(_: &State) -> Vec<Actor> {
+pub fn push_actors(actors: &mut Vec<Actor>, _: &State) {
+    actors.reserve(4);
     let w = screen_width();
     let h = screen_height();
     let cx = screen_center_x();
     let cy = screen_center_y();
 
-    vec![
-        // Backdrop (ScreenWithMenuElements background is effectively black here).
-        act!(quad:
-            align(0.0, 0.0): xy(0.0, 0.0):
-            zoomto(w, h):
-            diffuse(0.0, 0.0, 0.0, 1.0):
-            z(0.0)
-        ),
-        // FadeToBlack
-        act!(quad:
-            align(0.0, 0.0): xy(0.0, 0.0):
-            zoomto(w, h):
-            diffuse(0.0, 0.0, 0.0, 0.0):
-            z(100.0):
-            sleep(TWEENTIME):
-            linear(TWEENTIME): alpha(1.0)
-        ),
-        // HorizontalWhiteSwoosh
-        act!(quad:
-            align(0.5, 0.5): xy(cx, cy):
-            diffuse(1.0, 1.0, 1.0, 1.0):
-            zoomto(w + SWOOSH_W_PAD, SWOOSH_H):
-            fadeleft(0.1): faderight(0.1):
-            cropright(1.0):
-            z(101.0):
-            linear(TWEENTIME): cropright(0.0):
-            sleep(TWEENTIME):
-            linear(TWEENTIME): cropleft(1.0)
-        ),
-        // "Common Bold" (Simply Love) -> Wendy small.
-        act!(text:
-            font("wendy"): settext("Loading"):
-            align(0.5, 0.5): xy(cx, cy):
-            zoom(0.6):
-            diffuse(0.0, 0.0, 0.0, 1.0):
-            z(102.0)
-        ),
-    ]
+    actors.push(act!(quad:
+        align(0.0, 0.0): xy(0.0, 0.0):
+        zoomto(w, h):
+        diffuse(0.0, 0.0, 0.0, 1.0):
+        z(0.0)
+    ));
+    actors.push(act!(quad:
+        align(0.0, 0.0): xy(0.0, 0.0):
+        zoomto(w, h):
+        diffuse(0.0, 0.0, 0.0, 0.0):
+        z(100.0):
+        sleep(TWEENTIME):
+        linear(TWEENTIME): alpha(1.0)
+    ));
+    actors.push(act!(quad:
+        align(0.5, 0.5): xy(cx, cy):
+        diffuse(1.0, 1.0, 1.0, 1.0):
+        zoomto(w + SWOOSH_W_PAD, SWOOSH_H):
+        fadeleft(0.1): faderight(0.1):
+        cropright(1.0):
+        z(101.0):
+        linear(TWEENTIME): cropright(0.0):
+        sleep(TWEENTIME):
+        linear(TWEENTIME): cropleft(1.0)
+    ));
+    actors.push(act!(text:
+        font(current_machine_font_key(FontRole::Header)): settext(tr("Common", "Loading")):
+        align(0.5, 0.5): xy(cx, cy):
+        zoom(0.6):
+        diffuse(0.0, 0.0, 0.0, 1.0):
+        z(102.0)
+    ));
+}
+
+pub fn get_actors(state: &State) -> Vec<Actor> {
+    let mut actors = Vec::with_capacity(4);
+    push_actors(&mut actors, state);
+    actors
 }

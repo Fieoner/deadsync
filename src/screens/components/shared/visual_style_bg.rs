@@ -1,0 +1,333 @@
+use super::technique_bg;
+use crate::act;
+use crate::assets::visual_styles;
+use crate::config::{self, SrpgVariant, VisualStyle};
+use deadlib_present::actors::Actor;
+use deadlib_present::color;
+use deadlib_present::space::{screen_center_x, screen_center_y, screen_height, screen_width};
+use std::sync::{
+    Arc, Mutex, OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
+
+// Shared UI elapsed clock advanced by `app` using post-Tab-acceleration dt so
+// menu backgrounds stay phase-locked across screens while still honoring
+// fast/slow/paused menu animation controls.
+static GLOBAL_ELAPSED_BITS: AtomicU64 = AtomicU64::new(0.0_f64.to_bits());
+static SRPG_BACKGROUND_KEY: OnceLock<Mutex<Option<Arc<str>>>> = OnceLock::new();
+
+const COLOR_ADD: [i32; 10] = [-1, 0, 0, -1, -1, -1, 0, 0, 0, 0];
+const DIFFUSE_ALPHA: [f32; 10] = [0.05, 0.2, 0.1, 0.1, 0.1, 0.1, 0.1, 0.05, 0.1, 0.1];
+const XY: [f32; 10] = [
+    0.0, 40.0, 80.0, 120.0, 200.0, 280.0, 360.0, 400.0, 480.0, 560.0,
+];
+const UV_VEL: [[f32; 2]; 10] = [
+    [0.03, 0.01],
+    [0.03, 0.02],
+    [0.03, 0.01],
+    [0.02, 0.02],
+    [0.03, 0.03],
+    [0.02, 0.02],
+    [0.03, 0.01],
+    [-0.03, 0.01],
+    [0.05, 0.03],
+    [0.03, 0.04],
+];
+const SHARED_BG_ZOOM: f32 = 1.3;
+const SHARED_BG_UV_SPAN: f32 = 1.0;
+
+#[derive(Clone, Copy)]
+struct TiledStyleState;
+
+#[derive(Clone)]
+pub struct State {
+    tiled: TiledStyleState,
+    technique: technique_bg::State,
+}
+
+pub struct Params {
+    pub active_color_index: i32,
+    pub backdrop_rgba: [f32; 4],
+    pub alpha_mul: f32,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Default for TiledStyleState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TiledStyleState {
+    const fn new() -> Self {
+        Self
+    }
+
+    fn push_at_elapsed(&self, out: &mut Vec<Actor>, params: &Params, elapsed_s: f64) {
+        out.reserve(11);
+        let w = screen_width();
+        let h = screen_height();
+        out.push(act!(quad:
+            align(0.0, 0.0):
+            xy(0.0, 0.0):
+            zoomto(w, h):
+            diffuse(params.backdrop_rgba[0], params.backdrop_rgba[1], params.backdrop_rgba[2], params.backdrop_rgba[3]):
+            z(-100)
+        ));
+
+        for i in 0..10 {
+            let mut rgba = color::decorative_rgba(params.active_color_index + COLOR_ADD[i]);
+            rgba[3] = DIFFUSE_ALPHA[i] * params.alpha_mul;
+            let uv = scrolled_uv_rect(UV_VEL[i], elapsed_s);
+
+            push_shared_bg(out, XY[i], XY[i], rgba, uv);
+        }
+    }
+}
+
+impl State {
+    pub fn new() -> Self {
+        Self {
+            tiled: TiledStyleState::new(),
+            technique: technique_bg::State::new(),
+        }
+    }
+
+    pub fn build(&self, params: Params) -> Vec<Actor> {
+        self.build_at_elapsed(params, global_elapsed_s())
+    }
+
+    pub fn push(&self, out: &mut Vec<Actor>, params: Params) {
+        self.push_at_elapsed(out, params, global_elapsed_s());
+    }
+
+    pub fn push_at_elapsed(&self, out: &mut Vec<Actor>, params: Params, elapsed_s: f64) {
+        let style = visual_style();
+        if matches!(style, VisualStyle::Technique)
+            && self.technique.push_at_elapsed(
+                out,
+                params.active_color_index,
+                params.backdrop_rgba,
+                params.alpha_mul,
+                elapsed_s,
+            )
+        {
+            return;
+        }
+        if matches!(style, VisualStyle::Srpg9) {
+            push_srpg(out, &params);
+            return;
+        }
+        self.tiled.push_at_elapsed(out, &params, elapsed_s);
+    }
+
+    pub fn build_at_elapsed(&self, params: Params, elapsed_s: f64) -> Vec<Actor> {
+        let mut actors = Vec::new();
+        self.push_at_elapsed(&mut actors, params, elapsed_s);
+        actors
+    }
+}
+
+fn push_shared_bg(out: &mut Vec<Actor>, x: f32, y: f32, rgba: [f32; 4], uv: [f32; 4]) {
+    out.push(
+        act!(sprite_static(visual_styles::shared_background_texture_key()):
+            xy(x, y):
+            zoom(SHARED_BG_ZOOM):
+            customtexturerect(uv[0], uv[1], uv[2], uv[3]):
+            diffuse(rgba[0], rgba[1], rgba[2], rgba[3]):
+            z(-99)
+        ),
+    );
+}
+
+fn push_srpg(out: &mut Vec<Actor>, params: &Params) {
+    out.reserve(3);
+    let w = screen_width();
+    let h = screen_height();
+    let background_key = srpg_background_key();
+    out.push(act!(quad:
+        align(0.0, 0.0):
+        xy(0.0, 0.0):
+        zoomto(w, h):
+        diffuse(params.backdrop_rgba[0], params.backdrop_rgba[1], params.backdrop_rgba[2], params.backdrop_rgba[3]):
+        z(-100)
+    ));
+
+    let mut tint = srpg_background_tint(params.active_color_index);
+    tint[0] = (tint[0] * 3.0).min(1.0);
+    tint[1] = (tint[1] * 3.0).min(1.0);
+    tint[2] = (tint[2] * 3.0).min(1.0);
+    tint[3] = params.alpha_mul;
+    out.push(act!(sprite(background_key):
+        align(0.5, 0.5):
+        xy(screen_center_x(), screen_center_y()):
+        setsize((h * 16.0 / 9.0).max(w), h):
+        diffuse(tint[0], tint[1], tint[2], tint[3]):
+        z(-99)
+    ));
+    out.push(act!(quad:
+        align(0.0, 0.0):
+        xy(0.0, 0.0):
+        zoomto(w, h):
+        diffuse(0.0, 0.0, 0.0, 0.5 * params.alpha_mul):
+        z(-98)
+    ));
+}
+
+pub fn set_srpg_background_key(key: Option<String>) {
+    if let Ok(mut slot) = SRPG_BACKGROUND_KEY.get_or_init(|| Mutex::new(None)).lock() {
+        *slot = key.map(Arc::<str>::from);
+    }
+}
+
+fn srpg_background_key() -> Arc<str> {
+    let fallback = || Arc::<str>::from(visual_styles::shared_background_texture_key());
+    match SRPG_BACKGROUND_KEY.get_or_init(|| Mutex::new(None)).lock() {
+        Ok(slot) => slot.clone().unwrap_or_else(fallback),
+        Err(_) => fallback(),
+    }
+}
+
+fn srpg_background_tint(active_color_index: i32) -> [f32; 4] {
+    let Ok(cfg) = std::panic::catch_unwind(config::get) else {
+        return color::decorative_rgba(active_color_index);
+    };
+    match cfg.srpg_variant {
+        SrpgVariant::Srpg10 if cfg.visual_style.is_srpg() => color::srpg10_rgba(active_color_index),
+        _ => color::decorative_rgba(active_color_index),
+    }
+}
+
+#[inline(always)]
+fn scrolled_uv_rect(velocity: [f32; 2], elapsed_s: f64) -> [f32; 4] {
+    let u0 = (f64::from(velocity[0]) * elapsed_s).rem_euclid(1.0) as f32;
+    let v0 = (f64::from(velocity[1]) * elapsed_s).rem_euclid(1.0) as f32;
+    [u0, v0, u0 + SHARED_BG_UV_SPAN, v0 + SHARED_BG_UV_SPAN]
+}
+
+fn visual_style() -> VisualStyle {
+    std::panic::catch_unwind(|| config::get().visual_style).unwrap_or(VisualStyle::Hearts)
+}
+
+#[inline]
+pub fn tick_global(dt: f32) {
+    if !dt.is_finite() || dt <= 0.0 {
+        return;
+    }
+    let dt = f64::from(dt);
+    let _ = GLOBAL_ELAPSED_BITS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
+        let elapsed = f64::from_bits(bits);
+        let next = elapsed + dt;
+        Some(if next.is_finite() {
+            next.max(0.0).to_bits()
+        } else {
+            bits
+        })
+    });
+}
+
+#[inline]
+fn global_elapsed_s() -> f64 {
+    f64::from_bits(GLOBAL_ELAPSED_BITS.load(Ordering::Relaxed))
+}
+
+#[cfg(test)]
+fn set_global_elapsed_for_test(elapsed_s: f64) {
+    GLOBAL_ELAPSED_BITS.store(elapsed_s.max(0.0).to_bits(), Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const EPS: f64 = 1e-3;
+
+    fn params() -> Params {
+        Params {
+            active_color_index: 3,
+            backdrop_rgba: [0.0, 0.0, 0.0, 1.0],
+            alpha_mul: 1.0,
+        }
+    }
+
+    fn first_bg_sprite(actors: &[Actor]) -> ([f32; 2], [f32; 4]) {
+        let Some(Actor::Sprite {
+            offset,
+            source,
+            uv_rect,
+            ..
+        }) = actors.get(1)
+        else {
+            panic!("missing first background sprite");
+        };
+        assert_eq!(
+            source.texture_key(),
+            Some(visual_styles::for_style(VisualStyle::Hearts).shared_background)
+        );
+        (
+            *offset,
+            uv_rect.expect("shared background should scroll UVs"),
+        )
+    }
+
+    #[test]
+    fn build_reads_shared_elapsed_clock() {
+        set_global_elapsed_for_test(2.5);
+        let state = TiledStyleState::new();
+        let mut shared_actors = Vec::new();
+        state.push_at_elapsed(&mut shared_actors, &params(), global_elapsed_s());
+        let mut explicit_actors = Vec::new();
+        state.push_at_elapsed(&mut explicit_actors, &params(), 2.5);
+        let shared = first_bg_sprite(&shared_actors);
+        let explicit = first_bg_sprite(&explicit_actors);
+        assert!(
+            f64::from((shared.0[0] - explicit.0[0]).abs()) < EPS
+                && f64::from((shared.0[1] - explicit.0[1]).abs()) < EPS
+                && shared
+                    .1
+                    .iter()
+                    .zip(explicit.1)
+                    .all(|(a, b)| f64::from((*a - b).abs()) < EPS),
+            "shared={shared:?} explicit={explicit:?}"
+        );
+    }
+
+    #[test]
+    fn tick_global_accumulates_positive_dt() {
+        set_global_elapsed_for_test(1.0);
+        tick_global(0.5);
+        assert!(
+            (global_elapsed_s() - 1.5).abs() < EPS,
+            "got {}",
+            global_elapsed_s()
+        );
+        tick_global(0.0);
+        assert!(
+            (global_elapsed_s() - 1.5).abs() < EPS,
+            "got {}",
+            global_elapsed_s()
+        );
+        tick_global(-0.25);
+        assert!(
+            (global_elapsed_s() - 1.5).abs() < EPS,
+            "got {}",
+            global_elapsed_s()
+        );
+    }
+
+    #[test]
+    fn tick_global_keeps_subframe_precision_after_long_uptime() {
+        set_global_elapsed_for_test(1_000_000.0);
+        tick_global(1.0 / 240.0);
+        assert!(
+            global_elapsed_s() > 1_000_000.0,
+            "got {}",
+            global_elapsed_s()
+        );
+    }
+}

@@ -1,5 +1,5 @@
+use deadlib_present::actors::Actor;
 use crate::screens::components::shared::heart_bg;
-use crate::ui::actors::Actor;
 
 pub const SCENARIO_NAME: &str = "heart-bg";
 

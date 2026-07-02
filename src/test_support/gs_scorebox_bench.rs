@@ -1,15 +1,16 @@
-use crate::game::profile;
-use crate::game::scores::{
-    CachedPlayerLeaderboardData, LeaderboardEntry, LeaderboardPane, PlayerLeaderboardData,
-};
+use crate::game::scores;
 use crate::screens::components::shared::gs_scorebox;
-use crate::ui::actors::Actor;
+use deadlib_present::actors::Actor;
+use deadsync_score::{
+    CachedPlayerLeaderboardData, GameplayScoreboxProfileSnapshot, LeaderboardEntry,
+    LeaderboardPane, PlayerLeaderboardData,
+};
 
 pub const SCENARIO_NAME: &str = "gs-scorebox";
 
 pub struct GsScoreboxBenchFixture {
     snapshot: CachedPlayerLeaderboardData,
-    side: profile::PlayerSide,
+    profile_snapshot: GameplayScoreboxProfileSnapshot,
     center_x: f32,
     center_y: f32,
     zoom: f32,
@@ -19,8 +20,8 @@ pub struct GsScoreboxBenchFixture {
 impl GsScoreboxBenchFixture {
     pub fn build(&self) -> Vec<Actor> {
         gs_scorebox::gameplay_scorebox_actors_from_cached_snapshot(
-            self.side,
             &self.snapshot,
+            &self.profile_snapshot,
             self.center_x,
             self.center_y,
             self.zoom,
@@ -30,6 +31,8 @@ impl GsScoreboxBenchFixture {
 }
 
 pub fn fixture() -> GsScoreboxBenchFixture {
+    let mut profile = deadsync_profile::Profile::default();
+    profile.display_scorebox = true;
     GsScoreboxBenchFixture {
         snapshot: CachedPlayerLeaderboardData {
             loading: false,
@@ -42,9 +45,11 @@ pub fn fixture() -> GsScoreboxBenchFixture {
                     leaderboard_pane("Stamina RPG 9", false, scores_rpg()),
                     leaderboard_pane("ITL Online 2024", false, scores_itl()),
                 ],
+                itl_self_score: None,
+                itl_self_rank: None,
             }),
         },
-        side: profile::PlayerSide::P1,
+        profile_snapshot: scores::scorebox_profile_snapshot(&profile, true, None),
         center_x: 704.0,
         center_y: 108.0,
         zoom: 1.0,
@@ -58,6 +63,8 @@ fn leaderboard_pane(name: &str, is_ex: bool, entries: Vec<LeaderboardEntry>) -> 
         entries,
         is_ex,
         disabled: false,
+        personalized: true,
+        arrowcloud_kind: None,
     }
 }
 

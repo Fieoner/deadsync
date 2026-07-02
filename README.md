@@ -44,7 +44,7 @@ export RUSTFLAGS="-L native=$brew_prefix/lib -L native=$brew_prefix/opt/vulkan-l
 
 ### BSD build dependencies (FreeBSD)
 ```bash
-pkg install cmake python3 pkgconf alsa-lib alsa-plugins vulkan-validation-layers
+pkg install cmake python3 pkgconf alsa-lib alsa-plugins vulkan-validation-layers hidapi
 ```
 
 ## Getting Started
@@ -55,12 +55,15 @@ Follow these steps to get the game running:
     ```sh
     git clone https://github.com/pnn64/deadsync.git
     cd deadsync
-    git submodule update --init
     ```
 
 2.  **Add Songs:**
-    Create a folder named `songs` in the project root. Place your song packs inside this directory.
-    *   *Example structure: `deadsync/songs/MyPack/MySong/MySong.ssc`*
+    Place your song packs in one of DeadSync's song scan roots:
+    *   the `songs/` folder inside the data directory (see [Data Directories](#data-directories))
+    *   the `songs/` folder next to the executable
+    *   any folder listed in `AdditionalSongFolders`, `AdditionalSongFoldersReadOnly`, or `AdditionalSongFoldersWritable`
+
+    *Example structure inside a song root: `<song-root>/MyPack/MySong/MySong.ssc`*
 
 3.  **Build the Project:**
     Compile the game in release mode for optimal performance:
@@ -75,14 +78,19 @@ Follow these steps to get the game running:
         ```sh
         .\target\release\deadsync.exe
         ```
-    *   **On Linux or macOS:**
+    *   **On Linux:**
+        ```sh
+        ./target/release/deadsync
+        ```
+     *  **On macOS:**
+        Before the first run, grant Input Monitoring permissions to `Terminal.app` in `System Settings > Privacy & Security > Input Monitoring`. Without this, deadsync will not receive any keystrokes. Then, run:
         ```sh
         ./target/release/deadsync
         ```
 
 ## Configuration
 
-After running the game for the first time, configuration files and a `save` directory will be generated in the project root.
+After running the game for the first time, configuration files and a `save` directory will be generated.
 
 ### Game Settings
 You can edit `deadsync.ini` to change various settings, including renderer, video resolution, VSync, `GfxDebug` (backend validation/debugging), and the default theme color.
@@ -131,11 +139,121 @@ P1_Back=PadCode[0x00030031]@0
 
 Legacy high-level bindings like `PadDir::Up`, `PadButton::Confirm`, and `PadN::Dir::Left` are still accepted for convenience, but low-level `PadCode[...]` bindings are the most accurate and device-agnostic way to configure controllers.
 
-### Profile & Online Features
-A `save` directory is also created to store your personal data.
+#### Debug shortcuts
 
-*   To enable online features with **GrooveStats**, edit the `save/profiles/00000000/groovestats.ini` file and add your API key and username. This allows the game to fetch your online scores.
-*   You can also change your in-game display name in `save/profiles/00000000/profile.ini`.
+| Key | Action |
+|-----|--------|
+| `Tab` (hold) | Fast-forward menus and transitions at 4×. Disabled in gameplay. |
+| `` ` `` (hold) | Slow menus and transitions to 0.25×. Disabled in gameplay. |
+| `Tab` + `` ` `` | Halt menu animations. Disabled in gameplay. |
+| `F3` | Cycle the stats overlay (off → FPS → +stutter → +timing). |
+| `Ctrl`+`F3` | Toggle the live frame-statistics overlay: rolling per-phase frame-time graph (with idle/await-GPU segments and catch-up/spike markers), a frame-interval jitter histogram, and display-clock + audio sync-health readouts. Opens in the top-right corner, or the last position you moved it to. |
+| `Ctrl`+`Shift`+`F3` | Move the frame-statistics overlay to the next corner. The chosen corner is remembered across toggles and restarts. |
+| `Ctrl`+`Alt`+`F3` | Switch the frame-statistics overlay between the *detailed* presentation (stable decaying-histogram p99 + jitter histogram) and a *minimal* presentation (the graph is the jitter display — no histogram, no percentiles). Remembered across restarts. |
+
+These shortcuts mirror ITGmania's debug-loop modifiers and never affect timing-sensitive gameplay (note timing, scoring, music sync). Set `TabAcceleration=0` in `deadsync.ini` to disable them entirely.
+
+See [Frame-Statistics Overlay](docs/frame-stats-overlay.md) for how to read the colored graph, the marker and reference lines, and the readout cells.
+
+### Profile & Online Features
+A `save` directory is created inside the data directory to store your personal data (see [Data Directories](#data-directories) for its location).
+
+*   To enable online features with **GrooveStats**, edit `<data dir>/save/profiles/00000000/groovestats.ini` and add your API key and username. This allows the game to fetch your online scores.
+*   You can also change your in-game display name in `<data dir>/save/profiles/00000000/profile.ini`.
+
+### Custom sound packs
+
+DeadSync supports zmod-style "drop in a folder, play a random one" custom
+sounds. The bundled `assets/sounds/` directory ships several folders that
+you can fill with your own `.ogg` files; the data-directory overlay
+(`{data dir}/assets/sounds/...`) is honored as well, so you don't have to
+modify the install. Files whose name starts with `_` are ignored.
+
+| Folder | Plays when |
+|---|---|
+| `assets/sounds/evaluation_pass/` | Any joined player clears (passes) on the Evaluation screen |
+| `assets/sounds/evaluation_fail/` | All joined players failed on the Evaluation screen |
+| `assets/sounds/evaluation_pb/` | GrooveStats submit response reports a Personal Best |
+| `assets/sounds/evaluation_wr/` | GrooveStats submit response reports a World Record (rank 1) |
+| `assets/sounds/song_start/` | Gameplay starts (first try; not on restart) |
+| `assets/sounds/song_start/restart/` | Gameplay restarts. Naming is `{n}.ogg` (1.ogg, 2.ogg, ...). Falls back to `restart.ogg` for any restart count without a matching file |
+
+`{n}` in `song_start/restart/` is the restart count since the last fresh
+entry into Gameplay; it resets to zero on `SelectMusic → Gameplay` and
+between course songs.
+
+Custom per-style menu music works the same way: drop `.ogg` files into
+`assets/music/menu/{style}/` (one of `hearts`, `arrows`, `bears`,
+`ducks`, `cats`, `spooky`, `gay`, `stars`, `thonk`, `technique`, `srpg9`)
+and the menu music for that visual style will randomly pick from your
+files. If the folder is empty the bundled per-style track plays.
+
+The whole feature is gated by `CustomSoundsEnabled` in `deadsync.ini`
+(default `1`). Set it to `0` to disable all folder-based sound triggers.
+
+## Direct Pad Support
+
+DeadSync can communicate directly with dance pad hardware over USB, bypassing the OS gamepad layer. This gives you named panel inputs, stable per-pad player assignment, and the ability to read and write pad sensor configuration from within the game.
+
+| Pad | Status | Docs |
+|-----|--------|------|
+| **StepManiaX** | ✅ Supported | [Documentation](docs/stepmaniax.md) |
+| **FSRio** | ✅ Supported | |
+
+## Data Directories
+
+By default, DeadSync stores user data outside the install directory so that upgrading the game doesn't risk overwriting your config, saves, or scores. Each platform uses native, XDG-compliant locations.
+
+### Default locations
+
+| Platform | Data directory | Cache directory |
+|----------|---------------|-----------------|
+| **Linux / FreeBSD** | `~/.local/share/deadsync` (`$XDG_DATA_HOME/deadsync`) | `~/.cache/deadsync` (`$XDG_CACHE_HOME/deadsync`) |
+| **Windows** | `%APPDATA%\deadsync` | `%APPDATA%\deadsync\cache` |
+| **macOS** | `~/Library/Application Support/deadsync` | `~/Library/Caches/deadsync` |
+
+**Data directory** contains user data that should be backed up:
+
+```
+deadsync.ini          # game configuration
+deadsync.log          # current run's log (previous runs kept as deadsync-<timestamp>.log)
+save/
+  profiles/           # player profiles, scores, settings
+  screenshots/        # captured screenshots
+songs/                # default song scan root
+courses/              # course files
+```
+
+**Cache directory** contains regenerable data that can be freely deleted:
+
+```
+songs/                # parsed song metadata cache
+banner/               # banner image cache
+cdtitle/              # CD title image cache
+downloads/            # temporary download data
+noteskins/            # compiled noteskin cache
+unlocks-cache.json    # online unlock cache
+```
+
+### Portable mode
+
+If you prefer a fully self-contained install (e.g. for arcade cabs or USB sticks), create an empty file named **`portable.txt`** next to the executable. When this file is present, DeadSync stores everything in the executable's directory — the same behavior as older versions.
+
+The file's contents are ignored; only its presence matters.
+
+### Song directories
+
+DeadSync scans for songs in the following locations:
+
+1. The `songs/` folder inside the data directory.
+2. The `songs/` folder next to the executable (in non-portable mode, so bundled songs are always found).
+3. Any additional folders listed in `AdditionalSongFolders`, `AdditionalSongFoldersReadOnly`, or `AdditionalSongFoldersWritable` in `deadsync.ini`.
+
+Course files follow the same pattern: DeadSync scans the data-directory `courses/` root first and, in non-portable mode, also scans the `courses/` folder next to the executable.
+
+### Migration
+
+On first run in non-portable mode, if DeadSync finds a `deadsync.ini` next to the executable but not in the data directory, it will automatically copy `deadsync.ini`, `save/`, and legacy cache subdirectories into the new data/cache locations. Install-folder `songs/` and `courses/` are **not** copied; they remain in place and are still scanned in non-portable mode. The originals are **not** deleted — you can clean them up manually after verifying everything works.
 
 ## Contributing
 
@@ -153,7 +271,7 @@ When reporting a bug, attaching a log file helps the team diagnose the problem q
 
 ### 1. Enable file logging
 
-Open `deadsync.ini` (created in the project root after the first run) and set the following under `[Options]`:
+Open `deadsync.ini` (created after the first run; see [Data Directories](#data-directories)) and set the following under `[Options]`:
 
 ```ini
 [Options]
@@ -170,7 +288,7 @@ Use **Debug** for most bug reports. Use **Trace** only if asked—it produces si
 
 ### 2. Reproduce the issue
 
-Launch the game and reproduce the problem. The log is written to **`deadsync.log`** in the project root (the same folder as the executable).
+Launch the game and reproduce the problem. The log is written to **`deadsync.log`** in the data directory (see [Data Directories](#data-directories) above). The previous two runs are kept alongside it as `deadsync-<timestamp>.log`.
 
 ### 3. Share the log
 

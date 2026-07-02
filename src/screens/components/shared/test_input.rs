@@ -1,15 +1,18 @@
 use crate::act;
-use crate::core::input::{
-    InputEvent, PadDir, PadEvent, RawKeyboardEvent, VirtualAction, with_keymap,
-};
-use crate::core::space::{screen_center_x, screen_center_y, screen_height, screen_width};
-use crate::ui::actors::Actor;
-use std::collections::HashMap;
+use crate::assets::{FontRole, current_machine_font_key};
+use deadlib_present::actors::Actor;
+use deadlib_present::space::{screen_center_x, screen_center_y, screen_height, screen_width};
+use deadsync_input::RawKeyboardEvent;
+use deadsync_input::{InputEvent, PadDir, PadEvent, VirtualAction, with_keymap};
+use std::collections::{HashMap, VecDeque};
+use std::time::Instant;
 use winit::keyboard::KeyCode;
 
 const UNMAPPED_AXIS_HELD_THRESHOLD: f32 = 0.5;
 const SORT_MENU_DIM_ALPHA: f32 = 0.875;
 const SORT_MENU_CLOSE_HINT: &str = "Press &START; to dismiss.";
+const EVENT_RATE_HISTORY: usize = 64;
+const MAX_DISPLAY_HZ: u32 = 1000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LogicalButton {
@@ -33,6 +36,7 @@ pub enum PlayerSlot {
 pub struct State {
     buttons_held: HashMap<(PlayerSlot, LogicalButton), bool>,
     unmapped: UnmappedTracker,
+    event_rate: EventRateTracker,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -47,6 +51,187 @@ enum UnmappedKey {
     RawButton { dev: usize, code_u32: u32 },
     RawAxis { dev: usize, code_u32: u32 },
     Keyboard { code: KeyCode },
+}
+
+#[derive(Clone, Debug, Default)]
+struct EventRateTracker {
+    stats: HashMap<EventStreamKey, EventStreamStats>,
+    active_stream: Option<EventStreamKey>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum EventStreamKey {
+    Keyboard,
+    Pad { dev: usize },
+}
+
+#[derive(Clone, Debug, Default)]
+struct EventStreamStats {
+    prev_time: Option<EventSampleTime>,
+    last_sample: Option<EventSampleKey>,
+    hz_samples: VecDeque<u32>,
+    latest_hz: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EventSampleKey {
+    KeyboardHost {
+        host_nanos: u64,
+        code: KeyCode,
+        pressed: bool,
+    },
+    KeyboardInstant {
+        timestamp: Instant,
+        code: KeyCode,
+        pressed: bool,
+    },
+    PadHost {
+        dev: usize,
+        host_nanos: u64,
+    },
+    PadInstant {
+        dev: usize,
+        timestamp: Instant,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EventSampleTime {
+    HostNanos(u64),
+    Local(Instant),
+}
+
+impl EventSampleTime {
+    fn hz_since(self, prev: Self) -> Option<u32> {
+        let delta_ns = match (self, prev) {
+            (Self::HostNanos(now), Self::HostNanos(prev)) => now.checked_sub(prev)?,
+            (Self::Local(now), Self::Local(prev)) => {
+                let nanos = now.checked_duration_since(prev)?.as_nanos();
+                u64::try_from(nanos).ok()?
+            }
+            _ => return None,
+        };
+        if delta_ns == 0 {
+            return None;
+        }
+        let hz = 1_000_000_000u64 / delta_ns;
+        u32::try_from(hz).ok().filter(|hz| *hz != 0)
+    }
+}
+
+impl EventStreamStats {
+    fn record(&mut self, sample: EventSampleKey, time: EventSampleTime) {
+        if self.last_sample == Some(sample) {
+            return;
+        }
+        self.last_sample = Some(sample);
+        if let Some(prev) = self.prev_time
+            && let Some(hz) = time.hz_since(prev)
+        {
+            self.latest_hz = hz;
+            if self.hz_samples.len() == EVENT_RATE_HISTORY {
+                self.hz_samples.pop_front();
+            }
+            self.hz_samples.push_back(hz);
+        }
+        self.prev_time = Some(time);
+    }
+
+    fn max_hz(&self) -> u32 {
+        if self.hz_samples.is_empty() {
+            return 0;
+        }
+        self.hz_samples.iter().copied().max().unwrap_or(0)
+    }
+}
+
+impl EventRateTracker {
+    #[inline(always)]
+    fn record_key(&mut self, key_event: &RawKeyboardEvent) {
+        let key = if key_event.host_nanos != 0 {
+            EventSampleKey::KeyboardHost {
+                host_nanos: key_event.host_nanos,
+                code: key_event.code,
+                pressed: key_event.pressed,
+            }
+        } else {
+            EventSampleKey::KeyboardInstant {
+                timestamp: key_event.timestamp,
+                code: key_event.code,
+                pressed: key_event.pressed,
+            }
+        };
+        let time = if key_event.host_nanos != 0 {
+            EventSampleTime::HostNanos(key_event.host_nanos)
+        } else {
+            EventSampleTime::Local(key_event.timestamp)
+        };
+        self.record_sample(EventStreamKey::Keyboard, key, time);
+    }
+
+    #[inline(always)]
+    fn record_pad(&mut self, pad_event: &PadEvent) {
+        let (dev, timestamp, host_nanos) = match *pad_event {
+            PadEvent::Dir {
+                id,
+                timestamp,
+                host_nanos,
+                ..
+            }
+            | PadEvent::RawButton {
+                id,
+                timestamp,
+                host_nanos,
+                ..
+            }
+            | PadEvent::RawAxis {
+                id,
+                timestamp,
+                host_nanos,
+                ..
+            } => (usize::from(id), timestamp, host_nanos),
+        };
+        let key = if host_nanos != 0 {
+            EventSampleKey::PadHost { dev, host_nanos }
+        } else {
+            EventSampleKey::PadInstant { dev, timestamp }
+        };
+        let time = if host_nanos != 0 {
+            EventSampleTime::HostNanos(host_nanos)
+        } else {
+            EventSampleTime::Local(timestamp)
+        };
+        self.record_sample(EventStreamKey::Pad { dev }, key, time);
+    }
+
+    #[inline(always)]
+    fn record_sample(
+        &mut self,
+        stream: EventStreamKey,
+        key: EventSampleKey,
+        time: EventSampleTime,
+    ) {
+        self.active_stream = Some(stream);
+        self.stats.entry(stream).or_default().record(key, time);
+    }
+
+    fn readout(&self) -> Option<(String, u32, u32)> {
+        let stream = self.active_stream?;
+        let stats = self.stats.get(&stream)?;
+        let label = match stream {
+            EventStreamKey::Keyboard => "Keyboard".to_owned(),
+            EventStreamKey::Pad { dev } => format!("Gamepad {dev}"),
+        };
+        Some((label, stats.latest_hz, stats.max_hz()))
+    }
+}
+
+#[inline(always)]
+fn format_hz(hz: u32) -> String {
+    if hz > MAX_DISPLAY_HZ {
+        return format!(">{MAX_DISPLAY_HZ} Hz");
+    }
+    format!("{hz} Hz")
 }
 
 impl UnmappedTracker {
@@ -72,7 +257,8 @@ impl UnmappedTracker {
             let line = match *k {
                 UnmappedKey::Dir { dev, dir } => format!("Gamepad {dev}: Dir::{dir:?}"),
                 UnmappedKey::RawButton { dev, code_u32 } => {
-                    format!("Gamepad {dev}: RawButton [0x{code_u32:08X}]")
+                    deadsync_smx::trigger_label(dev, code_u32)
+                        .unwrap_or_else(|| format!("Gamepad {dev}: RawButton [0x{code_u32:08X}]"))
                 }
                 UnmappedKey::RawAxis { dev, code_u32 } => {
                     let value = self.axis_value.get(k).copied().unwrap_or(0.0);
@@ -94,26 +280,28 @@ pub fn clear(state: &mut State) {
 
 const fn player_from_action(act: VirtualAction) -> Option<PlayerSlot> {
     use VirtualAction::{
-        p1_down, p1_left, p1_menu_left, p1_menu_right, p1_right, p1_select, p1_start, p1_up,
-        p2_down, p2_left, p2_menu_left, p2_menu_right, p2_right, p2_select, p2_start, p2_up,
+        p1_down, p1_left, p1_menu_down, p1_menu_left, p1_menu_right, p1_menu_up, p1_right,
+        p1_select, p1_start, p1_up, p2_down, p2_left, p2_menu_down, p2_menu_left, p2_menu_right,
+        p2_menu_up, p2_right, p2_select, p2_start, p2_up,
     };
     match act {
-        p1_up | p1_down | p1_left | p1_right | p1_menu_left | p1_menu_right | p1_start
-        | p1_select => Some(PlayerSlot::P1),
-        p2_up | p2_down | p2_left | p2_right | p2_menu_left | p2_menu_right | p2_start
-        | p2_select => Some(PlayerSlot::P2),
+        p1_up | p1_down | p1_left | p1_right | p1_menu_up | p1_menu_down | p1_menu_left
+        | p1_menu_right | p1_start | p1_select => Some(PlayerSlot::P1),
+        p2_up | p2_down | p2_left | p2_right | p2_menu_up | p2_menu_down | p2_menu_left
+        | p2_menu_right | p2_start | p2_select => Some(PlayerSlot::P2),
         _ => None,
     }
 }
 
 const fn logical_button_from_action(act: VirtualAction) -> Option<LogicalButton> {
     use VirtualAction::{
-        p1_down, p1_left, p1_menu_left, p1_menu_right, p1_right, p1_select, p1_start, p1_up,
-        p2_down, p2_left, p2_menu_left, p2_menu_right, p2_right, p2_select, p2_start, p2_up,
+        p1_down, p1_left, p1_menu_down, p1_menu_left, p1_menu_right, p1_menu_up, p1_right,
+        p1_select, p1_start, p1_up, p2_down, p2_left, p2_menu_down, p2_menu_left, p2_menu_right,
+        p2_menu_up, p2_right, p2_select, p2_start, p2_up,
     };
     match act {
-        p1_up | p2_up => Some(LogicalButton::Up),
-        p1_down | p2_down => Some(LogicalButton::Down),
+        p1_up | p1_menu_up | p2_up | p2_menu_up => Some(LogicalButton::Up),
+        p1_down | p1_menu_down | p2_down | p2_menu_down => Some(LogicalButton::Down),
         p1_left | p2_left => Some(LogicalButton::Left),
         p1_right | p2_right => Some(LogicalButton::Right),
         p1_menu_left | p2_menu_left => Some(LogicalButton::MenuLeft),
@@ -124,6 +312,7 @@ const fn logical_button_from_action(act: VirtualAction) -> Option<LogicalButton>
     }
 }
 
+/// Track which logical buttons are held, for the test-input button display.
 pub fn apply_virtual_input(state: &mut State, ev: &InputEvent) {
     if let Some(player) = player_from_action(ev.action)
         && let Some(btn) = logical_button_from_action(ev.action)
@@ -133,7 +322,9 @@ pub fn apply_virtual_input(state: &mut State, ev: &InputEvent) {
 }
 
 pub fn apply_raw_pad_event(state: &mut State, pad_event: &PadEvent) {
-    use crate::core::input::PadEvent as PE;
+    use deadsync_input::PadEvent as PE;
+
+    state.event_rate.record_pad(pad_event);
 
     let (key, pressed_opt, axis_value_opt) = match pad_event {
         PE::Dir {
@@ -188,6 +379,7 @@ pub fn apply_raw_key_event(state: &mut State, key_event: &RawKeyboardEvent) {
     if key_event.repeat {
         return;
     }
+    state.event_rate.record_key(key_event);
     let mapped = with_keymap(|km| km.raw_key_event_mapped(key_event));
     if mapped {
         return;
@@ -219,18 +411,43 @@ fn push_pad(
     show_player_label: bool,
     z: f32,
 ) {
-    let arrow_h_offset = 67.0_f32;
-    let arrow_v_offset = 68.0_f32;
-    let buttons_y = pad_y + 160.0;
-    let start_y = pad_y + 146.0;
-    let select_y = pad_y + 175.0;
-    let menu_y = pad_y + 160.0;
-    let menu_x_offset = 37.0_f32;
+    push_pad_scaled(
+        actors,
+        state,
+        slot,
+        pad_x,
+        pad_y,
+        show_menu_buttons,
+        show_player_label,
+        z,
+        1.0,
+    );
+}
+
+fn push_pad_scaled(
+    actors: &mut Vec<Actor>,
+    state: &State,
+    slot: PlayerSlot,
+    pad_x: f32,
+    pad_y: f32,
+    show_menu_buttons: bool,
+    show_player_label: bool,
+    z: f32,
+    scale: f32,
+) {
+    let arrow_h_offset = 67.0_f32 * scale;
+    let arrow_v_offset = 68.0_f32 * scale;
+    let sprite_zoom = 0.8_f32 * scale;
+    let buttons_y = pad_y + 160.0 * scale;
+    let start_y = pad_y + 146.0 * scale;
+    let select_y = pad_y + 175.0 * scale;
+    let menu_y = pad_y + 160.0 * scale;
+    let menu_x_offset = 37.0_f32 * scale;
 
     actors.push(act!(sprite("test_input/dance.png"):
         align(0.5, 0.5):
         xy(pad_x, pad_y):
-        zoom(0.8):
+        zoom(sprite_zoom):
         z(z)
     ));
 
@@ -241,9 +458,9 @@ fn push_pad(
         };
         actors.push(act!(text:
             align(0.5, 0.5):
-            xy(pad_x, pad_y - 130.0):
-            zoom(0.7):
-            font("wendy"):
+            xy(pad_x, pad_y - 130.0 * scale):
+            zoom(0.7 * scale):
+            font(current_machine_font_key(FontRole::Header)):
             settext(label):
             horizalign(center):
             z(z + 1.0)
@@ -253,28 +470,28 @@ fn push_pad(
     actors.push(act!(sprite("test_input/highlight.png"):
         align(0.5, 0.5):
         xy(pad_x, pad_y - arrow_v_offset):
-        zoom(0.8):
+        zoom(sprite_zoom):
         diffuse(1.0, 1.0, 1.0, held_alpha(state, slot, LogicalButton::Up)):
         z(z + 1.0)
     ));
     actors.push(act!(sprite("test_input/highlight.png"):
         align(0.5, 0.5):
         xy(pad_x, pad_y + arrow_v_offset):
-        zoom(0.8):
+        zoom(sprite_zoom):
         diffuse(1.0, 1.0, 1.0, held_alpha(state, slot, LogicalButton::Down)):
         z(z + 1.0)
     ));
     actors.push(act!(sprite("test_input/highlight.png"):
         align(0.5, 0.5):
         xy(pad_x - arrow_h_offset, pad_y):
-        zoom(0.8):
+        zoom(sprite_zoom):
         diffuse(1.0, 1.0, 1.0, held_alpha(state, slot, LogicalButton::Left)):
         z(z + 1.0)
     ));
     actors.push(act!(sprite("test_input/highlight.png"):
         align(0.5, 0.5):
         xy(pad_x + arrow_h_offset, pad_y):
-        zoom(0.8):
+        zoom(sprite_zoom):
         diffuse(1.0, 1.0, 1.0, held_alpha(state, slot, LogicalButton::Right)):
         z(z + 1.0)
     ));
@@ -283,30 +500,31 @@ fn push_pad(
         return;
     }
 
+    let button_zoom = 0.5_f32 * scale;
     actors.push(act!(sprite("test_input/buttons.png"):
         align(0.5, 0.5):
         xy(pad_x, buttons_y):
-        zoom(0.5):
+        zoom(button_zoom):
         z(z)
     ));
     actors.push(act!(sprite("test_input/highlightgreen.png"):
         align(0.5, 0.5):
         xy(pad_x, start_y):
-        zoom(0.5):
+        zoom(button_zoom):
         diffuse(1.0, 1.0, 1.0, held_alpha(state, slot, LogicalButton::Start)):
         z(z + 1.0)
     ));
     actors.push(act!(sprite("test_input/highlightred.png"):
         align(0.5, 0.5):
         xy(pad_x, select_y):
-        zoom(0.5):
+        zoom(button_zoom):
         diffuse(1.0, 1.0, 1.0, held_alpha(state, slot, LogicalButton::Select)):
         z(z + 1.0)
     ));
     actors.push(act!(sprite("test_input/highlightarrow.png"):
         align(0.5, 0.5):
         xy(pad_x - menu_x_offset, menu_y):
-        zoom(0.5):
+        zoom(button_zoom):
         rotationz(180.0):
         diffuse(1.0, 1.0, 1.0, held_alpha(state, slot, LogicalButton::MenuLeft)):
         z(z + 1.0)
@@ -314,14 +532,51 @@ fn push_pad(
     actors.push(act!(sprite("test_input/highlightarrow.png"):
         align(0.5, 0.5):
         xy(pad_x + menu_x_offset, menu_y):
-        zoom(0.5):
+        zoom(button_zoom):
         diffuse(1.0, 1.0, 1.0, held_alpha(state, slot, LogicalButton::MenuRight)):
         z(z + 1.0)
     ));
 }
 
-pub fn build_test_input_screen_content(state: &State) -> Vec<Actor> {
-    let mut actors = Vec::with_capacity(48);
+fn push_polling_readout(actors: &mut Vec<Actor>, state: &State, z: f32) {
+    let (rate_source, latest_hz, max_hz) = state
+        .event_rate
+        .readout()
+        .unwrap_or_else(|| ("Waiting for raw input".to_owned(), 0, 0));
+
+    actors.push(act!(text:
+        font("miso"):
+        settext("RAW EVENT POLLING"):
+        align(1.0, 1.0):
+        xy(screen_width() - 20.0, screen_height() - 60.0):
+        zoom(0.55):
+        horizalign(right):
+        diffuse(1.0, 1.0, 1.0, 0.8):
+        z(z)
+    ));
+    actors.push(act!(text:
+        font("miso"):
+        settext(rate_source):
+        align(1.0, 1.0):
+        xy(screen_width() - 20.0, screen_height() - 38.0):
+        zoom(0.65):
+        horizalign(right):
+        diffuse(1.0, 1.0, 1.0, 0.9):
+        z(z)
+    ));
+    actors.push(act!(text:
+        font("miso"):
+        settext(format!("{} latest / {} max", format_hz(latest_hz), format_hz(max_hz))):
+        align(1.0, 1.0):
+        xy(screen_width() - 20.0, screen_height() - 20.0):
+        zoom(0.72):
+        horizalign(right):
+        z(z)
+    ));
+}
+
+pub fn build_test_input_screen_content(state: &State, _active_color_index: i32) -> Vec<Actor> {
+    let mut actors = Vec::with_capacity(96);
     let cx = screen_center_x();
     let cy = screen_center_y() - 20.0;
     let pad_spacing = 150.0;
@@ -374,16 +629,191 @@ pub fn build_test_input_screen_content(state: &State) -> Vec<Actor> {
         z(30)
     ));
 
+    push_polling_readout(&mut actors, state, 30.0);
+
+    actors
+}
+
+/// Build a TestInput pad for use inside an evaluation pane (SL ScreenEvaluation Pane6 parity).
+///
+/// `scale` scales the entire pad uniformly (1.0 = full size; SL Pane6 uses ~0.8).
+pub fn build_evaluation_pad(
+    state: &State,
+    slot: PlayerSlot,
+    pad_x: f32,
+    pad_y: f32,
+    scale: f32,
+) -> Vec<Actor> {
+    let mut actors = Vec::with_capacity(6);
+    push_pad_scaled(
+        &mut actors,
+        state,
+        slot,
+        pad_x,
+        pad_y,
+        false,
+        false,
+        100.0,
+        scale,
+    );
+    actors
+}
+
+/// Approximate visual half-width of a pad rendered by `build_evaluation_pad` at the given scale.
+/// Useful for laying out neighboring elements (e.g., gaps between two pads in Double play).
+pub fn evaluation_pad_half_width(scale: f32) -> f32 {
+    eval_panel_layout::PAD_NATURAL_WIDTH * 0.5 * scale
+}
+
+mod eval_panel_layout {
+    // Panel size (logical px).
+    pub const PANEL_WIDTH: f32 = 288.889;
+    pub const PANEL_HEIGHT: f32 = 177.778;
+
+    // Pad: top-left corner of the pad's bounding box, panel-local, y-down.
+    pub const PAD_LOGICAL_SCALE: f32 = 0.8222;
+    pub const PAD_X: f32 = 126.667;
+    pub const PAD_Y: f32 = -5.111;
+
+    // Text block.
+    pub const TEXT_LEFT_X: f32 = 3.111;
+    pub const TEXT_BLOCK_WIDTH: f32 = 100.0;
+    pub const TITLE_TOP_Y: f32 = 17.778;
+    pub const DIVIDER_OFFSET: f32 = 23.111;
+    pub const BODY_OFFSET: f32 = 28.889;
+
+    /// If true, the title is horizontally centered within the text block;
+    /// otherwise it's left-aligned to TEXT_LEFT_X.
+    pub const TITLE_CENTERED: bool = true;
+
+    pub const TITLE_ZOOM: f32 = 1.0889;
+    pub const BODY_ZOOM: f32 = 0.7778;
+
+    pub const BODY_LINE_SPACING: i32 = 20;
+
+    /// Pad natural full width at PAD_LOGICAL_SCALE = 1.0, in logical px.
+    /// This is `(arrow_h_offset + half_arrow_sprite) * 2` from `push_pad_scaled`.
+    pub const PAD_NATURAL_WIDTH: f32 = (67.0 + 27.0) * 2.0;
+    /// Pad natural full height at PAD_LOGICAL_SCALE = 1.0, in logical px.
+    pub const PAD_NATURAL_HEIGHT: f32 = (68.0 + 27.0) * 2.0;
+}
+
+/// Visual size of the unscaled panel in logical pixels (width, height at
+/// scale 1.0).
+pub fn evaluation_panel_size() -> (f32, f32) {
+    (
+        eval_panel_layout::PANEL_WIDTH,
+        eval_panel_layout::PANEL_HEIGHT,
+    )
+}
+
+/// Build the TestInput evaluation panel anchored at its **top-left corner**.
+///
+/// `(anchor_x, anchor_y)` is the screen-space position of the panel's
+/// top-left corner. `scale` uniformly scales the entire panel.
+pub fn build_evaluation_panel(
+    state: &State,
+    slot: PlayerSlot,
+    anchor_x: f32,
+    anchor_y: f32,
+    scale: f32,
+    title_font: &'static str,
+    title: std::sync::Arc<str>,
+    body_font: &'static str,
+    instructions: std::sync::Arc<str>,
+) -> Vec<Actor> {
+    use eval_panel_layout::*;
+    let mut actors = Vec::with_capacity(10);
+
+    // Convert a panel-local (x_right, y_down) point in logical px to screen-space actor coords.
+    let map = |local_x: f32, local_y_from_top: f32| -> (f32, f32) {
+        (
+            anchor_x + local_x * scale,
+            anchor_y + local_y_from_top * scale,
+        )
+    };
+
+    let (pad_x, pad_y) = {
+        // PAD_X/PAD_Y refer to the pad's top-left (panel-local, y-down);
+        // convert to the pad's center for push_pad_scaled.
+        let pad_box_w = PAD_NATURAL_WIDTH * PAD_LOGICAL_SCALE;
+        let pad_box_h = PAD_NATURAL_HEIGHT * PAD_LOGICAL_SCALE;
+        let cx_local = PAD_X + pad_box_w * 0.5;
+        let cy_local = PAD_Y + pad_box_h * 0.5;
+        map(cx_local, cy_local)
+    };
+    let pad_scale = PAD_LOGICAL_SCALE * scale;
+    push_pad_scaled(
+        &mut actors,
+        state,
+        slot,
+        pad_x,
+        pad_y,
+        false,
+        false,
+        100.0,
+        pad_scale,
+    );
+
+    let (text_x, title_y) = map(TEXT_LEFT_X, TITLE_TOP_Y);
+    let (_, divider_y) = map(TEXT_LEFT_X, TITLE_TOP_Y + DIVIDER_OFFSET);
+    let (_, body_y) = map(TEXT_LEFT_X, TITLE_TOP_Y + BODY_OFFSET);
+    let block_w = TEXT_BLOCK_WIDTH * scale;
+    let title_zoom = TITLE_ZOOM * scale;
+    let body_zoom = BODY_ZOOM * scale;
+
+    if TITLE_CENTERED {
+        let title_center_x = text_x + block_w * 0.5;
+        actors.push(act!(text:
+            font(title_font):
+            settext(title):
+            align(0.5, 0.0):
+            xy(title_center_x, title_y):
+            zoom(title_zoom):
+            horizalign(center):
+            z(100.0)
+        ));
+    } else {
+        actors.push(act!(text:
+            font(title_font):
+            settext(title):
+            align(0.0, 0.0):
+            xy(text_x, title_y):
+            zoom(title_zoom):
+            horizalign(left):
+            z(100.0)
+        ));
+    }
+    actors.push(act!(quad:
+        align(0.0, 0.0):
+        xy(text_x, divider_y):
+        zoomto(block_w, 2.0_f32.max(scale * 2.0)):
+        diffuse(1.0, 1.0, 1.0, 0.33):
+        z(100.0)
+    ));
+    actors.push(act!(text:
+        font(body_font):
+        settext(instructions):
+        align(0.0, 0.0):
+        xy(text_x, body_y):
+        zoom(body_zoom):
+        horizalign(left):
+        wrapwidthpixels(TEXT_BLOCK_WIDTH / BODY_ZOOM):
+        vertspacing(BODY_LINE_SPACING):
+        z(100.0)
+    ));
+
     actors
 }
 
 pub fn build_select_music_overlay(
     state: &State,
+    _active_color_index: i32,
     show_p1: bool,
     show_p2: bool,
     pad_spacing: f32,
 ) -> Vec<Actor> {
-    let mut actors = Vec::with_capacity(24);
+    let mut actors = Vec::with_capacity(96);
     let cx = screen_center_x();
     // SL parity: overlay/TestInput.lua places pad AF at y = _screen.cy + 50, then
     // _modules/TestInput Pad/default.lua places the pad art at y = -80 inside that AF.
@@ -434,5 +864,150 @@ pub fn build_select_music_overlay(
         horizalign(center)
     ));
 
+    push_polling_readout(&mut actors, state, 1453.0);
+
     actors
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use deadsync_core::input::InputSource;
+    use deadsync_input::{InputEvent, PadCode, PadId};
+    use std::time::Duration;
+
+    fn input_event_from(action: VirtualAction, source: InputSource) -> InputEvent {
+        let now = Instant::now();
+        InputEvent {
+            action,
+            input_slot: 0,
+            pressed: true,
+            source,
+            timestamp: now,
+            timestamp_host_nanos: 0,
+            stored_at: now,
+            emitted_at: now,
+        }
+    }
+
+    fn input_event(action: VirtualAction) -> InputEvent {
+        input_event_from(action, InputSource::Keyboard)
+    }
+
+    #[test]
+    fn dedups_pad_events_from_the_same_report() {
+        let base = Instant::now();
+        let mut tracker = EventRateTracker::default();
+
+        tracker.record_pad(&PadEvent::RawButton {
+            id: PadId(0),
+            timestamp: base,
+            host_nanos: 123,
+            code: PadCode(1),
+            uuid: [0; 16],
+            value: 1.0,
+            pressed: true,
+        });
+        tracker.record_pad(&PadEvent::Dir {
+            id: PadId(0),
+            timestamp: base,
+            host_nanos: 123,
+            dir: PadDir::Up,
+            pressed: true,
+        });
+
+        let (_, latest, max) = tracker.readout().expect("missing readout");
+        assert_eq!(latest, 0);
+        assert_eq!(max, 0);
+    }
+
+    #[test]
+    fn reports_latest_and_peak_rate() {
+        let base = Instant::now();
+        let mut tracker = EventRateTracker::default();
+
+        for (i, host_nanos) in [0u64, 1_000_000, 3_000_000, 4_000_000]
+            .into_iter()
+            .enumerate()
+        {
+            tracker.record_key(&RawKeyboardEvent {
+                code: KeyCode::KeyA,
+                pressed: i % 2 == 0,
+                repeat: false,
+                timestamp: base + Duration::from_nanos(host_nanos),
+                host_nanos,
+            });
+        }
+
+        let (source, latest, max) = tracker.readout().expect("missing readout");
+        assert_eq!(source, "Keyboard");
+        assert_eq!(latest, 1000);
+        assert_eq!(max, 1000);
+    }
+
+    #[test]
+    fn keeps_only_the_last_sixty_four_samples_in_the_peak() {
+        let base = Instant::now();
+        let mut tracker = EventRateTracker::default();
+        let mut host_nanos = 0u64;
+
+        for i in 0..66 {
+            host_nanos += if i < 2 { 2_000_000 } else { 1_000_000 };
+            tracker.record_key(&RawKeyboardEvent {
+                code: KeyCode::KeyA,
+                pressed: i % 2 == 0,
+                repeat: false,
+                timestamp: base + Duration::from_nanos(host_nanos),
+                host_nanos,
+            });
+        }
+
+        let (_, latest, max) = tracker.readout().expect("missing readout");
+        assert_eq!(latest, 1000);
+        assert_eq!(max, 1000);
+    }
+
+    #[test]
+    fn peak_drops_once_old_spike_leaves_history() {
+        let base = Instant::now();
+        let mut tracker = EventRateTracker::default();
+        let mut host_nanos = 0u64;
+
+        tracker.record_key(&RawKeyboardEvent {
+            code: KeyCode::KeyA,
+            pressed: true,
+            repeat: false,
+            timestamp: base,
+            host_nanos,
+        });
+        host_nanos += 500_000;
+        tracker.record_key(&RawKeyboardEvent {
+            code: KeyCode::KeyA,
+            pressed: false,
+            repeat: false,
+            timestamp: base + Duration::from_nanos(host_nanos),
+            host_nanos,
+        });
+
+        for i in 0..64 {
+            host_nanos += 1_000_000;
+            tracker.record_key(&RawKeyboardEvent {
+                code: KeyCode::KeyA,
+                pressed: i % 2 == 0,
+                repeat: false,
+                timestamp: base + Duration::from_nanos(host_nanos),
+                host_nanos,
+            });
+        }
+
+        let (_, latest, max) = tracker.readout().expect("missing readout");
+        assert_eq!(latest, 1000);
+        assert_eq!(max, 1000);
+    }
+
+    #[test]
+    fn caps_display_above_one_thousand_hz() {
+        assert_eq!(format_hz(1000), "1000 Hz");
+        assert_eq!(format_hz(1001), ">1000 Hz");
+    }
 }

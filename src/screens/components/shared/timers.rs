@@ -1,6 +1,7 @@
 use crate::act;
-use crate::core::space::{screen_center_x, widescale};
-use crate::ui::actors::{Actor, TextContent};
+use crate::assets::{FontRole, current_machine_font_key};
+use deadlib_present::actors::{Actor, TextContent};
+use deadlib_present::space::{screen_center_x, widescale};
 
 pub fn build_session(text: impl Into<TextContent>) -> Actor {
     build_header_timer(text, screen_center_x())
@@ -13,7 +14,7 @@ pub fn build_gameplay(text: impl Into<TextContent>) -> Actor {
 fn build_header_timer(text: impl Into<TextContent>, x: f32) -> Actor {
     let text = text.into();
     act!(text:
-        font("wendy_monospace_numbers"):
+        font(current_machine_font_key(FontRole::Numbers)):
         settext(text):
         align(0.5, 0.5):
         xy(x, 10.0):

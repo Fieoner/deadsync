@@ -1,14 +1,16 @@
 use std::sync::Arc;
 
 use crate::act;
-use crate::core::gfx::{BlendMode, MeshMode, MeshVertex};
-use crate::game::profile;
+use crate::assets::{FontRole, current_machine_font_key_for_text};
 use crate::screens::components::evaluation::eval_graphs::TimingHistogramScale;
 use crate::screens::evaluation::ScoreInfo;
-use crate::ui::actors::{Actor, SizeSpec};
-use crate::ui::color;
+use deadlib_present::actors::{Actor, SizeSpec};
+use deadlib_present::color;
+use deadlib_render::{BlendMode, MeshVertex};
+use deadsync_profile as profile_data;
+use deadsync_rules::timing;
 
-use super::utils::pane_origin_x;
+use super::utils::{eval_style_alpha, pane_origin_x};
 
 #[derive(Clone, Copy)]
 struct TimingBand {
@@ -70,7 +72,7 @@ fn timing_bands_ex(timing_windows: [f32; 5]) -> ([TimingBand; 7], usize) {
     let decent = color::JUDGMENT_RGBA[3];
     let wayoff = color::JUDGMENT_RGBA[4];
     let white = color::JUDGMENT_FA_PLUS_WHITE_RGBA;
-    let w0 = crate::game::timing::FA_PLUS_W0_MS;
+    let w0 = timing::FA_PLUS_W0_MS;
     let w1 = timing_windows[0];
     let w2 = timing_windows[1];
     let w3 = timing_windows[2];
@@ -100,8 +102,8 @@ fn timing_bands_hard_ex(timing_windows: [f32; 5]) -> ([TimingBand; 7], usize) {
     let decent = color::JUDGMENT_RGBA[3];
     let wayoff = color::JUDGMENT_RGBA[4];
     let white = color::JUDGMENT_FA_PLUS_WHITE_RGBA;
-    let w010 = crate::game::timing::FA_PLUS_W010_MS;
-    let w0 = crate::game::timing::FA_PLUS_W0_MS;
+    let w010 = timing::FA_PLUS_W010_MS;
+    let w0 = timing::FA_PLUS_W0_MS;
     let w1 = timing_windows[0];
     let w2 = timing_windows[1];
     let w3 = timing_windows[2];
@@ -138,7 +140,7 @@ fn timing_bands_ms(
 pub fn build_timing_pane(
     score_info: &ScoreInfo,
     timing_hist_mesh: Option<&Arc<[MeshVertex]>>,
-    controller: profile::PlayerSide,
+    controller: profile_data::PlayerSide,
     scale: TimingHistogramScale,
 ) -> Vec<Actor> {
     let pane_width: f32 = 300.0;
@@ -148,16 +150,18 @@ pub fn build_timing_pane(
 
     let pane_origin_x = pane_origin_x(controller);
     let frame_x = pane_origin_x - pane_width * 0.5;
-    let frame_y = crate::core::space::screen_center_y() - 56.0;
+    let frame_y = deadlib_present::space::screen_center_y() - 56.0;
 
     let mut children = Vec::new();
     const BAR_BG_COLOR: [f32; 4] = color::rgba_hex("#101519");
+    let topbar_alpha = eval_style_alpha(1.0, 0.5);
+    let early_alpha = eval_style_alpha(1.0, 0.5);
 
     // Top and Bottom bars
     children.push(act!(quad:
         align(0.0, 0.0): xy(0.0, 0.0):
         setsize(pane_width, topbar_height):
-        diffuse(BAR_BG_COLOR[0], BAR_BG_COLOR[1], BAR_BG_COLOR[2], 1.0)
+        diffuse(BAR_BG_COLOR[0], BAR_BG_COLOR[1], BAR_BG_COLOR[2], topbar_alpha)
     ));
     children.push(act!(quad:
         align(0.0, 1.0): xy(0.0, pane_height):
@@ -174,18 +178,19 @@ pub fn build_timing_pane(
 
     // Early/Late text
     let early_late_y = topbar_height + 11.0;
-    children.push(act!(text: font("wendy"): settext("Early"):
+    children.push(act!(text: font(current_machine_font_key_for_text(FontRole::Header, "Early")): settext("Early"):
         align(0.0, 0.0): xy(10.0, early_late_y):
         zoom(0.3):
+        diffusealpha(early_alpha)
     ));
-    children.push(act!(text: font("wendy"): settext("Late"):
+    children.push(act!(text: font(current_machine_font_key_for_text(FontRole::Header, "Late")): settext("Late"):
         align(1.0, 0.0): xy(pane_width - 10.0, early_late_y):
         zoom(0.3): horizalign(right)
     ));
 
     // Bottom bar judgment labels
     let bottom_bar_center_y = pane_height - (bottombar_height / 2.0_f32);
-    let timing_windows: [f32; 5] = crate::game::timing::effective_windows_ms(); // ms, with +1.5ms
+    let timing_windows: [f32; 5] = timing::effective_windows_ms(); // ms, with +1.5ms
     let (judgment_bands, band_count) = timing_bands_ms(scale, timing_windows);
     let legend_span_ms =
         super::eval_graphs::timing_display_window_ms(score_info.histogram.worst_window_ms, scale);
@@ -232,7 +237,6 @@ pub fn build_timing_pane(
             offset: [0.0, topbar_height],
             size: [SizeSpec::Px(pane_width), SizeSpec::Px(graph_area_height)],
             vertices: mesh.clone(),
-            mode: MeshMode::Triangles,
             visible: true,
             blend: BlendMode::Alpha,
             z: 0,

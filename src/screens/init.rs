@@ -1,13 +1,20 @@
 use crate::act;
-use crate::core::input::{InputEvent, VirtualAction};
-use crate::core::space::{
+use crate::assets::i18n::tr;
+use crate::assets::{FontRole, current_machine_font_key_for_text};
+use crate::game::{
+    course,
+    parsing::{noteskin, simfile as song_loading},
+};
+use crate::screens::components::shared::{loading_bar, visual_style_bg};
+use crate::screens::{Screen, ScreenAction};
+use deadlib_platform::dirs;
+use deadlib_present::actors::Actor;
+use deadlib_present::color;
+use deadlib_present::space::{
     screen_center_x, screen_center_y, screen_height, screen_width, widescale,
 };
-use crate::game::parsing::{noteskin, simfile as song_loading};
-use crate::screens::components::shared::heart_bg;
-use crate::screens::{Screen, ScreenAction};
-use crate::ui::actors::Actor;
-use crate::ui::color;
+use deadsync_input::{InputEvent, VirtualAction};
+use deadsync_simfile::course as simfile_course;
 use log::info;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -126,17 +133,6 @@ impl LoadingState {
 }
 
 static EMPTY_TEXT: LazyLock<Arc<str>> = LazyLock::new(|| Arc::<str>::from(""));
-static INIT_TITLE_TEXT: LazyLock<Arc<str>> = LazyLock::new(|| Arc::<str>::from("DEAD SYNC"));
-static INITIALIZING_TEXT: LazyLock<Arc<str>> =
-    LazyLock::new(|| Arc::<str>::from("Initializing..."));
-static SONGS_PHASE_TEXT: LazyLock<Arc<str>> =
-    LazyLock::new(|| Arc::<str>::from("Loading songs..."));
-static COURSES_PHASE_TEXT: LazyLock<Arc<str>> =
-    LazyLock::new(|| Arc::<str>::from("Loading courses..."));
-static ARTWORK_PHASE_TEXT: LazyLock<Arc<str>> =
-    LazyLock::new(|| Arc::<str>::from("Caching artwork..."));
-static NOTESKINS_PHASE_TEXT: LazyLock<Arc<str>> =
-    LazyLock::new(|| Arc::<str>::from("Compiling noteskins..."));
 
 /* ----------------------- auto-advance ----------------------- */
 #[inline(always)]
@@ -171,7 +167,7 @@ pub struct State {
     loader_started: bool,
     loading: Option<LoadingState>,
     pub active_color_index: i32,
-    bg: heart_bg::State,
+    bg: visual_style_bg::State,
 }
 
 pub fn init() -> State {
@@ -181,7 +177,7 @@ pub fn init() -> State {
         loader_started: false,
         loading: None,
         active_color_index: color::DEFAULT_COLOR_INDEX,
-        bg: heart_bg::State::new(),
+        bg: visual_style_bg::State::new(),
     }
 }
 
@@ -201,7 +197,7 @@ pub(crate) fn bench_loading_state() -> State {
         loader_started: true,
         loading: Some(loading),
         active_color_index: color::DEFAULT_COLOR_INDEX,
-        bg: heart_bg::State::new(),
+        bg: visual_style_bg::State::new(),
     }
 }
 
@@ -234,7 +230,7 @@ fn collect_artwork_cache_paths() -> (Vec<PathBuf>, Vec<PathBuf>) {
         let course_cache = crate::game::course::get_course_cache();
         for (course_path, course) in course_cache.iter() {
             if let Some(path) =
-                rssp::course::resolve_course_banner_path(course_path, &course.banner)
+                simfile_course::resolve_course_banner_path(course_path, &course.banner)
             {
                 banner.push(path);
             }
@@ -293,10 +289,10 @@ fn cache_progress_lines(path: Option<&Path>) -> (String, String) {
 #[inline(always)]
 fn arc_phase_label(phase: LoadingPhase) -> Arc<str> {
     match phase {
-        LoadingPhase::Songs => SONGS_PHASE_TEXT.clone(),
-        LoadingPhase::Courses => COURSES_PHASE_TEXT.clone(),
-        LoadingPhase::Artwork => ARTWORK_PHASE_TEXT.clone(),
-        LoadingPhase::Noteskins => NOTESKINS_PHASE_TEXT.clone(),
+        LoadingPhase::Songs => tr("Init", "LoadingSongsText"),
+        LoadingPhase::Courses => tr("Init", "LoadingCoursesText"),
+        LoadingPhase::Artwork => tr("Init", "CachingArtworkText"),
+        LoadingPhase::Noteskins => tr("Init", "CompilingNoteskinsText"),
     }
 }
 
@@ -324,7 +320,9 @@ fn loading_progress_values(loading: &LoadingState) -> (usize, usize, f32) {
 
 fn refresh_loading_count_text(loading: &mut LoadingState) {
     let (done, total, _) = loading_progress_values(loading);
-    loading.count_text = if total == 0 {
+    loading.count_text = if loading.done || (total > 0 && done >= total) {
+        tr("Init", "DoneText")
+    } else if total == 0 {
         EMPTY_TEXT.clone()
     } else {
         Arc::<str>::from(crate::screens::progress_count_text(done, total))
@@ -371,7 +369,8 @@ fn start_loading_thread(state: &mut State) {
                 song: song.to_owned(),
             });
         };
-        song_loading::scan_and_load_songs_with_progress_counts("songs", &mut on_song);
+        let dirs = dirs::app_dirs();
+        song_loading::scan_and_load_songs_with_progress_counts(&dirs.songs_dir(), &mut on_song);
 
         let _ = tx.send(LoadingMsg::Phase(LoadingPhase::Courses));
         let mut on_course = |done: usize, total: usize, group: &str, course: &str| {
@@ -382,14 +381,15 @@ fn start_loading_thread(state: &mut State) {
                 course: course.to_owned(),
             });
         };
-        song_loading::scan_and_load_courses_with_progress_counts(
-            "courses",
-            "songs",
+        course::scan_and_load_courses_with_progress_counts(
+            &dirs.courses_dir(),
+            &dirs.songs_dir(),
             &mut on_course,
         );
 
         let (banner_paths, cdtitle_paths) = collect_artwork_cache_paths();
-        let artwork_total = crate::assets::artwork_cache_jobs(&banner_paths, &cdtitle_paths);
+        let artwork_total =
+            crate::app::media_cache::artwork_cache_jobs(&banner_paths, &cdtitle_paths);
 
         let _ = tx.send(LoadingMsg::Phase(LoadingPhase::Artwork));
         info!(
@@ -407,7 +407,7 @@ fn start_loading_thread(state: &mut State) {
                 line3,
             });
         };
-        crate::assets::prewarm_artwork_cache_with_progress(
+        crate::app::media_cache::prewarm_artwork_cache_with_progress(
             &banner_paths,
             &cdtitle_paths,
             &mut on_artwork,
@@ -513,7 +513,10 @@ pub fn handle_input(state: &mut State, ev: &InputEvent) -> ScreenAction {
     }
     if ev.pressed {
         match ev.action {
-            VirtualAction::p1_start | VirtualAction::p1_back => {
+            VirtualAction::p1_start
+            | VirtualAction::p1_back
+            | VirtualAction::p2_start
+            | VirtualAction::p2_back => {
                 return ScreenAction::Navigate(Screen::Menu);
             }
             _ => {}
@@ -645,8 +648,6 @@ fn push_loading_overlay(state: &State, actors: &mut Vec<Actor>, loading_elapsed_
     let bar_h = LOADING_BAR_H;
     let bar_cx = screen_center_x();
     let bar_cy = screen_center_y() + 34.0;
-    let fill_w = (bar_w - 4.0) * progress.clamp(0.0, 1.0);
-
     actors.push(act!(quad:
         align(0.0, 0.0):
         xy(0.0, 0.0):
@@ -654,18 +655,24 @@ fn push_loading_overlay(state: &State, actors: &mut Vec<Actor>, loading_elapsed_
         diffuse(0.0, 0.0, 0.0, 0.8):
         z(104.0)
     ));
+    let title_text = tr("Init", "TitleText");
+    let title_font = current_machine_font_key_for_text(FontRole::Header, &title_text);
     actors.push(act!(text:
-        font("wendy"):
-        settext(INIT_TITLE_TEXT.clone()):
+        font(title_font):
+        settext(title_text):
         align(0.5, 0.5):
         xy(screen_center_x(), bar_cy - 136.0):
         zoom(0.82):
         horizalign(center):
         z(110.0)
     ));
+    let phase_label = loading.map_or_else(
+        || tr("Init", "InitializingText"),
+        |_| arc_phase_label(phase),
+    );
     actors.push(act!(text:
         font("miso"):
-        settext(loading.map_or_else(|| INITIALIZING_TEXT.clone(), |_| arc_phase_label(phase))):
+        settext(phase_label):
         align(0.5, 0.5):
         xy(screen_center_x(), bar_cy - 96.0):
         zoom(1.05):
@@ -701,50 +708,22 @@ fn push_loading_overlay(state: &State, actors: &mut Vec<Actor>, loading_elapsed_
         ));
     }
 
-    let mut bar_children = Vec::with_capacity(4);
-    bar_children.push(act!(quad:
-        align(0.5, 0.5):
-        xy(bar_w / 2.0, bar_h / 2.0):
-        zoomto(bar_w, bar_h):
-        diffuse(1.0, 1.0, 1.0, 1.0):
-        z(0)
-    ));
-    bar_children.push(act!(quad:
-        align(0.5, 0.5):
-        xy(bar_w / 2.0, bar_h / 2.0):
-        zoomto(bar_w - 4.0, bar_h - 4.0):
-        diffuse(0.0, 0.0, 0.0, 1.0):
-        z(1)
-    ));
-    if fill_w > 0.0 {
-        bar_children.push(act!(quad:
-            align(0.0, 0.5):
-            xy(2.0, bar_h / 2.0):
-            zoomto(fill_w, bar_h - 4.0):
-            diffuse(fill[0], fill[1], fill[2], 1.0):
-            z(2)
-        ));
-    }
-    bar_children.push(act!(text:
-        font("miso"):
-        settext(loading.map_or_else(|| EMPTY_TEXT.clone(), |loading| loading.count_text.clone())):
-        align(0.5, 0.5):
-        xy(bar_w / 2.0, bar_h / 2.0):
-        zoom(0.9):
-        horizalign(center):
-        z(3)
-    ));
-    actors.push(Actor::Frame {
+    actors.push(loading_bar::build(loading_bar::LoadingBarParams {
         align: [0.5, 0.5],
         offset: [bar_cx, bar_cy],
-        size: [
-            crate::ui::actors::SizeSpec::Px(bar_w),
-            crate::ui::actors::SizeSpec::Px(bar_h),
-        ],
-        background: None,
+        width: bar_w,
+        height: bar_h,
+        progress,
+        label: loading
+            .map_or_else(|| EMPTY_TEXT.clone(), |loading| loading.count_text.clone())
+            .into(),
+        fill_rgba: [fill[0], fill[1], fill[2], 1.0],
+        bg_rgba: [0.0, 0.0, 0.0, 1.0],
+        border_rgba: [1.0, 1.0, 1.0, 1.0],
+        text_rgba: [1.0, 1.0, 1.0, 1.0],
+        text_zoom: 0.9,
         z: 110,
-        children: bar_children,
-    });
+    }));
 
     if let Some(speed_text) = speed_text {
         actors.push(act!(text:
@@ -761,24 +740,27 @@ fn push_loading_overlay(state: &State, actors: &mut Vec<Actor>, loading_elapsed_
 
 /* --------------------------- combined build --------------------------- */
 
-fn get_actors_with_elapsed_overrides(
+fn push_actors_with_elapsed_overrides(
+    actors: &mut Vec<Actor>,
     state: &State,
     loading_elapsed_override: Option<f32>,
     bg_elapsed_override: Option<f32>,
-) -> Vec<Actor> {
-    let mut actors: Vec<Actor> = Vec::with_capacity(32 + ARROW_COUNT);
+) {
+    actors.reserve(32 + ARROW_COUNT);
 
     /* 1) HEART BACKGROUND — visible immediately */
-    let bg_params = heart_bg::Params {
+    let bg_params = visual_style_bg::Params {
         active_color_index: state.active_color_index,
         backdrop_rgba: [0.0, 0.0, 0.0, 1.0],
         alpha_mul: 1.0,
     };
-    actors.extend(if let Some(bg_elapsed_s) = bg_elapsed_override {
-        state.bg.build_at_elapsed(bg_params, bg_elapsed_s)
+    if let Some(bg_elapsed_s) = bg_elapsed_override {
+        state
+            .bg
+            .push_at_elapsed(actors, bg_params, f64::from(bg_elapsed_s));
     } else {
-        state.bg.build(bg_params)
-    });
+        state.bg.push(actors, bg_params);
+    }
 
     if state.phase == InitPhase::Loading {
         let loading_elapsed_s = loading_elapsed_override.unwrap_or_else(|| {
@@ -786,13 +768,13 @@ fn get_actors_with_elapsed_overrides(
                 loading.started_at.elapsed().as_secs_f32().max(0.0)
             })
         });
-        push_loading_overlay(state, &mut actors, loading_elapsed_s);
-        return actors;
+        push_loading_overlay(state, actors, loading_elapsed_s);
+        return;
     }
 
     /* If we’re still in pre-roll, stop here: no squish/backdrop/arrows yet. */
     if state.elapsed < PRE_ROLL {
-        return actors;
+        return;
     }
 
     /* 2) SQUISH BAR — drive by timeline that starts after PRE_ROLL */
@@ -832,6 +814,7 @@ fn get_actors_with_elapsed_overrides(
         let tint = color::decorative_rgba(state.active_color_index - i as i32 - 4);
 
         actors.push(act!(sprite("init_arrow.png"):
+            tweensalt(i):
             align(0.5, 0.5):
             xy(cx + x, cy):
             z(110.0):
@@ -843,7 +826,20 @@ fn get_actors_with_elapsed_overrides(
             linear(0.0): visible(false)
         ));
     }
+}
 
+fn get_actors_with_elapsed_overrides(
+    state: &State,
+    loading_elapsed_override: Option<f32>,
+    bg_elapsed_override: Option<f32>,
+) -> Vec<Actor> {
+    let mut actors = Vec::with_capacity(32 + ARROW_COUNT);
+    push_actors_with_elapsed_overrides(
+        &mut actors,
+        state,
+        loading_elapsed_override,
+        bg_elapsed_override,
+    );
     actors
 }
 
@@ -851,6 +847,12 @@ pub(crate) fn get_actors_at_loading_elapsed(state: &State, loading_elapsed_s: f3
     get_actors_with_elapsed_overrides(state, Some(loading_elapsed_s), Some(loading_elapsed_s))
 }
 
+pub fn push_actors(actors: &mut Vec<Actor>, state: &State) {
+    push_actors_with_elapsed_overrides(actors, state, None, None);
+}
+
 pub fn get_actors(state: &State) -> Vec<Actor> {
-    get_actors_with_elapsed_overrides(state, None, None)
+    let mut actors = Vec::with_capacity(32 + ARROW_COUNT);
+    push_actors(&mut actors, state);
+    actors
 }

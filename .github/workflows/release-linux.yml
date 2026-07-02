@@ -52,7 +52,7 @@ jobs:
       CARGO_TERM_COLOR: always
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           submodules: true
@@ -121,19 +121,23 @@ jobs:
 
       - name: Upload workflow artifacts
         if: steps.select_arch.outputs.enabled == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: deadsync-linux-${{ steps.tag.outputs.tag }}-${{ matrix.arch }}
           if-no-files-found: error
-          path: ${{ steps.package.outputs.archive }}
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.checksum }}
 
       - name: Publish GitHub release
         if: steps.select_arch.outputs.enabled == 'true'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           target_commitish: ${{ github.sha }}
-          files: ${{ steps.package.outputs.archive }}
+          files: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.checksum }}
           generate_release_notes: true
           prerelease: ${{ contains(steps.tag.outputs.tag, '-') }}
           fail_on_unmatched_files: true

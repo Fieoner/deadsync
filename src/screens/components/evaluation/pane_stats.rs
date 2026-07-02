@@ -1,18 +1,27 @@
 use crate::act;
 use crate::assets::AssetManager;
-use crate::core::space::screen_center_y;
-use crate::game::judgment::JudgeGrade;
-use crate::game::profile;
+use crate::assets::i18n::{LookupKey, lookup_key};
+use crate::assets::{FontRole, current_machine_font_key};
 use crate::screens::evaluation::{EvalPane, ScoreInfo};
-use crate::ui::actors::Actor;
-use crate::ui::color;
-use crate::ui::font;
+use deadlib_present::actors::Actor;
+use deadlib_present::color;
+use deadlib_present::font;
+use deadlib_present::space::screen_center_y;
+use deadsync_profile as profile_data;
+use deadsync_rules::judgment::JudgeGrade;
+use deadsync_rules::timing::WindowCounts;
 use std::sync::{Arc, LazyLock};
 
 use super::utils::pane_origin_x;
 
 // Simply Love metrics.ini [RollingNumbersEvaluation]: ApproachSeconds=1
 const ROLLING_NUMBERS_APPROACH_SECONDS: f32 = 1.0;
+const DISABLED_WINDOW_RGBA: [f32; 4] = color::JUDGMENT_FA_PLUS_WHITE_EVAL_DIM_RGBA;
+
+#[inline(always)]
+pub(crate) const fn rolling_numbers_approach_seconds() -> f32 {
+    ROLLING_NUMBERS_APPROACH_SECONDS
+}
 
 static JUDGMENT_ORDER: [JudgeGrade; 6] = [
     JudgeGrade::Fantastic,
@@ -24,44 +33,47 @@ static JUDGMENT_ORDER: [JudgeGrade; 6] = [
 ];
 
 #[derive(Clone, Copy)]
-struct JudgmentDisplayInfo {
-    label: &'static str,
+struct LabeledColor {
+    label: LookupKey,
     color: [f32; 4],
 }
 
-const JUDGMENT_INFO: [JudgmentDisplayInfo; 6] = [
-    JudgmentDisplayInfo {
-        label: "FANTASTIC",
+const JUDGMENT_INFO: [LabeledColor; 6] = [
+    LabeledColor {
+        label: lookup_key("Gameplay", "JudgmentFantastic"),
         color: color::JUDGMENT_RGBA[0],
     },
-    JudgmentDisplayInfo {
-        label: "EXCELLENT",
+    LabeledColor {
+        label: lookup_key("Gameplay", "JudgmentExcellent"),
         color: color::JUDGMENT_RGBA[1],
     },
-    JudgmentDisplayInfo {
-        label: "GREAT",
+    LabeledColor {
+        label: lookup_key("Gameplay", "JudgmentGreat"),
         color: color::JUDGMENT_RGBA[2],
     },
-    JudgmentDisplayInfo {
-        label: "DECENT",
+    LabeledColor {
+        label: lookup_key("Gameplay", "JudgmentDecent"),
         color: color::JUDGMENT_RGBA[3],
     },
-    JudgmentDisplayInfo {
-        label: "WAY OFF",
+    LabeledColor {
+        label: lookup_key("Gameplay", "JudgmentWayOff"),
         color: color::JUDGMENT_RGBA[4],
     },
-    JudgmentDisplayInfo {
-        label: "MISS",
+    LabeledColor {
+        label: lookup_key("Gameplay", "JudgmentMiss"),
         color: color::JUDGMENT_RGBA[5],
     },
 ];
 
+const RADAR_LABELS: [LookupKey; 4] = [
+    lookup_key("Gameplay", "HandsLabel"),
+    lookup_key("Gameplay", "HoldsLabel"),
+    lookup_key("Gameplay", "MinesLabel"),
+    lookup_key("Gameplay", "RollsLabel"),
+];
+
 static DIGIT_TEXT: LazyLock<[Arc<str>; 10]> =
     LazyLock::new(|| ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"].map(Arc::<str>::from));
-static JUDGMENT_LABEL_TEXT: LazyLock<[Arc<str>; 6]> =
-    LazyLock::new(|| JUDGMENT_INFO.map(|info| Arc::<str>::from(info.label)));
-static RADAR_LABEL_TEXT: LazyLock<[Arc<str>; 4]> =
-    LazyLock::new(|| ["hands", "holds", "mines", "rolls"].map(Arc::<str>::from));
 static TEN_MS_TEXT: LazyLock<Arc<str>> = LazyLock::new(|| Arc::<str>::from("(10ms)"));
 static SLASH_TEXT: LazyLock<Arc<str>> = LazyLock::new(|| Arc::<str>::from("/"));
 
@@ -86,12 +98,18 @@ fn digit_text(digit: u8) -> Arc<str> {
 
 #[inline(always)]
 fn judgment_label_text(index: usize) -> Arc<str> {
-    JUDGMENT_LABEL_TEXT[index].clone()
+    JUDGMENT_INFO
+        .get(index)
+        .map(|info| info.label.get())
+        .unwrap_or_else(|| Arc::from(""))
 }
 
 #[inline(always)]
 fn radar_label_text(index: usize) -> Arc<str> {
-    RADAR_LABEL_TEXT[index].clone()
+    RADAR_LABELS
+        .get(index)
+        .map(LookupKey::get)
+        .unwrap_or_else(|| Arc::from(""))
 }
 
 #[inline(always)]
@@ -136,7 +154,7 @@ fn fill_padded_digits(mut value: u32, width: usize, out: &mut [u8; 10]) -> usize
 }
 
 #[inline(always)]
-fn max_window_count(wc: crate::game::timing::WindowCounts) -> u32 {
+fn max_window_count(wc: WindowCounts) -> u32 {
     wc.w0
         .max(wc.w1)
         .max(wc.w2)
@@ -147,25 +165,67 @@ fn max_window_count(wc: crate::game::timing::WindowCounts) -> u32 {
 }
 
 #[inline(always)]
-fn actor_capacity(show_fa_plus_pane: bool, show_10ms_blue: bool, digits_to_fmt: usize) -> usize {
+fn standard_row_disabled(disabled_windows: [bool; 5], row: usize) -> bool {
+    row < 5 && disabled_windows[row]
+}
+
+#[inline(always)]
+fn split_row_disabled(disabled_windows: [bool; 5], row: usize) -> bool {
+    match row {
+        0 | 1 => disabled_windows[0],
+        2 => disabled_windows[1],
+        3 => disabled_windows[2],
+        4 => disabled_windows[3],
+        5 => disabled_windows[4],
+        _ => false,
+    }
+}
+
+#[inline(always)]
+fn actor_capacity(
+    show_fa_plus_pane: bool,
+    show_10ms_blue: bool,
+    show_hands_row: bool,
+    digits_to_fmt: usize,
+) -> usize {
     let judgment_rows = if show_fa_plus_pane { 7 } else { 6 };
     let judgment_labels = judgment_rows + usize::from(show_10ms_blue);
-    let radar_rows = 4;
+    let radar_rows = radar_rows_for_pane(show_hands_row);
     judgment_labels + (judgment_rows * digits_to_fmt) + (radar_rows * 8)
+}
+
+#[inline(always)]
+const fn show_hands_row_for_pane(pane: EvalPane) -> bool {
+    matches!(pane, EvalPane::Standard)
+}
+
+#[inline(always)]
+const fn radar_start_index(show_hands_row: bool) -> usize {
+    if show_hands_row { 0 } else { 1 }
+}
+
+#[inline(always)]
+const fn radar_rows_for_pane(show_hands_row: bool) -> usize {
+    if show_hands_row { 4 } else { 3 }
+}
+
+#[inline(always)]
+const fn radar_row_offset(show_hands_row: bool) -> f32 {
+    if show_hands_row { 0.0 } else { 1.0 }
 }
 
 /// Builds a 300px evaluation pane for a given controller side, including judgment and radar counts.
 pub(crate) fn build_stats_pane(
     score_info: &ScoreInfo,
     pane: EvalPane,
-    controller: profile::PlayerSide,
+    controller: profile_data::PlayerSide,
     asset_manager: &AssetManager,
     elapsed_s: f32,
 ) -> Vec<Actor> {
     let cy = screen_center_y();
 
     let pane_origin_x = pane_origin_x(controller);
-    let side_sign = if controller == profile::PlayerSide::P1 {
+    let side_sign = if controller == profile_data::PlayerSide::P1 {
         1.0_f32
     } else {
         -1.0_f32
@@ -180,11 +240,12 @@ pub(crate) fn build_stats_pane(
     } else {
         score_info.window_counts
     };
-    let judgment_counts =
-        JUDGMENT_ORDER.map(|grade| score_info.judgment_counts.get(&grade).copied().unwrap_or(0));
+    let judgment_counts = JUDGMENT_ORDER.map(|grade| score_info.judgment_count(grade));
+    let show_standard_judgments = !show_fa_plus_pane;
+    let show_hands_row = show_hands_row_for_pane(pane);
 
     // --- Calculate label shift for large numbers ---
-    let max_judgment_count = if !show_fa_plus_pane {
+    let max_judgment_count = if show_standard_judgments {
         *judgment_counts.iter().max().unwrap_or(&0)
     } else {
         max_window_count(wc)
@@ -206,10 +267,11 @@ pub(crate) fn build_stats_pane(
     let mut actors = Vec::with_capacity(actor_capacity(
         show_fa_plus_pane,
         show_10ms_blue,
+        show_hands_row,
         digits_to_fmt,
     ));
 
-    asset_manager.with_fonts(|all_fonts| asset_manager.with_font("wendy_screenevaluation", |metrics_font| {
+    asset_manager.with_fonts(|all_fonts| asset_manager.with_font(current_machine_font_key(FontRole::ScreenEval), |metrics_font| {
         let numbers_frame_zoom: f32 = 0.8;
         let final_numbers_zoom = numbers_frame_zoom * 0.5;
         let digit_width = font::measure_line_width_logical(metrics_font, "0", all_fonts) as f32 * final_numbers_zoom;
@@ -219,7 +281,7 @@ pub(crate) fn build_stats_pane(
         let labels_frame_origin_x = (50.0 * side_sign).mul_add(1.0, pane_origin_x);
         let numbers_frame_origin_x = (90.0 * side_sign).mul_add(1.0, pane_origin_x);
         let frame_origin_y = cy - 24.0;
-        let number_local_x = if controller == profile::PlayerSide::P1 {
+        let number_local_x = if controller == profile_data::PlayerSide::P1 {
             64.0
         } else {
             94.0
@@ -228,33 +290,43 @@ pub(crate) fn build_stats_pane(
         let number_base_x = numbers_frame_origin_x + (number_local_x * numbers_frame_zoom);
         let mut digits = [0u8; 10];
 
-        if !show_fa_plus_pane {
+        if show_standard_judgments {
             for (i, info) in JUDGMENT_INFO.iter().enumerate() {
                 let target_count = judgment_counts[i];
                 let count = rolling_number_value(target_count, elapsed_s);
+                let disabled = standard_row_disabled(score_info.disabled_timing_windows, i);
+                let bright_color = if disabled {
+                    DISABLED_WINDOW_RGBA
+                } else {
+                    info.color
+                };
+                let dim_color = if disabled {
+                    DISABLED_WINDOW_RGBA
+                } else {
+                    color::JUDGMENT_DIM_EVAL_RGBA[i]
+                };
 
                 // Label
                 let label_local_y = (i as f32).mul_add(28.0, -16.0);
                 actors.push(act!(text: font("miso"): settext(judgment_label_text(i)):
                     align(1.0, 0.5): xy(labels_frame_origin_x + label_local_x, frame_origin_y + label_local_y):
                     maxwidth(76.0): zoom(label_zoom): horizalign(right):
-                    diffuse(info.color[0], info.color[1], info.color[2], info.color[3]): z(101)
+                    diffuse(bright_color[0], bright_color[1], bright_color[2], bright_color[3]): z(101)
                 ));
 
                 // Number (digit by digit for dimming)
-                let bright_color = info.color;
-                let dim_color = color::JUDGMENT_DIM_EVAL_RGBA[i];
                 let first_nonzero = fill_padded_digits(count, digits_to_fmt, &mut digits);
 
                 let number_local_y = (i as f32).mul_add(35.0, -20.0);
                 let number_final_y = frame_origin_y + (number_local_y * numbers_frame_zoom);
-                for char_idx in 0..digits_to_fmt {
-                    let is_dim = if count == 0 { char_idx < digits_to_fmt - 1 } else { char_idx < first_nonzero };
+                for (char_idx, digit) in digits.iter().take(digits_to_fmt).enumerate() {
+                    let is_dim = disabled
+                        || if count == 0 { char_idx < digits_to_fmt - 1 } else { char_idx < first_nonzero };
                     let color = if is_dim { dim_color } else { bright_color };
                     let index_from_right = digits_to_fmt - 1 - char_idx;
                     let cell_right_x = (index_from_right as f32).mul_add(-digit_width, number_base_x);
 
-                    actors.push(act!(text: font("wendy_screenevaluation"): settext(digit_text(digits[char_idx])):
+                    actors.push(act!(text: font(current_machine_font_key(FontRole::ScreenEval)): settext(digit_text(*digit)):
                         align(1.0, 0.5): xy(cell_right_x, number_final_y): zoom(final_numbers_zoom):
                         diffuse(color[0], color[1], color[2], color[3]): z(101)
                     ));
@@ -279,6 +351,17 @@ pub(crate) fn build_stats_pane(
 
             for (i, (label_idx, bright_color, dim_color, count)) in rows.iter().enumerate() {
                 let count = rolling_number_value(*count, elapsed_s);
+                let disabled = split_row_disabled(score_info.disabled_timing_windows, i);
+                let bright_color = if disabled {
+                    DISABLED_WINDOW_RGBA
+                } else {
+                    *bright_color
+                };
+                let dim_color = if disabled {
+                    DISABLED_WINDOW_RGBA
+                } else {
+                    *dim_color
+                };
                 // Label: match Simply Love Pane2 labels using 26px spacing.
                 // Original Lua uses 1-based indexing: y = i*26 - 46.
                 // Our rows are 0-based, so use (i+1) here.
@@ -303,13 +386,14 @@ pub(crate) fn build_stats_pane(
                 // Numbers: match Simply Love Pane2 numbers using 32px spacing.
                 let number_local_y = (i as f32).mul_add(32.0, -24.0);
                 let number_final_y = frame_origin_y + (number_local_y * numbers_frame_zoom);
-                for char_idx in 0..digits_to_fmt {
-                    let is_dim = if count == 0 { char_idx < digits_to_fmt - 1 } else { char_idx < first_nonzero };
-                    let color = if is_dim { *dim_color } else { *bright_color };
+                for (char_idx, digit) in digits.iter().take(digits_to_fmt).enumerate() {
+                    let is_dim = disabled
+                        || if count == 0 { char_idx < digits_to_fmt - 1 } else { char_idx < first_nonzero };
+                    let color = if is_dim { dim_color } else { bright_color };
                     let index_from_right = digits_to_fmt - 1 - char_idx;
                     let cell_right_x = (index_from_right as f32).mul_add(-digit_width, number_base_x);
 
-                    actors.push(act!(text: font("wendy_screenevaluation"): settext(digit_text(digits[char_idx])):
+                    actors.push(act!(text: font(current_machine_font_key(FontRole::ScreenEval)): settext(digit_text(*digit)):
                         align(1.0, 0.5): xy(cell_right_x, number_final_y): zoom(final_numbers_zoom):
                         diffuse(color[0], color[1], color[2], color[3]): z(101)
                     ));
@@ -319,24 +403,28 @@ pub(crate) fn build_stats_pane(
 
         // --- RADAR LABELS & NUMBERS ---
         let radar_categories = [
-            ("hands", score_info.hands_achieved, score_info.hands_total),
-            ("holds", score_info.holds_held, score_info.holds_total),
-            ("mines", score_info.mines_avoided, score_info.mines_total),
-            ("rolls", score_info.rolls_held, score_info.rolls_total),
+            (0, score_info.hands_achieved, score_info.hands_total),
+            (1, score_info.holds_held, score_info.holds_total),
+            (2, score_info.mines_avoided, score_info.mines_total),
+            (3, score_info.rolls_held, score_info.rolls_total),
         ];
+        let radar_start_index = radar_start_index(show_hands_row);
+        let radar_categories = &radar_categories[radar_start_index..];
+        let radar_row_offset = radar_row_offset(show_hands_row);
 
         const GRAY_POSSIBLE: [f32; 4] = color::rgba_hex("#5A6166");
         const GRAY_ACHIEVED: [f32; 4] = color::rgba_hex("#444444");
         let white_color = [1.0, 1.0, 1.0, 1.0];
 
-        for (i, (_, achieved, possible)) in radar_categories.iter().copied().enumerate() {
-            let label_local_x = if controller == profile::PlayerSide::P1 {
+        for (i, (label_idx, achieved, possible)) in radar_categories.iter().copied().enumerate() {
+            let sl_row = i as f32 + radar_row_offset;
+            let label_local_x = if controller == profile_data::PlayerSide::P1 {
                 -160.0
             } else {
                 90.0
             };
-            let label_local_y = (i as f32).mul_add(28.0, 41.0);
-            actors.push(act!(text: font("miso"): settext(radar_label_text(i)):
+            let label_local_y = sl_row.mul_add(28.0, 41.0);
+            actors.push(act!(text: font("miso"): settext(radar_label_text(label_idx)):
                 align(1.0, 0.5): xy(labels_frame_origin_x + label_local_x, frame_origin_y + label_local_y): horizalign(right): zoom(0.833): z(101)
             ));
 
@@ -344,12 +432,12 @@ pub(crate) fn build_stats_pane(
             let achieved_clamped = achieved.min(999);
             let achieved_rolling = rolling_number_value(achieved_clamped, elapsed_s);
 
-            let number_local_y = (i as f32).mul_add(35.0, 53.0);
+            let number_local_y = sl_row.mul_add(35.0, 53.0);
             let number_final_y = frame_origin_y + (number_local_y * numbers_frame_zoom);
 
             // --- Group 1: "Achieved" Numbers (Anchored at -180, separated from Slash) ---
             // Matches Lua: x = { P1=-180 }, aligned right.
-            let achieved_anchor_x = (if controller == profile::PlayerSide::P1 {
+            let achieved_anchor_x = (if controller == profile_data::PlayerSide::P1 {
                 -180.0_f32
             } else {
                 218.0_f32
@@ -369,7 +457,7 @@ pub(crate) fn build_stats_pane(
                 let x_pos = (char_idx_from_right as f32).mul_add(-digit_width, achieved_anchor_x);
                 let digit_idx = 2 - char_idx_from_right;
 
-                actors.push(act!(text: font("wendy_screenevaluation"): settext(digit_text(digits[digit_idx])):
+                actors.push(act!(text: font(current_machine_font_key(FontRole::ScreenEval)): settext(digit_text(digits[digit_idx])):
                     align(1.0, 0.5): xy(x_pos, number_final_y): zoom(final_numbers_zoom):
                     diffuse(color[0], color[1], color[2], color[3]): z(101)
                 ));
@@ -377,7 +465,7 @@ pub(crate) fn build_stats_pane(
 
             // --- Group 2: "Slash + Possible" Numbers (Anchored at -114) ---
             // Matches Lua: x = { P1=-114 }, aligned right.
-            let possible_anchor_x = (if controller == profile::PlayerSide::P1 {
+            let possible_anchor_x = (if controller == profile_data::PlayerSide::P1 {
                 -114.0_f32
             } else {
                 286.0_f32
@@ -398,7 +486,7 @@ pub(crate) fn build_stats_pane(
                 let color = if is_dim { GRAY_POSSIBLE } else { white_color };
                 let digit_idx = 2 - char_idx_from_right;
 
-                actors.push(act!(text: font("wendy_screenevaluation"): settext(digit_text(digits[digit_idx])):
+                actors.push(act!(text: font(current_machine_font_key(FontRole::ScreenEval)): settext(digit_text(digits[digit_idx])):
                     align(1.0, 0.5): xy(cursor_x, number_final_y): zoom(final_numbers_zoom):
                     diffuse(color[0], color[1], color[2], color[3]): z(101)
                 ));
@@ -407,7 +495,7 @@ pub(crate) fn build_stats_pane(
 
             // 2. Draw slash
             // Moved 1px to the right for visual parity
-            actors.push(act!(text: font("wendy_screenevaluation"): settext(SLASH_TEXT.clone()):
+            actors.push(act!(text: font(current_machine_font_key(FontRole::ScreenEval)): settext(SLASH_TEXT.clone()):
                 align(1.0, 0.5): xy(cursor_x + 0.5, number_final_y): zoom(final_numbers_zoom):
                 diffuse(GRAY_POSSIBLE[0], GRAY_POSSIBLE[1], GRAY_POSSIBLE[2], GRAY_POSSIBLE[3]): z(101)
             ));
@@ -415,4 +503,22 @@ pub(crate) fn build_stats_pane(
     }));
 
     actors
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn radar_hands_row_only_shows_for_single_score_pane() {
+        assert!(show_hands_row_for_pane(EvalPane::Standard));
+        assert!(!show_hands_row_for_pane(EvalPane::FaPlus));
+        assert!(!show_hands_row_for_pane(EvalPane::HardEx));
+        assert_eq!(radar_start_index(true), 0);
+        assert_eq!(radar_start_index(false), 1);
+        assert_eq!(radar_rows_for_pane(true), 4);
+        assert_eq!(radar_rows_for_pane(false), 3);
+        assert_eq!(radar_row_offset(true), 0.0);
+        assert_eq!(radar_row_offset(false), 1.0);
+    }
 }

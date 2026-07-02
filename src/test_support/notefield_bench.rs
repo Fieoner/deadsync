@@ -1,19 +1,24 @@
-use crate::game::chart::{ChartData, StaminaCounts};
-use crate::game::gameplay::{
-    self, ActiveHold, ActiveTapExplosion, Arrow, ColumnCue, ColumnCueColumn, ErrorBarText,
-    ErrorBarTick, MAX_COLS, MAX_PLAYERS,
-};
-use crate::game::judgment::{JudgeGrade, TimingWindow};
-use crate::game::note::NoteType;
-use crate::game::parsing::notes::ParsedNote;
 use crate::game::profile;
-use crate::game::scroll::ScrollSpeedSetting;
-use crate::game::song::SongData;
-use crate::game::timing::{ROWS_PER_BEAT, TimingData, TimingSegments, note_row_to_beat};
-use crate::screens::components::gameplay::notefield::{self, FieldPlacement};
-use crate::ui::actors::Actor;
-use rssp::TechCounts;
-use rssp::stats::ArrowStats;
+use crate::screens::components::gameplay::notefield;
+use crate::screens::components::shared::noteskin_model::{ModelMeshCache, ModelMeshCacheStats};
+use crate::screens::gameplay as gameplay_screen;
+use deadlib_present::actors::Actor;
+use deadsync_chart::SongData;
+use deadsync_chart::notes::ParsedNote;
+use deadsync_chart::{ArrowStats, ChartData, GameplayChartData, StaminaCounts, TechCounts};
+use deadsync_core::input::MAX_PLAYERS;
+use deadsync_core::note::NoteType;
+use deadsync_core::timing::{ROWS_PER_BEAT, note_row_to_beat};
+use deadsync_gameplay::{
+    ActiveHold, ActiveTapExplosion, ColumnCue, ColumnCueColumn, ErrorBarText, ErrorBarTick,
+    GameplayConfig, GameplayMiniIndicatorData, GameplaySession, GameplayViewport,
+};
+use deadsync_notefield::{FieldPlacement, ProxyCaptureRequests, ViewOverride};
+use deadsync_profile as profile_data;
+use deadsync_rules::judgment::{JudgeGrade, TimingWindow};
+use deadsync_rules::scroll::ScrollSpeedSetting;
+use deadsync_rules::timing::{TimingData, TimingSegments};
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -21,77 +26,151 @@ pub const SCENARIO_NAME: &str = "notefield";
 const VISIBLE_BEAT: f32 = 48.0;
 const WINDOW_BEATS_BEFORE: f32 = 8.0;
 const WINDOW_BEATS_AFTER: f32 = 24.0;
+pub use crate::game::GameplayCoreState;
 
 pub struct NotefieldBenchFixture {
-    state: gameplay::State,
-    profile: profile::Profile,
+    state: GameplayCoreState,
+    noteskin_assets: gameplay_screen::GameplayNoteskinAssets,
+    notefield_model_cache: [RefCell<ModelMeshCache>; MAX_PLAYERS],
+    profile: profile_data::Profile,
 }
 
 impl NotefieldBenchFixture {
-    pub fn state(&self) -> &gameplay::State {
+    pub fn state(&self) -> &GameplayCoreState {
         &self.state
     }
 
-    pub fn state_mut(&mut self) -> &mut gameplay::State {
+    pub fn state_mut(&mut self) -> &mut GameplayCoreState {
         &mut self.state
     }
 
-    pub fn profile(&self) -> &profile::Profile {
+    pub fn profile(&self) -> &profile_data::Profile {
         &self.profile
+    }
+
+    pub fn reset_notefield_model_cache_stats(&self) {
+        for cache in &self.notefield_model_cache {
+            cache.borrow_mut().reset_stats();
+        }
+    }
+
+    pub fn notefield_model_cache_stats(&self) -> [ModelMeshCacheStats; MAX_PLAYERS] {
+        std::array::from_fn(|player| self.notefield_model_cache[player].borrow().stats())
+    }
+
+    pub fn summed_notefield_model_cache_stats(&self) -> ModelMeshCacheStats {
+        self.notefield_model_cache_stats().into_iter().fold(
+            ModelMeshCacheStats::default(),
+            |mut acc, stats| {
+                acc.hits = acc.hits.saturating_add(stats.hits);
+                acc.misses = acc.misses.saturating_add(stats.misses);
+                acc.saturated_misses = acc.saturated_misses.saturating_add(stats.saturated_misses);
+                acc
+            },
+        )
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        GameplayCoreState,
+        gameplay_screen::GameplayNoteskinAssets,
+        profile_data::Profile,
+    ) {
+        (self.state, self.noteskin_assets, self.profile)
     }
 
     pub fn build(&self, retained: bool) -> Vec<Actor> {
         if !retained {
-            for cache in &self.state.notefield_model_cache {
+            for cache in &self.notefield_model_cache {
                 cache.borrow_mut().clear();
             }
         }
-        notefield::build(
+        let mut actors = Vec::new();
+        let mut hud_actors = Vec::new();
+        notefield::build_bundles(
             &self.state,
+            &self.noteskin_assets,
+            &self.notefield_model_cache,
             &self.profile,
             FieldPlacement::P1,
-            profile::PlayStyle::Single,
+            profile_data::PlayStyle::Single,
             false,
-        )
-        .0
+            ProxyCaptureRequests::default(),
+            false,
+            ViewOverride::default(),
+            &mut actors,
+            &mut hud_actors,
+        );
+        actors
     }
 }
 
 pub fn fixture() -> NotefieldBenchFixture {
-    profile::set_session_play_style(profile::PlayStyle::Single);
-    profile::set_session_player_side(profile::PlayerSide::P1);
+    profile::set_session_play_style(profile_data::PlayStyle::Single);
+    profile::set_session_player_side(profile_data::PlayerSide::P1);
     profile::set_session_joined(true, false);
 
     let song = Arc::new(bench_song());
     let chart = Arc::new(song.charts[0].clone());
     let charts: [Arc<ChartData>; MAX_PLAYERS] = [chart.clone(), chart];
-    let mut player_profiles = [profile::Profile::default(), profile::Profile::default()];
-    player_profiles[0].noteskin = profile::NoteSkin::new(profile::NoteSkin::CEL_NAME);
+    let gameplay_chart = Arc::new(bench_gameplay_chart());
+    let gameplay_charts: [Arc<GameplayChartData>; MAX_PLAYERS] =
+        [gameplay_chart.clone(), gameplay_chart];
+    let mut player_profiles = [
+        profile_data::Profile::default(),
+        profile_data::Profile::default(),
+    ];
+    player_profiles[0].noteskin = profile_data::NoteSkin::new(profile_data::NoteSkin::CEL_NAME);
     player_profiles[0].scroll_speed = ScrollSpeedSetting::CMod(620.0);
-    player_profiles[0].judgment_graphic = profile::JudgmentGraphic::Wendy;
-    player_profiles[0].hold_judgment_graphic = profile::HoldJudgmentGraphic::Love;
+    player_profiles[0].judgment_graphic = profile_data::JudgmentGraphic::new("Wendy");
+    player_profiles[0].hold_judgment_graphic = profile_data::HoldJudgmentGraphic::new("Love");
     player_profiles[0].hide_combo = false;
     player_profiles[0].column_cues = true;
-    player_profiles[0].error_bar = profile::ErrorBarStyle::Colorful;
+    player_profiles[0].error_bar = profile_data::ErrorBarStyle::Colorful;
     player_profiles[0].error_bar_active_mask =
-        profile::error_bar_mask_from_style(profile::ErrorBarStyle::Colorful, true);
+        profile_data::error_bar_mask_from_style(profile_data::ErrorBarStyle::Colorful, true);
     player_profiles[0].error_bar_text = true;
-    player_profiles[0].measure_lines = profile::MeasureLines::Eighth;
+    player_profiles[0].measure_lines = profile_data::MeasureLines::Eighth;
 
-    let mut state = gameplay::init(
+    let session = GameplaySession::default();
+    let runtime_profiles =
+        gameplay_screen::gameplay_runtime_profile_data(&player_profiles, &session);
+    let noteskin_assets = gameplay_screen::gameplay_noteskin_assets(
+        profile_data::PlayStyle::Single.cols_per_player(),
+        profile_data::PlayStyle::Single.player_count(),
+        &runtime_profiles,
+    );
+    let noteskin_data = noteskin_assets.gameplay_data(
+        profile_data::PlayStyle::Single.cols_per_player(),
+        profile_data::PlayStyle::Single.player_count(),
+        &runtime_profiles,
+    );
+
+    let mut state = deadsync_gameplay::init_gameplay_runtime(
         song,
         charts,
+        gameplay_charts,
+        GameplayViewport::default(),
+        session,
+        GameplayConfig::default(),
+        deadsync_chart::SyncPref::Default,
+        GameplayMiniIndicatorData::default(),
+        noteskin_data,
+        gameplay_screen::GameplaySongLuaData::default(),
+        deadsync_gameplay::empty_crossover_annotations,
         0,
         1.0,
         [
             ScrollSpeedSetting::CMod(620.0),
             ScrollSpeedSetting::CMod(620.0),
         ],
-        player_profiles.clone(),
+        player_profiles
+            .clone()
+            .map(crate::game::GameplayProfile::from),
         None,
         None,
         None,
-        Arc::from("BENCH"),
         None,
         None,
         None,
@@ -99,39 +178,41 @@ pub fn fixture() -> NotefieldBenchFixture {
     );
 
     prime_visible_window(&mut state);
+    let notefield_model_cache =
+        gameplay_screen::notefield_model_cache_from_assets(&noteskin_assets, state.num_players());
 
     NotefieldBenchFixture {
         state,
+        noteskin_assets,
+        notefield_model_cache,
         profile: player_profiles[0].clone(),
     }
 }
 
-fn prime_visible_window(state: &mut gameplay::State) {
+fn prime_visible_window(state: &mut GameplayCoreState) {
     let beat = VISIBLE_BEAT;
-    let time = state.timing_players[0].get_time_for_beat(beat);
-    state.total_elapsed_in_screen = 7.25;
-    state.current_beat = beat;
-    state.current_beat_display = beat;
-    state.current_music_time = time;
-    state.current_music_time_display = time;
-    state.current_beat_visible[0] = beat;
-    state.current_beat_visible[1] = beat;
-    state.current_music_time_visible[0] = time;
-    state.current_music_time_visible[1] = time;
+    let timing = state
+        .timing_for_player(0)
+        .expect("notefield bench fixture initializes P1 timing");
+    let time = timing.get_time_for_beat(beat);
+    let time_ns = timing.get_time_for_beat_ns(beat);
+    let elapsed = 7.25;
+    state.set_screen_elapsed(elapsed);
+    state.set_song_position_for_benchmark(beat, time_ns, beat, time);
+    state.set_visible_time(0, time_ns, time, beat);
+    state.set_visible_time(1, time_ns, time, beat);
+    state.clear_visual_feedback();
 
-    for col in 0..MAX_COLS {
-        state.arrows[col].clear();
-        state.tap_explosions[col] = None;
-        state.active_holds[col] = None;
-    }
+    state.clear_active_holds();
 
     let lower = beat - WINDOW_BEATS_BEFORE;
     let upper = beat + WINDOW_BEATS_AFTER;
-    let (note_start, note_end) = state.note_ranges[0];
+    let (note_start, note_end) = state.note_range_for_player(0);
+    let notes = state.notes();
     let mut end_cursor = note_start;
 
     for idx in note_start..note_end {
-        let note = &state.notes[idx];
+        let note = &notes[idx];
         if note.beat < lower {
             continue;
         }
@@ -139,19 +220,12 @@ fn prime_visible_window(state: &mut gameplay::State) {
             break;
         }
         end_cursor = idx + 1;
-        if !matches!(note.note_type, NoteType::Hold | NoteType::Roll) {
-            state.arrows[note.column].push(Arrow {
-                beat: note.beat,
-                note_type: note.note_type,
-                note_index: idx,
-            });
-        }
     }
 
-    state.note_spawn_cursor[0] = end_cursor.max(note_start);
-    state.next_tap_miss_cursor[0] = end_cursor.max(note_start);
+    state.set_next_tap_miss_cursor(0, end_cursor.max(note_start));
+    let notes = state.notes();
 
-    if let Some((note_index, note_type)) = state.notes[note_start..end_cursor]
+    if let Some((note_index, note_type)) = notes[note_start..end_cursor]
         .iter()
         .enumerate()
         .find_map(|(ix, note)| {
@@ -159,75 +233,105 @@ fn prime_visible_window(state: &mut gameplay::State) {
                 .then_some((note_start + ix, note.note_type))
         })
     {
-        let column = state.notes[note_index].column;
-        let end_time = state.hold_end_time_cache[note_index].unwrap_or(time + 1.0);
-        state.active_holds[column] = Some(ActiveHold {
-            note_index,
-            end_time,
-            note_type,
-            let_go: false,
-            is_pressed: true,
-            life: 1.0,
-        });
+        let column = notes[note_index].column;
+        let end_time_ns = state
+            .hold_end_time_cache_ns_at(note_index)
+            .flatten()
+            .unwrap_or_else(|| deadsync_core::song_time::song_time_ns_from_seconds(time + 1.0));
+        let start_time_ns = state
+            .note_time_cache_ns_at(note_index)
+            .unwrap_or_else(|| deadsync_core::song_time::song_time_ns_from_seconds(time));
+        state.set_active_hold(
+            column,
+            Some(ActiveHold {
+                note_index,
+                start_time_ns,
+                end_time_ns,
+                note_type,
+                let_go: false,
+                is_pressed: true,
+                life: 1.0,
+                last_update_time_ns: time_ns,
+            }),
+        );
     }
 
-    state.tap_explosions[0] = Some(ActiveTapExplosion {
-        window: "W1".to_string(),
-        elapsed: 0.08,
-        start_beat: beat,
+    state.set_tap_explosion(
+        0,
+        Some(ActiveTapExplosion {
+            window: "W1",
+            bright: false,
+            elapsed: 0.08,
+            duration: 0.6,
+            start_beat: beat,
+        }),
+    );
+    state.set_column_cues(
+        0,
+        vec![ColumnCue {
+            start_time: time - 1.4,
+            duration: 8.0,
+            columns: vec![
+                ColumnCueColumn {
+                    column: 0,
+                    is_mine: false,
+                },
+                ColumnCueColumn {
+                    column: 1,
+                    is_mine: true,
+                },
+                ColumnCueColumn {
+                    column: 3,
+                    is_mine: false,
+                },
+            ],
+        }],
+    );
+    state.set_receptor_bop_timer_for_benchmark(0, 0.05);
+    state.update_player(0, |player| {
+        player.combo = 327;
+        player.current_combo_grade = Some(JudgeGrade::Fantastic);
+        player.full_combo_grade = Some(JudgeGrade::Fantastic);
+        player.error_bar_color_bar_started_at = Some(elapsed - 0.06);
+        player.error_bar_color_ticks[0] = Some(ErrorBarTick {
+            started_at: elapsed - 0.04,
+            offset_s: -0.011,
+            window: TimingWindow::W1,
+        });
+        player.error_bar_color_ticks[1] = Some(ErrorBarTick {
+            started_at: elapsed - 0.08,
+            offset_s: 0.019,
+            window: TimingWindow::W2,
+        });
+        player.error_bar_text = Some(ErrorBarText {
+            started_at: elapsed - 0.05,
+            early: true,
+            offset_ms: 12.0,
+            scaled: false,
+            scale_start_ms: 10.0,
+        });
+        player.last_judgment = None;
     });
-    state.column_cues[0] = vec![ColumnCue {
-        start_time: time - 1.4,
-        duration: 8.0,
-        columns: vec![
-            ColumnCueColumn {
-                column: 0,
-                is_mine: false,
-            },
-            ColumnCueColumn {
-                column: 1,
-                is_mine: true,
-            },
-            ColumnCueColumn {
-                column: 3,
-                is_mine: false,
-            },
-        ],
-    }];
-    state.receptor_bop_timers[0] = 0.05;
-    state.players[0].combo = 327;
-    state.players[0].current_combo_grade = Some(JudgeGrade::Fantastic);
-    state.players[0].full_combo_grade = Some(JudgeGrade::Fantastic);
-    state.players[0].error_bar_color_bar_started_at = Some(state.total_elapsed_in_screen - 0.06);
-    state.players[0].error_bar_color_ticks[0] = Some(ErrorBarTick {
-        started_at: state.total_elapsed_in_screen - 0.04,
-        offset_s: -0.011,
-        window: TimingWindow::W1,
-    });
-    state.players[0].error_bar_color_ticks[1] = Some(ErrorBarTick {
-        started_at: state.total_elapsed_in_screen - 0.08,
-        offset_s: 0.019,
-        window: TimingWindow::W2,
-    });
-    state.players[0].error_bar_text = Some(ErrorBarText {
-        started_at: state.total_elapsed_in_screen - 0.05,
-        early: true,
-    });
-    state.players[0].last_judgment = None;
 }
 
 fn bench_song() -> SongData {
     let chart = bench_chart();
     SongData {
-        simfile_path: PathBuf::from("Songs/Bench/Notefield/notefield-bench.ssc"),
+        simfile_path: PathBuf::from("songs/Bench/Notefield/notefield-bench.ssc"),
         title: "Notefield Benchmark".to_string(),
         subtitle: "Cache Warmup".to_string(),
         translit_title: String::new(),
         translit_subtitle: String::new(),
         artist: "Bench Artist".to_string(),
+        genre: String::new(),
         banner_path: None,
         background_path: None,
         background_changes: Vec::new(),
+        background_layer2_changes: Vec::new(),
+        foreground_changes: Vec::new(),
+        background_lua_changes: Vec::new(),
+        foreground_lua_changes: Vec::new(),
+        has_lua: false,
         cdtitle_path: None,
         music_path: None,
         display_bpm: "150".to_string(),
@@ -237,57 +341,17 @@ fn bench_song() -> SongData {
         min_bpm: 150.0,
         max_bpm: 150.0,
         normalized_bpms: "0.000=150.000".to_string(),
-        normalized_stops: String::new(),
-        normalized_delays: String::new(),
-        normalized_warps: String::new(),
-        normalized_speeds: String::new(),
-        normalized_scrolls: String::new(),
-        normalized_fakes: String::new(),
         music_length_seconds: 128.0,
+        first_second: 0.0,
         total_length_seconds: 128,
+        precise_last_second_seconds: 128.0,
         charts: vec![chart],
         cached_precise_last_second: 0.0,
     }
 }
 
 fn bench_chart() -> ChartData {
-    let parsed_notes = bench_notes();
-    let max_row = parsed_notes
-        .iter()
-        .map(|note| note.tail_row_index.unwrap_or(note.row_index))
-        .max()
-        .unwrap_or(0);
-    let row_to_beat: Vec<f32> = (0..=max_row)
-        .map(|row| note_row_to_beat(row as i32))
-        .collect();
-    let timing_segments = TimingSegments {
-        beat0_offset_adjust: 0.0,
-        bpms: vec![(0.0, 150.0)],
-        stops: Vec::new(),
-        delays: Vec::new(),
-        warps: Vec::new(),
-        speeds: Vec::new(),
-        scrolls: Vec::new(),
-        fakes: Vec::new(),
-    };
-    let timing = TimingData::from_segments(0.0, 0.0, &timing_segments, &row_to_beat);
-    let holds = parsed_notes
-        .iter()
-        .filter(|note| note.note_type == NoteType::Hold)
-        .count() as u32;
-    let rolls = parsed_notes
-        .iter()
-        .filter(|note| note.note_type == NoteType::Roll)
-        .count() as u32;
-    let mines = parsed_notes
-        .iter()
-        .filter(|note| note.note_type == NoteType::Mine)
-        .count() as u32;
-    let total_steps = parsed_notes
-        .iter()
-        .filter(|note| !matches!(note.note_type, NoteType::Mine | NoteType::Fake))
-        .count() as u32;
-
+    let (gameplay, holds, rolls, mines, total_steps) = bench_chart_bundle();
     ChartData {
         chart_type: "dance-single".to_string(),
         difficulty: "challenge".to_string(),
@@ -295,11 +359,7 @@ fn bench_chart() -> ChartData {
         chart_name: String::new(),
         meter: 15,
         step_artist: String::new(),
-        notes: Vec::new(),
-        parsed_notes,
-        row_to_beat,
-        timing_segments,
-        timing,
+        music_path: None,
         short_hash: "notefield-bench".to_string(),
         stats: ArrowStats {
             total_arrows: total_steps,
@@ -332,6 +392,7 @@ fn bench_chart() -> ChartData {
         mines_nonfake: mines,
         stamina_counts: StaminaCounts::default(),
         total_streams: 0,
+        matrix_rating: 0.0,
         max_nps: 12.5,
         sn_detailed_breakdown: String::new(),
         sn_partial_breakdown: String::new(),
@@ -341,15 +402,77 @@ fn bench_chart() -> ChartData {
         simple_breakdown: String::new(),
         total_measures: 0,
         measure_nps_vec: Vec::new(),
-        chart_attacks: None,
-        chart_bpms: None,
-        chart_stops: None,
-        chart_delays: None,
-        chart_warps: None,
-        chart_speeds: None,
-        chart_scrolls: None,
-        chart_fakes: None,
+        measure_seconds_vec: Vec::new(),
+        first_second: gameplay.timing.get_time_for_beat(0.0).min(0.0),
+        has_note_data: true,
+        has_chart_attacks: false,
+        possible_grade_points: 0,
+        holds_total: holds,
+        rolls_total: rolls,
+        mines_total: mines,
+        display_bpm: None,
+        min_bpm: 120.0,
+        max_bpm: 120.0,
     }
+}
+
+fn bench_gameplay_chart() -> GameplayChartData {
+    let (gameplay, _, _, _, _) = bench_chart_bundle();
+    gameplay
+}
+
+fn bench_chart_bundle() -> (GameplayChartData, u32, u32, u32, u32) {
+    let parsed_notes = bench_notes();
+    let max_row = parsed_notes
+        .iter()
+        .map(|note| note.tail_row_index.unwrap_or(note.row_index))
+        .max()
+        .unwrap_or(0);
+    let row_to_beat: Vec<f32> = (0..=max_row)
+        .map(|row| note_row_to_beat(row as i32))
+        .collect();
+    let timing_segments = TimingSegments {
+        beat0_offset_adjust: 0.0,
+        bpms: vec![(0.0, 150.0)],
+        stops: Vec::new(),
+        delays: Vec::new(),
+        warps: Vec::new(),
+        speeds: Vec::new(),
+        scrolls: Vec::new(),
+        fakes: Vec::new(),
+        ..TimingSegments::default()
+    };
+    let timing = TimingData::from_segments(0.0, 0.0, &timing_segments, &row_to_beat);
+    let holds = parsed_notes
+        .iter()
+        .filter(|note| note.note_type == NoteType::Hold)
+        .count() as u32;
+    let rolls = parsed_notes
+        .iter()
+        .filter(|note| note.note_type == NoteType::Roll)
+        .count() as u32;
+    let mines = parsed_notes
+        .iter()
+        .filter(|note| note.note_type == NoteType::Mine)
+        .count() as u32;
+    let total_steps = parsed_notes
+        .iter()
+        .filter(|note| !matches!(note.note_type, NoteType::Mine | NoteType::Fake))
+        .count() as u32;
+    (
+        GameplayChartData {
+            notes: Vec::new(),
+            parsed_notes,
+            row_to_beat,
+            timing_segments,
+            timing,
+            chart_attacks: None,
+        },
+        holds,
+        rolls,
+        mines,
+        total_steps,
+    )
 }
 
 fn bench_notes() -> Vec<ParsedNote> {

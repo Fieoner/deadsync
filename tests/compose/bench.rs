@@ -1,12 +1,14 @@
+use deadlib_present::actors::Actor;
+use deadlib_present::compose;
+use deadlib_render::RenderList;
 use deadsync::assets::AssetManager;
-use deadsync::core::gfx::RenderList;
+use deadsync::assets::PRESENT_TEXTURE_CONTEXT;
 use deadsync::test_support::{
-    compose_case, compose_scenarios, density_graph_bench, density_graph_life_bench, gameplay_bench,
-    gameplay_stats_bench, gameplay_stats_double_bench, gameplay_stats_versus_bench,
-    gs_scorebox_bench, heart_bg_bench, init_bench, menu_bench, music_wheel_bench, notefield_bench,
-    options_bench, pane_stats_bench, player_options_bench,
+    compose_case, compose_scenarios, density_graph_bench, density_graph_life_bench,
+    evaluation_bench, gameplay_bench, gameplay_stats_bench, gameplay_stats_double_bench,
+    gameplay_stats_versus_bench, gs_scorebox_bench, init_bench, menu_bench, music_wheel_bench,
+    notefield_bench, options_bench, pane_stats_bench, player_options_bench, visual_style_bg_bench,
 };
-use deadsync::ui::{actors::Actor, compose};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::HashMap;
 use std::error::Error;
@@ -15,7 +17,19 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+#[cfg(not(feature = "dhat-heap"))]
 #[global_allocator]
+static ALLOC: CountingAlloc = CountingAlloc::new();
+
+// When profiling allocations, DHAT must be THE global allocator. `ALLOC` stays as a
+// (non-global) static so the existing `ALLOC.begin_measurement()`/`.snapshot()` call
+// sites keep compiling; their counters just read zero in this mode (we don't print
+// the deterministic alloc block when DHAT is active).
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static DHAT_ALLOC: dhat::Alloc = dhat::Alloc;
+
+#[cfg(feature = "dhat-heap")]
 static ALLOC: CountingAlloc = CountingAlloc::new();
 
 struct CountingAlloc {
@@ -68,6 +82,7 @@ struct Args {
 enum CacheMode {
     Fresh,
     Retained,
+    Scratch,
 }
 
 #[derive(Clone, Copy)]
@@ -90,6 +105,7 @@ struct BenchmarkResult {
     alloc: AllocDelta,
     checksum: u64,
     verifications: Vec<VerificationResult>,
+    notes: Vec<String>,
 }
 
 struct VerificationResult {
@@ -103,7 +119,11 @@ impl CacheMode {
         match value {
             "fresh" => Ok(Self::Fresh),
             "retained" => Ok(Self::Retained),
-            _ => Err(format!("unknown --cache value '{value}', expected fresh or retained").into()),
+            "scratch" => Ok(Self::Scratch),
+            _ => Err(format!(
+                "unknown --cache value '{value}', expected fresh, retained, or scratch"
+            )
+            .into()),
         }
     }
 
@@ -111,7 +131,12 @@ impl CacheMode {
         match self {
             Self::Fresh => "fresh",
             Self::Retained => "retained",
+            Self::Scratch => "scratch",
         }
+    }
+
+    const fn retains_actor_data(self) -> bool {
+        matches!(self, Self::Retained | Self::Scratch)
     }
 }
 
@@ -255,6 +280,13 @@ fn update_peak(slot: &AtomicU64, value: u64) {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    // Profiles every allocation from here to program exit; writes dhat-heap.json on
+    // drop. Setup/fixture allocs land under distinct backtraces from the per-iter
+    // actor path, so the hot sites still rank by total bytes/blocks.
+    #[cfg(feature = "dhat-heap")]
+    let _dhat_profiler = dhat::Profiler::new_heap();
+
+    deadsync::assets::i18n::init("en");
     let args = parse_args()?;
     if args.case_path.is_none()
         && args.scenario == "all"
@@ -303,7 +335,7 @@ fn run_named(args: &Args, name: &str) -> Result<BenchmarkResult, Box<dyn Error>>
         Phase::Actors => match name {
             music_wheel_bench::SCENARIO_NAME => {
                 let fixture = music_wheel_bench::fixture();
-                benchmark_actor_builder(
+                benchmark_actor_pusher(
                     scenario.name,
                     scenario.clear_color,
                     &scenario.metrics,
@@ -312,7 +344,21 @@ fn run_named(args: &Args, name: &str) -> Result<BenchmarkResult, Box<dyn Error>>
                     args.iters,
                     args.warmup,
                     args.cache_mode,
-                    || fixture.build(),
+                    |actors| fixture.push(actors),
+                )
+            }
+            music_wheel_bench::SCENARIO_NAME_LOADED => {
+                let fixture = music_wheel_bench::loaded_fixture();
+                benchmark_actor_pusher(
+                    scenario.name,
+                    scenario.clear_color,
+                    &scenario.metrics,
+                    &scenario.fonts,
+                    scenario.total_elapsed,
+                    args.iters,
+                    args.warmup,
+                    args.cache_mode,
+                    |actors| fixture.push(actors),
                 )
             }
             density_graph_bench::SCENARIO_NAME => {
@@ -386,7 +432,7 @@ fn run_named(args: &Args, name: &str) -> Result<BenchmarkResult, Box<dyn Error>>
                 )
             }
             gameplay_bench::SCENARIO_NAME => {
-                let fixture = gameplay_bench::fixture();
+                let mut fixture = gameplay_bench::fixture();
                 benchmark_actor_builder(
                     scenario.name,
                     scenario.clear_color,
@@ -396,7 +442,7 @@ fn run_named(args: &Args, name: &str) -> Result<BenchmarkResult, Box<dyn Error>>
                     args.iters,
                     args.warmup,
                     args.cache_mode,
-                    || fixture.build(matches!(args.cache_mode, CacheMode::Retained)),
+                    || fixture.build(args.cache_mode.retains_actor_data()),
                 )
             }
             gs_scorebox_bench::SCENARIO_NAME => {
@@ -413,8 +459,8 @@ fn run_named(args: &Args, name: &str) -> Result<BenchmarkResult, Box<dyn Error>>
                     || fixture.build(),
                 )
             }
-            heart_bg_bench::SCENARIO_NAME => {
-                let fixture = heart_bg_bench::fixture();
+            visual_style_bg_bench::SCENARIO_NAME => {
+                let fixture = visual_style_bg_bench::fixture();
                 benchmark_actor_builder(
                     scenario.name,
                     scenario.clear_color,
@@ -438,12 +484,13 @@ fn run_named(args: &Args, name: &str) -> Result<BenchmarkResult, Box<dyn Error>>
                     args.iters,
                     args.warmup,
                     args.cache_mode,
-                    || fixture.build(matches!(args.cache_mode, CacheMode::Retained)),
+                    || fixture.build(args.cache_mode.retains_actor_data()),
                 )
             }
             menu_bench::SCENARIO_NAME => {
                 let fixture = menu_bench::fixture();
-                benchmark_actor_builder(
+                let retained = args.cache_mode.retains_actor_data();
+                benchmark_actor_pusher(
                     scenario.name,
                     scenario.clear_color,
                     &scenario.metrics,
@@ -452,12 +499,12 @@ fn run_named(args: &Args, name: &str) -> Result<BenchmarkResult, Box<dyn Error>>
                     args.iters,
                     args.warmup,
                     args.cache_mode,
-                    || fixture.build(matches!(args.cache_mode, CacheMode::Retained)),
+                    |actors| fixture.push(actors, retained),
                 )
             }
             notefield_bench::SCENARIO_NAME => {
-                let fixture = notefield_bench::fixture();
-                benchmark_actor_builder(
+                let mut fixture = notefield_bench::fixture();
+                benchmark_notefield_actor_builder(
                     scenario.name,
                     scenario.clear_color,
                     &scenario.metrics,
@@ -466,7 +513,7 @@ fn run_named(args: &Args, name: &str) -> Result<BenchmarkResult, Box<dyn Error>>
                     args.iters,
                     args.warmup,
                     args.cache_mode,
-                    || fixture.build(matches!(args.cache_mode, CacheMode::Retained)),
+                    &mut fixture,
                 )
             }
             options_bench::SCENARIO_NAME => {
@@ -480,11 +527,39 @@ fn run_named(args: &Args, name: &str) -> Result<BenchmarkResult, Box<dyn Error>>
                     args.iters,
                     args.warmup,
                     args.cache_mode,
-                    || fixture.build(matches!(args.cache_mode, CacheMode::Retained)),
+                    || fixture.build(args.cache_mode.retains_actor_data()),
                 )
             }
             pane_stats_bench::SCENARIO_NAME => {
                 let fixture = pane_stats_bench::fixture();
+                benchmark_actor_builder(
+                    scenario.name,
+                    scenario.clear_color,
+                    &scenario.metrics,
+                    &scenario.fonts,
+                    scenario.total_elapsed,
+                    args.iters,
+                    args.warmup,
+                    args.cache_mode,
+                    || fixture.build(),
+                )
+            }
+            evaluation_bench::SCENARIO_NAME => {
+                let fixture = evaluation_bench::fixture();
+                benchmark_actor_builder(
+                    scenario.name,
+                    scenario.clear_color,
+                    &scenario.metrics,
+                    &scenario.fonts,
+                    scenario.total_elapsed,
+                    args.iters,
+                    args.warmup,
+                    args.cache_mode,
+                    || fixture.build(),
+                )
+            }
+            evaluation_bench::SCENARIO_NAME_VERSUS => {
+                let fixture = evaluation_bench::fixture_versus();
                 benchmark_actor_builder(
                     scenario.name,
                     scenario.clear_color,
@@ -508,10 +583,10 @@ fn run_named(args: &Args, name: &str) -> Result<BenchmarkResult, Box<dyn Error>>
                     args.iters,
                     args.warmup,
                     args.cache_mode,
-                    || fixture.build(matches!(args.cache_mode, CacheMode::Retained)),
+                    || fixture.build(args.cache_mode.retains_actor_data()),
                 )
             }
-            _ => Err("actors phase currently only supports --scenario music-wheel, density-graph, density-graph-life, gameplay, gameplay-stats, gameplay-stats-double, gameplay-stats-versus, gs-scorebox, heart-bg, init, menu, notefield, options, pane-stats, or player-options".into()),
+            _ => Err("actors phase currently only supports --scenario music-wheel, density-graph, density-graph-life, evaluation, evaluation-versus, gameplay, gameplay-stats, gameplay-stats-double, gameplay-stats-versus, gs-scorebox, visual-style-bg, init, menu, notefield, options, pane-stats, or player-options".into()),
         },
         Phase::Compose => benchmark_compose(
             scenario.name,
@@ -565,7 +640,7 @@ fn run_named(args: &Args, name: &str) -> Result<BenchmarkResult, Box<dyn Error>>
 fn run_case(args: &Args, case_path: &str) -> Result<BenchmarkResult, Box<dyn Error>> {
     if matches!(args.phase, Phase::Actors) {
         return Err(
-            "actors phase does not support --case; use --scenario music-wheel, density-graph, density-graph-life, gameplay, gameplay-stats, gs-scorebox, heart-bg, init, menu, notefield, options, or pane-stats".into(),
+            "actors phase does not support --case; use --scenario music-wheel, density-graph, density-graph-life, gameplay, gameplay-stats, gs-scorebox, visual-style-bg, init, menu, notefield, options, or pane-stats".into(),
         );
     }
     let case = compose_case::read_case(Path::new(case_path))?;
@@ -590,9 +665,8 @@ fn run_case(args: &Args, case_path: &str) -> Result<BenchmarkResult, Box<dyn Err
         )?;
     }
     if let Some(path) = &args.write_resolved_output {
-        let assets = asset_manager_for_bench(&case)?;
-        let mut render = compose_case::render_list_runtime(&output);
-        assets.resolve_render_textures(&mut render);
+        let _assets = asset_manager_for_bench(&case)?;
+        let render = compose_case::render_list_runtime(&output);
         let snapshot = compose_case::texture_resolve_snapshot(&render);
         compose_case::write_texture_resolve_snapshot(Path::new(path), &snapshot)?;
     }
@@ -689,9 +763,8 @@ fn write_requested_outputs(
         compose_case::write_render_snapshot(Path::new(path), output)?;
     }
     if let Some(path) = &args.write_resolved_output {
-        let assets = asset_manager_for_bench(case)?;
-        let mut render = compose_case::render_list_runtime(output);
-        assets.resolve_render_textures(&mut render);
+        let _assets = asset_manager_for_bench(case)?;
+        let render = compose_case::render_list_runtime(output);
         let snapshot = compose_case::texture_resolve_snapshot(&render);
         compose_case::write_texture_resolve_snapshot(Path::new(path), &snapshot)?;
     }
@@ -699,51 +772,82 @@ fn write_requested_outputs(
 }
 
 #[inline(always)]
-fn build_screen_for_mode<'a>(
+fn build_screen_for_mode(
     cache_mode: CacheMode,
     text_cache: &mut compose::TextLayoutCache,
-    actors: &'a [Actor],
+    scratch: &mut compose::ComposeScratch,
+    actors: &[Actor],
     clear_color: [f32; 4],
-    metrics: &deadsync::core::space::Metrics,
-    fonts: &'a HashMap<&'static str, deadsync::ui::font::Font>,
+    metrics: &deadlib_present::space::Metrics,
+    fonts: &HashMap<&'static str, deadlib_present::font::Font>,
     total_elapsed: f32,
-) -> RenderList<'a> {
+) -> RenderList {
     match cache_mode {
-        CacheMode::Fresh => {
-            compose::build_screen(actors, clear_color, metrics, fonts, total_elapsed)
-        }
-        CacheMode::Retained => compose::build_screen_cached(
+        CacheMode::Fresh => compose::build_screen_with_texture_context(
+            actors,
+            clear_color,
+            metrics,
+            fonts,
+            total_elapsed,
+            &PRESENT_TEXTURE_CONTEXT,
+        ),
+        CacheMode::Retained => compose::build_screen_cached_with_texture_context(
             actors,
             clear_color,
             metrics,
             fonts,
             total_elapsed,
             text_cache,
+            &PRESENT_TEXTURE_CONTEXT,
         ),
+        CacheMode::Scratch => compose::build_screen_cached_with_scratch_and_texture_context(
+            actors,
+            clear_color,
+            metrics,
+            fonts,
+            total_elapsed,
+            text_cache,
+            scratch,
+            &PRESENT_TEXTURE_CONTEXT,
+        ),
+    }
+}
+
+#[inline(always)]
+fn recycle_screen_for_mode(
+    cache_mode: CacheMode,
+    scratch: &mut compose::ComposeScratch,
+    screen: &mut RenderList,
+) {
+    if matches!(cache_mode, CacheMode::Scratch) {
+        scratch.recycle_render_list(screen);
     }
 }
 
 fn benchmark_actor_builder<F>(
     name: &str,
     clear_color: [f32; 4],
-    metrics: &deadsync::core::space::Metrics,
-    fonts: &HashMap<&'static str, deadsync::ui::font::Font>,
+    metrics: &deadlib_present::space::Metrics,
+    fonts: &HashMap<&'static str, deadlib_present::font::Font>,
     total_elapsed: f32,
     iters: u64,
     warmup: u64,
     cache_mode: CacheMode,
-    build_actors: F,
+    mut build_actors: F,
 ) -> Result<BenchmarkResult, Box<dyn Error>>
 where
-    F: Fn() -> Vec<Actor>,
+    F: FnMut() -> Vec<Actor>,
 {
     let sample_actors = build_actors();
+    let _assets = compose_case::asset_manager_for_scene(name, &sample_actors, fonts)?;
     let actor_snapshot = compose_case::actor_list_snapshot(&sample_actors);
     let actor_hash = compose_case::actor_snapshot_hash(&actor_snapshot)?;
     let mut text_cache = compose::TextLayoutCache::default();
+    let mut scratch = compose::ComposeScratch::default();
     let sample_render = build_screen_for_mode(
         cache_mode,
         &mut text_cache,
+        &mut scratch,
         &sample_actors,
         clear_color,
         metrics,
@@ -787,9 +891,11 @@ where
         .into());
     }
     let mut verify_cache = compose::TextLayoutCache::default();
+    let mut verify_scratch = compose::ComposeScratch::default();
     let final_render = build_screen_for_mode(
         cache_mode,
         &mut verify_cache,
+        &mut verify_scratch,
         &final_actors,
         clear_color,
         metrics,
@@ -829,6 +935,265 @@ where
                 actual_hash: actual_render_hash,
             },
         ],
+        notes: Vec::new(),
+    })
+}
+
+fn benchmark_actor_pusher<F>(
+    name: &str,
+    clear_color: [f32; 4],
+    metrics: &deadlib_present::space::Metrics,
+    fonts: &HashMap<&'static str, deadlib_present::font::Font>,
+    total_elapsed: f32,
+    iters: u64,
+    warmup: u64,
+    cache_mode: CacheMode,
+    mut push_actors: F,
+) -> Result<BenchmarkResult, Box<dyn Error>>
+where
+    F: FnMut(&mut Vec<Actor>),
+{
+    let mut sample_actors = Vec::new();
+    push_actors(&mut sample_actors);
+    let _assets = compose_case::asset_manager_for_scene(name, &sample_actors, fonts)?;
+    let actor_snapshot = compose_case::actor_list_snapshot(&sample_actors);
+    let actor_hash = compose_case::actor_snapshot_hash(&actor_snapshot)?;
+    let mut text_cache = compose::TextLayoutCache::default();
+    let mut scratch = compose::ComposeScratch::default();
+    let sample_render = build_screen_for_mode(
+        cache_mode,
+        &mut text_cache,
+        &mut scratch,
+        &sample_actors,
+        clear_color,
+        metrics,
+        fonts,
+        total_elapsed,
+    );
+    let render_hash =
+        compose_case::render_snapshot_hash(&compose_case::render_list_snapshot(&sample_render))?;
+    let actors = actor_count(&sample_actors);
+    let objects = sample_render.objects.len();
+    let cameras = sample_render.cameras.len();
+    black_box(actors ^ objects ^ cameras);
+    drop(sample_render);
+    drop(sample_actors);
+
+    let mut actor_scratch = Vec::new();
+    for _ in 0..warmup {
+        actor_scratch.clear();
+        push_actors(&mut actor_scratch);
+        black_box(actor_count(&actor_scratch));
+    }
+
+    let start_alloc = ALLOC.begin_measurement();
+    let started = Instant::now();
+    let mut checksum = 0u64;
+    for _ in 0..iters {
+        actor_scratch.clear();
+        push_actors(black_box(&mut actor_scratch));
+        checksum = checksum
+            .wrapping_mul(131)
+            .wrapping_add(actor_count(&actor_scratch) as u64)
+            .wrapping_add(actor_scratch.len() as u64);
+        black_box(checksum);
+    }
+
+    let mut final_actors = Vec::new();
+    push_actors(&mut final_actors);
+    let actual_actor_hash =
+        compose_case::actor_snapshot_hash(&compose_case::actor_list_snapshot(&final_actors))?;
+    if actual_actor_hash != actor_hash {
+        return Err(format!(
+            "actor hash mismatch after benchmark: expected {} got {}",
+            actor_hash, actual_actor_hash
+        )
+        .into());
+    }
+    let mut verify_cache = compose::TextLayoutCache::default();
+    let mut verify_scratch = compose::ComposeScratch::default();
+    let final_render = build_screen_for_mode(
+        cache_mode,
+        &mut verify_cache,
+        &mut verify_scratch,
+        &final_actors,
+        clear_color,
+        metrics,
+        fonts,
+        total_elapsed,
+    );
+    let actual_render_hash =
+        compose_case::render_snapshot_hash(&compose_case::render_list_snapshot(&final_render))?;
+    if actual_render_hash != render_hash {
+        return Err(format!(
+            "actor compose hash mismatch: expected {} got {}",
+            render_hash, actual_render_hash
+        )
+        .into());
+    }
+
+    Ok(BenchmarkResult {
+        name: name.to_string(),
+        phase: Phase::Actors,
+        cache_mode,
+        actors,
+        objects,
+        cameras,
+        iters,
+        elapsed_s: started.elapsed().as_secs_f64(),
+        alloc: ALLOC.snapshot().diff(start_alloc),
+        checksum,
+        verifications: vec![
+            VerificationResult {
+                kind: "actors",
+                expected_hash: actor_hash,
+                actual_hash: actual_actor_hash,
+            },
+            VerificationResult {
+                kind: "compose",
+                expected_hash: render_hash,
+                actual_hash: actual_render_hash,
+            },
+        ],
+        notes: Vec::new(),
+    })
+}
+
+fn benchmark_notefield_actor_builder(
+    name: &str,
+    clear_color: [f32; 4],
+    metrics: &deadlib_present::space::Metrics,
+    fonts: &HashMap<&'static str, deadlib_present::font::Font>,
+    total_elapsed: f32,
+    iters: u64,
+    warmup: u64,
+    cache_mode: CacheMode,
+    fixture: &mut notefield_bench::NotefieldBenchFixture,
+) -> Result<BenchmarkResult, Box<dyn Error>> {
+    let retained = cache_mode.retains_actor_data();
+    let build_actors = |fixture: &notefield_bench::NotefieldBenchFixture| fixture.build(retained);
+
+    let sample_actors = build_actors(fixture);
+    let _assets = compose_case::asset_manager_for_scene(name, &sample_actors, fonts)?;
+    let actor_snapshot = compose_case::actor_list_snapshot(&sample_actors);
+    let actor_hash = compose_case::actor_snapshot_hash(&actor_snapshot)?;
+    let mut text_cache = compose::TextLayoutCache::default();
+    let mut scratch = compose::ComposeScratch::default();
+    let sample_render = build_screen_for_mode(
+        cache_mode,
+        &mut text_cache,
+        &mut scratch,
+        &sample_actors,
+        clear_color,
+        metrics,
+        fonts,
+        total_elapsed,
+    );
+    let render_hash =
+        compose_case::render_snapshot_hash(&compose_case::render_list_snapshot(&sample_render))?;
+    let actors = actor_count(&sample_actors);
+    let objects = sample_render.objects.len();
+    let cameras = sample_render.cameras.len();
+    black_box(actors ^ objects ^ cameras);
+    drop(sample_render);
+    drop(sample_actors);
+
+    fixture.reset_notefield_model_cache_stats();
+    for _ in 0..warmup {
+        let actors = build_actors(fixture);
+        black_box(actor_count(&actors));
+    }
+    fixture.reset_notefield_model_cache_stats();
+
+    let start_alloc = ALLOC.begin_measurement();
+    let started = Instant::now();
+    let mut checksum = 0u64;
+    for _ in 0..iters {
+        let actors = black_box(build_actors(fixture));
+        checksum = checksum
+            .wrapping_mul(131)
+            .wrapping_add(actor_count(&actors) as u64)
+            .wrapping_add(actors.len() as u64);
+        black_box(checksum);
+    }
+    let model_cache_stats = fixture.notefield_model_cache_stats();
+    let model_cache_total = fixture.summed_notefield_model_cache_stats();
+
+    let final_actors = build_actors(fixture);
+    let actual_actor_hash =
+        compose_case::actor_snapshot_hash(&compose_case::actor_list_snapshot(&final_actors))?;
+    if actual_actor_hash != actor_hash {
+        return Err(format!(
+            "actor hash mismatch after benchmark: expected {} got {}",
+            actor_hash, actual_actor_hash
+        )
+        .into());
+    }
+    let mut verify_cache = compose::TextLayoutCache::default();
+    let mut verify_scratch = compose::ComposeScratch::default();
+    let final_render = build_screen_for_mode(
+        cache_mode,
+        &mut verify_cache,
+        &mut verify_scratch,
+        &final_actors,
+        clear_color,
+        metrics,
+        fonts,
+        total_elapsed,
+    );
+    let actual_render_hash =
+        compose_case::render_snapshot_hash(&compose_case::render_list_snapshot(&final_render))?;
+    if actual_render_hash != render_hash {
+        return Err(format!(
+            "actor compose hash mismatch: expected {} got {}",
+            render_hash, actual_render_hash
+        )
+        .into());
+    }
+
+    let mut notes = vec![format!(
+        "model_cache: hits={} misses={} saturated_misses={}",
+        model_cache_total.hits, model_cache_total.misses, model_cache_total.saturated_misses
+    )];
+    for (player, stats) in model_cache_stats.iter().copied().enumerate() {
+        if stats
+            == deadsync::screens::components::shared::noteskin_model::ModelMeshCacheStats::default()
+        {
+            continue;
+        }
+        notes.push(format!(
+            "model_cache_p{}: hits={} misses={} saturated_misses={}",
+            player + 1,
+            stats.hits,
+            stats.misses,
+            stats.saturated_misses
+        ));
+    }
+
+    Ok(BenchmarkResult {
+        name: name.to_string(),
+        phase: Phase::Actors,
+        cache_mode,
+        actors,
+        objects,
+        cameras,
+        iters,
+        elapsed_s: started.elapsed().as_secs_f64(),
+        alloc: ALLOC.snapshot().diff(start_alloc),
+        checksum,
+        verifications: vec![
+            VerificationResult {
+                kind: "actors",
+                expected_hash: actor_hash,
+                actual_hash: actual_actor_hash,
+            },
+            VerificationResult {
+                kind: "compose",
+                expected_hash: render_hash,
+                actual_hash: actual_render_hash,
+            },
+        ],
+        notes,
     })
 }
 
@@ -836,8 +1201,8 @@ fn benchmark_compose<F>(
     name: &str,
     actors: &[Actor],
     clear_color: [f32; 4],
-    metrics: &deadsync::core::space::Metrics,
-    fonts: &HashMap<&'static str, deadsync::ui::font::Font>,
+    metrics: &deadlib_present::space::Metrics,
+    fonts: &HashMap<&'static str, deadlib_present::font::Font>,
     iters: u64,
     warmup: u64,
     cache_mode: CacheMode,
@@ -847,10 +1212,13 @@ fn benchmark_compose<F>(
 where
     F: Fn(u64) -> f32,
 {
+    let _assets = compose_case::asset_manager_for_scene(name, actors, fonts)?;
     let mut text_cache = compose::TextLayoutCache::default();
+    let mut scratch = compose::ComposeScratch::default();
     let sample = build_screen_for_mode(
         cache_mode,
         &mut text_cache,
+        &mut scratch,
         actors,
         clear_color,
         metrics,
@@ -862,9 +1230,10 @@ where
     black_box(objects ^ cameras);
 
     for idx in 0..warmup {
-        let screen = build_screen_for_mode(
+        let mut screen = build_screen_for_mode(
             cache_mode,
             &mut text_cache,
+            &mut scratch,
             actors,
             clear_color,
             metrics,
@@ -872,15 +1241,17 @@ where
             elapsed_for_iter(idx),
         );
         black_box(screen.objects.len());
+        recycle_screen_for_mode(cache_mode, &mut scratch, &mut screen);
     }
 
     let start_alloc = ALLOC.begin_measurement();
     let started = Instant::now();
     let mut checksum = 0u64;
     for idx in 0..iters {
-        let screen = black_box(build_screen_for_mode(
+        let mut screen = black_box(build_screen_for_mode(
             cache_mode,
             &mut text_cache,
+            &mut scratch,
             actors,
             clear_color,
             metrics,
@@ -892,6 +1263,7 @@ where
             .wrapping_add(screen.objects.len() as u64)
             .wrapping_add(screen.cameras.len() as u64);
         black_box(checksum);
+        recycle_screen_for_mode(cache_mode, &mut scratch, &mut screen);
     }
 
     Ok(BenchmarkResult {
@@ -906,6 +1278,7 @@ where
         alloc: ALLOC.snapshot().diff(start_alloc),
         checksum,
         verifications: verification.into_iter().collect(),
+        notes: Vec::new(),
     })
 }
 
@@ -913,20 +1286,18 @@ fn benchmark_resolve(
     name: &str,
     actors: usize,
     cache_mode: CacheMode,
-    assets: &AssetManager,
-    mut render: RenderList<'static>,
+    _assets: &AssetManager,
+    render: RenderList,
     iters: u64,
     warmup: u64,
 ) -> Result<BenchmarkResult, Box<dyn Error>> {
     let objects = render.objects.len();
     let cameras = render.cameras.len();
-    assets.resolve_render_textures(&mut render);
     let expected_hash = compose_case::texture_resolve_snapshot_hash(
         &compose_case::texture_resolve_snapshot(&render),
     )?;
 
     for _ in 0..warmup {
-        assets.resolve_render_textures(&mut render);
         black_box(texture_handle_checksum(&render));
     }
 
@@ -934,7 +1305,6 @@ fn benchmark_resolve(
     let started = Instant::now();
     let mut checksum = 0u64;
     for _ in 0..iters {
-        assets.resolve_render_textures(&mut render);
         checksum = checksum
             .wrapping_mul(131)
             .wrapping_add(texture_handle_checksum(&render))
@@ -970,6 +1340,7 @@ fn benchmark_resolve(
             expected_hash,
             actual_hash,
         }],
+        notes: Vec::new(),
     })
 }
 
@@ -977,28 +1348,29 @@ fn benchmark_compose_resolve<F>(
     name: &str,
     actors: &[Actor],
     clear_color: [f32; 4],
-    metrics: &deadsync::core::space::Metrics,
-    fonts: &HashMap<&'static str, deadsync::ui::font::Font>,
+    metrics: &deadlib_present::space::Metrics,
+    fonts: &HashMap<&'static str, deadlib_present::font::Font>,
     iters: u64,
     warmup: u64,
     cache_mode: CacheMode,
-    assets: &AssetManager,
+    _assets: &AssetManager,
     elapsed_for_iter: F,
 ) -> Result<BenchmarkResult, Box<dyn Error>>
 where
     F: Fn(u64) -> f32,
 {
     let mut text_cache = compose::TextLayoutCache::default();
-    let mut sample = build_screen_for_mode(
+    let mut scratch = compose::ComposeScratch::default();
+    let sample = build_screen_for_mode(
         cache_mode,
         &mut text_cache,
+        &mut scratch,
         actors,
         clear_color,
         metrics,
         fonts,
         elapsed_for_iter(0),
     );
-    assets.resolve_render_textures(&mut sample);
     let objects = sample.objects.len();
     let cameras = sample.cameras.len();
     let expected_hash = compose_case::texture_resolve_snapshot_hash(
@@ -1009,14 +1381,15 @@ where
         let mut screen = build_screen_for_mode(
             cache_mode,
             &mut text_cache,
+            &mut scratch,
             actors,
             clear_color,
             metrics,
             fonts,
             elapsed_for_iter(idx),
         );
-        assets.resolve_render_textures(&mut screen);
         black_box(texture_handle_checksum(&screen));
+        recycle_screen_for_mode(cache_mode, &mut scratch, &mut screen);
     }
 
     let start_alloc = ALLOC.begin_measurement();
@@ -1026,32 +1399,33 @@ where
         let mut screen = build_screen_for_mode(
             cache_mode,
             &mut text_cache,
+            &mut scratch,
             actors,
             clear_color,
             metrics,
             fonts,
             elapsed_for_iter(idx),
         );
-        assets.resolve_render_textures(&mut screen);
         checksum = checksum
             .wrapping_mul(131)
             .wrapping_add(texture_handle_checksum(&screen))
             .wrapping_add(screen.objects.len() as u64);
         black_box(checksum);
+        recycle_screen_for_mode(cache_mode, &mut scratch, &mut screen);
     }
     let elapsed_s = started.elapsed().as_secs_f64();
     let alloc = ALLOC.snapshot().diff(start_alloc);
 
-    let mut final_screen = build_screen_for_mode(
+    let final_screen = build_screen_for_mode(
         cache_mode,
         &mut text_cache,
+        &mut scratch,
         actors,
         clear_color,
         metrics,
         fonts,
         elapsed_for_iter(0),
     );
-    assets.resolve_render_textures(&mut final_screen);
     let actual_hash = compose_case::texture_resolve_snapshot_hash(
         &compose_case::texture_resolve_snapshot(&final_screen),
     )?;
@@ -1079,10 +1453,11 @@ where
             expected_hash,
             actual_hash,
         }],
+        notes: Vec::new(),
     })
 }
 
-fn texture_handle_checksum(render: &RenderList<'_>) -> u64 {
+fn texture_handle_checksum(render: &RenderList) -> u64 {
     render.objects.iter().fold(0u64, |acc, obj| {
         acc.wrapping_mul(131)
             .wrapping_add(obj.texture_handle)
@@ -1155,6 +1530,9 @@ fn print_result(result: BenchmarkResult) {
         result.alloc.alloc_bytes,
         result.alloc.free_bytes
     );
+    for note in &result.notes {
+        println!("{note}");
+    }
     println!("checksum: {}", result.checksum);
     println!();
 }
@@ -1228,6 +1606,6 @@ fn next_value(
 
 fn print_help() {
     println!(
-        "compose_bench [--scenario all|hud|text|text-ci|resolve-ci|mask|heart-bg|init|menu|music-wheel|gameplay|gameplay-stats|gs-scorebox] [--case PATH] [--phase actors|compose|resolve|compose-resolve] [--iters N] [--warmup N] [--cache fresh|retained] [--write-case PATH] [--write-actors-output PATH] [--write-output PATH] [--write-resolved-output PATH]"
+        "compose_bench [--scenario all|hud|text|text-ci|resolve-ci|mask|perf-text-plain|perf-text-clip-inside|perf-text-clip-partial|perf-text-attr|perf-shadow-text|perf-sort-z|perf-texture-lookup|visual-style-bg|init|menu|music-wheel|gameplay|gameplay-stats|gs-scorebox] [--case PATH] [--phase actors|compose|resolve|compose-resolve] [--iters N] [--warmup N] [--cache fresh|retained|scratch] [--write-case PATH] [--write-actors-output PATH] [--write-output PATH] [--write-resolved-output PATH]"
     );
 }

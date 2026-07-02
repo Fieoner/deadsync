@@ -1,27 +1,40 @@
 use crate::act;
 use crate::assets::AssetManager;
-use crate::core::audio;
-use crate::core::input::{InputEvent, PadDir, VirtualAction};
-use crate::core::space::{is_wide, screen_center_x, screen_center_y, screen_height, screen_width};
-use crate::game::chart::ChartData;
+use crate::assets::i18n::tr;
+use crate::assets::{FontRole, current_machine_font_key};
 use crate::game::course::get_course_cache;
 use crate::game::profile;
 use crate::game::scores;
-use crate::game::song::{SongData, get_song_cache};
+use crate::game::song::get_song_cache;
 use crate::rgba_const;
 use crate::screens::components::{
     select_music::{music_wheel, screen_bars, select_pane, step_artist_bar},
-    shared::{banner as shared_banner, gs_scorebox, heart_bg, mode_pads, timers},
+    shared::{
+        banner as shared_banner, gs_scorebox, mode_pads, timers, transitions, visual_style_bg,
+    },
 };
+use crate::screens::input as screen_input;
 use crate::screens::{Screen, ScreenAction};
-use crate::ui::actors::{Actor, SizeSpec};
-use crate::ui::color;
+use deadlib_present::actors::{Actor, SizeSpec};
+use deadlib_present::cache::{TextCache, cached_text};
+use deadlib_present::color;
+use deadlib_present::space::{
+    is_wide, screen_center_x, screen_center_y, screen_height, screen_width,
+};
+use deadsync_audio_stream as audio;
+use deadsync_chart::song::standard_difficulty_index;
+use deadsync_chart::{ChartData, SongData};
+use deadsync_input::{InputEvent, PadDir, VirtualAction};
+use deadsync_profile as profile_data;
+use deadsync_score as score_data;
+use deadsync_simfile::course::{
+    self, CourseEntry, CourseFile, CourseSong, Difficulty, SongSort, StepsSpec,
+};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hasher;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
-use std::thread::LocalKey;
 use std::time::{Duration, Instant};
 use twox_hash::XxHash64;
 
@@ -59,14 +72,7 @@ const COURSE_TRACKLIST_RATING_BOX_H: f32 = 152.0;
 // Negative moves up, positive moves down.
 const COURSE_TRACKLIST_TEXT_Y_OFFSET: f32 = 0.0;
 const COURSE_TRACKLIST_TEXT_HEIGHT: f32 = 15.0;
-const PRESS_START_FOR_OPTIONS_TEXT: &str = "Press &START; for options";
-const ENTERING_OPTIONS_TEXT: &str = "Entering Options...";
 const SL_EXIT_PROMPT_BG_ALPHA: f32 = 0.925;
-const SL_EXIT_PROMPT_TEXT: &str = "Do you want to exit this game?";
-const SL_EXIT_PROMPT_NO_LABEL: &str = "No";
-const SL_EXIT_PROMPT_YES_LABEL: &str = "Yes";
-const SL_EXIT_PROMPT_NO_INFO: &str = "Keep playing.";
-const SL_EXIT_PROMPT_YES_INFO: &str = "I'm finished.";
 const SL_EXIT_PROMPT_CHOICE_Y: f32 = 250.0;
 const SL_EXIT_PROMPT_CHOICE_X_OFFSET: f32 = 100.0;
 const SL_EXIT_PROMPT_PROMPT_Y_OFFSET: f32 = -70.0;
@@ -85,29 +91,22 @@ rgba_const!(COURSE_WHEEL_SONG_TEXT_COLOR, "#D77272");
 rgba_const!(COURSE_WHEEL_RANDOM_TEXT_COLOR, "#FFFF00");
 const TEXT_CACHE_LIMIT: usize = 4096;
 
-type TextCache<K> = HashMap<K, Arc<str>>;
-
 thread_local! {
     static SCORE_PERCENT_CACHE: RefCell<TextCache<u64>> = RefCell::new(HashMap::with_capacity(1024));
+    static UINT_TEXT_CACHE: RefCell<TextCache<u32>> = RefCell::new(HashMap::with_capacity(1024));
 }
 
 #[inline(always)]
-fn cached_text<K, F>(cache: &'static LocalKey<RefCell<TextCache<K>>>, key: K, build: F) -> Arc<str>
-where
-    K: Copy + Eq + std::hash::Hash,
-    F: FnOnce() -> String,
-{
-    cache.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if let Some(text) = cache.get(&key) {
-            return text.clone();
-        }
-        let text: Arc<str> = Arc::<str>::from(build());
-        if cache.len() < TEXT_CACHE_LIMIT {
-            cache.insert(key, text.clone());
-        }
-        text
+fn cached_u32_text(value: u32) -> Arc<str> {
+    cached_text(&UINT_TEXT_CACHE, value, TEXT_CACHE_LIMIT, || {
+        value.to_string()
     })
+}
+
+#[inline(always)]
+fn unknown_text() -> Arc<str> {
+    static UNKNOWN: OnceLock<Arc<str>> = OnceLock::new();
+    UNKNOWN.get_or_init(|| Arc::<str>::from("?")).clone()
 }
 
 #[inline(always)]
@@ -123,9 +122,12 @@ fn cached_score_percent_text(score_percent: f64) -> Arc<str> {
     } else {
         0.0
     };
-    cached_text(&SCORE_PERCENT_CACHE, score.to_bits(), || {
-        format!("{score:.2}%")
-    })
+    cached_text(
+        &SCORE_PERCENT_CACHE,
+        score.to_bits(),
+        TEXT_CACHE_LIMIT,
+        || format!("{score:.2}%"),
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -198,7 +200,6 @@ struct CourseRatingMeta {
 
 struct InitData {
     all_entries: Vec<MusicWheelEntry>,
-    pack_course_counts: HashMap<String, usize>,
     course_meta_by_path: HashMap<PathBuf, Arc<CourseMeta>>,
     course_text_color_overrides: HashMap<usize, [f32; 4]>,
 }
@@ -214,6 +215,13 @@ enum OutPromptState {
     None,
     PressStartForOptions { elapsed: f32 },
     EnteringOptions { elapsed: f32 },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ThreeKeyFocus {
+    #[default]
+    Wheel,
+    Rating,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -237,10 +245,9 @@ pub struct State {
     pub session_elapsed: f32,
 
     all_entries: Vec<MusicWheelEntry>,
-    pack_course_counts: HashMap<String, usize>,
     course_meta_by_path: HashMap<PathBuf, Arc<CourseMeta>>,
     course_text_color_overrides: HashMap<usize, [f32; 4]>,
-    bg: heart_bg::State,
+    bg: visual_style_bg::State,
     nav_key_held_direction: Option<NavDirection>,
     nav_key_held_since: Option<Instant>,
     last_requested_banner_path: Option<PathBuf>,
@@ -254,6 +261,9 @@ pub struct State {
     last_rating_nav_time_p1: Option<Instant>,
     last_rating_nav_dir_p2: Option<PadDir>,
     last_rating_nav_time_p2: Option<Instant>,
+    menu_lr_chord: screen_input::MenuLrChordTracker,
+    menu_lr_undo: i8,
+    three_key_focus: ThreeKeyFocus,
 }
 
 #[inline(always)]
@@ -337,19 +347,19 @@ fn course_group_name(path: &Path) -> String {
         .and_then(|n| n.to_str())
         .filter(|s| !s.trim().is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| "Courses".to_string())
+        .unwrap_or_else(|| tr("SelectCourse", "CoursesGroup").to_string())
 }
 
 #[inline(always)]
-fn course_name(path: &Path, course: &rssp::course::CourseFile) -> String {
-    if !course.name.trim().is_empty() {
-        course.name.clone()
-    } else {
+fn course_name(path: &Path, course: &CourseFile) -> String {
+    if course.name.trim().is_empty() {
         path.file_stem()
             .and_then(|n| n.to_str())
             .filter(|s| !s.trim().is_empty())
             .map(str::to_string)
-            .unwrap_or_else(|| "Untitled Course".to_string())
+            .unwrap_or_else(|| tr("SelectCourse", "UntitledCourse").to_string())
+    } else {
+        course.name.clone()
     }
 }
 
@@ -361,13 +371,13 @@ pub fn course_score_hash(course_path: &Path) -> String {
 }
 
 #[inline(always)]
-fn course_steps_label(steps: &rssp::course::StepsSpec) -> String {
+fn course_steps_label(steps: &StepsSpec) -> String {
     match steps {
-        rssp::course::StepsSpec::Difficulty(diff) => rssp::course::difficulty_label(*diff)
+        StepsSpec::Difficulty(diff) => course::difficulty_label(*diff)
             .to_ascii_lowercase()
             .to_string(),
-        rssp::course::StepsSpec::MeterRange { low, high } => format!("{low}-{high}"),
-        rssp::course::StepsSpec::Unknown { raw } => {
+        StepsSpec::MeterRange { low, high } => format!("{low}-{high}"),
+        StepsSpec::Unknown { raw } => {
             if raw.trim().is_empty() {
                 "?".to_string()
             } else {
@@ -378,32 +388,32 @@ fn course_steps_label(steps: &rssp::course::StepsSpec) -> String {
 }
 
 #[inline(always)]
-fn course_entry_song_label(entry: &rssp::course::CourseEntry) -> String {
+fn course_entry_song_label(entry: &CourseEntry) -> String {
     match &entry.song {
-        rssp::course::CourseSong::Fixed { song, .. } => song.clone(),
-        rssp::course::CourseSong::RandomAny => "RANDOM".to_string(),
-        rssp::course::CourseSong::RandomWithinGroup { group } => format!("{group}/*"),
-        rssp::course::CourseSong::SortPick { sort, index } => {
+        CourseSong::Fixed { song, .. } => song.clone(),
+        CourseSong::RandomAny => tr("SelectCourse", "RandomLabel").to_string(),
+        CourseSong::RandomWithinGroup { group } => format!("{group}/*"),
+        CourseSong::SortPick { sort, index } => {
             let rank = index.saturating_add(1).max(1);
             let prefix = match sort {
-                rssp::course::SongSort::MostPlays => "BEST",
-                rssp::course::SongSort::FewestPlays => "WORST",
-                rssp::course::SongSort::TopGrades => "GRADEBEST",
-                rssp::course::SongSort::LowestGrades => "GRADEWORST",
+                SongSort::MostPlays => tr("SelectCourse", "BestPrefix"),
+                SongSort::FewestPlays => tr("SelectCourse", "WorstPrefix"),
+                SongSort::TopGrades => tr("SelectCourse", "TopGradesPrefix"),
+                SongSort::LowestGrades => tr("SelectCourse", "LowestGradesPrefix"),
             };
             format!("{prefix}{rank}")
         }
-        rssp::course::CourseSong::Unknown { raw } => raw.clone(),
+        CourseSong::Unknown { raw } => raw.clone(),
     }
 }
 
-const COURSE_RATING_ORDER: [rssp::course::Difficulty; 6] = [
-    rssp::course::Difficulty::Beginner,
-    rssp::course::Difficulty::Easy,
-    rssp::course::Difficulty::Medium,
-    rssp::course::Difficulty::Hard,
-    rssp::course::Difficulty::Challenge,
-    rssp::course::Difficulty::Edit,
+const COURSE_RATING_ORDER: [Difficulty; 6] = [
+    Difficulty::Beginner,
+    Difficulty::Easy,
+    Difficulty::Medium,
+    Difficulty::Hard,
+    Difficulty::Challenge,
+    Difficulty::Edit,
 ];
 
 #[inline(always)]
@@ -431,39 +441,32 @@ fn nearest_filled_slot<T>(slots: &[Option<T>], preferred: usize) -> Option<usize
 }
 
 #[inline(always)]
-fn shifted_course_difficulty(
-    base: rssp::course::Difficulty,
-    course: rssp::course::Difficulty,
-) -> rssp::course::Difficulty {
+fn shifted_course_difficulty(base: Difficulty, course: Difficulty) -> Difficulty {
     let base = base as i32;
-    let delta = (course as i32) - (rssp::course::Difficulty::Medium as i32);
+    let delta = (course as i32) - (Difficulty::Medium as i32);
     let mut idx = base + delta;
     if idx < 0 {
         idx = 0;
     }
-    if idx > rssp::course::Difficulty::Challenge as i32 {
-        idx = rssp::course::Difficulty::Challenge as i32;
+    if idx > Difficulty::Challenge as i32 {
+        idx = Difficulty::Challenge as i32;
     }
     match idx {
-        0 => rssp::course::Difficulty::Beginner,
-        1 => rssp::course::Difficulty::Easy,
-        2 => rssp::course::Difficulty::Medium,
-        3 => rssp::course::Difficulty::Hard,
-        _ => rssp::course::Difficulty::Challenge,
+        0 => Difficulty::Beginner,
+        1 => Difficulty::Easy,
+        2 => Difficulty::Medium,
+        3 => Difficulty::Hard,
+        _ => Difficulty::Challenge,
     }
 }
 
 #[inline(always)]
-const fn course_meter(
-    course: &rssp::course::CourseFile,
-    diff: rssp::course::Difficulty,
-) -> Option<i32> {
+const fn course_meter(course: &CourseFile, diff: Difficulty) -> Option<i32> {
     course.meters[diff as usize]
 }
 
 #[inline(always)]
-fn course_difficulty_from_meters(course: &rssp::course::CourseFile) -> Option<(&'static str, u32)> {
-    use rssp::course::Difficulty;
+fn course_difficulty_from_meters(course: &CourseFile) -> Option<(&'static str, u32)> {
     const ORDER: [(Difficulty, &str); 6] = [
         (Difficulty::Challenge, "Challenge"),
         (Difficulty::Hard, "Hard"),
@@ -482,10 +485,7 @@ fn course_difficulty_from_meters(course: &rssp::course::CourseFile) -> Option<(&
 
 #[inline(always)]
 fn course_stepchart_label(difficulty_name: &str, meter: Option<u32>) -> String {
-    let idx = color::FILE_DIFFICULTY_NAMES
-        .iter()
-        .position(|name| name.eq_ignore_ascii_case(difficulty_name))
-        .unwrap_or(2);
+    let idx = standard_difficulty_index(difficulty_name).unwrap_or(2);
     let display = color::DISPLAY_DIFFICULTY_NAMES[idx];
     if let Some(meter) = meter {
         format!("{display} {meter}")
@@ -501,28 +501,27 @@ fn chart_step_artist(chart: &ChartData) -> String {
     } else if !chart.step_artist.trim().is_empty() {
         chart.step_artist.clone()
     } else {
-        "Unknown".to_string()
+        tr("SelectCourse", "UnknownStepArtist").to_string()
     }
 }
 
 fn resolve_course_chart<'a>(
     song: &'a SongData,
-    entry: &rssp::course::CourseEntry,
+    entry: &CourseEntry,
     chart_type: &str,
-    course_difficulty: rssp::course::Difficulty,
+    course_difficulty: Difficulty,
 ) -> Option<&'a ChartData> {
     let mut first_chart = None;
     let mut first_playable = None;
     let mut meter_match = None;
     let target_diff = match &entry.steps {
-        rssp::course::StepsSpec::Difficulty(diff) => {
-            let selected =
-                if course_difficulty != rssp::course::Difficulty::Medium && !entry.no_difficult {
-                    shifted_course_difficulty(*diff, course_difficulty)
-                } else {
-                    *diff
-                };
-            Some(rssp::course::difficulty_label(selected))
+        StepsSpec::Difficulty(diff) => {
+            let selected = if course_difficulty != Difficulty::Medium && !entry.no_difficult {
+                shifted_course_difficulty(*diff, course_difficulty)
+            } else {
+                *diff
+            };
+            Some(course::difficulty_label(selected))
         }
         _ => None,
     };
@@ -534,7 +533,7 @@ fn resolve_course_chart<'a>(
         if first_chart.is_none() {
             first_chart = Some(chart);
         }
-        if chart.notes.is_empty() {
+        if !chart.has_note_data {
             continue;
         }
         if first_playable.is_none() {
@@ -545,7 +544,7 @@ fn resolve_course_chart<'a>(
         {
             return Some(chart);
         }
-        if let rssp::course::StepsSpec::MeterRange { low, high } = &entry.steps {
+        if let StepsSpec::MeterRange { low, high } = &entry.steps {
             let meter = chart.meter as i32;
             if meter >= *low && meter <= *high && meter_match.is_none() {
                 meter_match = Some(chart);
@@ -559,10 +558,10 @@ fn resolve_course_chart<'a>(
 fn resolve_sort_pick_song(
     all_songs: &[Arc<SongData>],
     song_play_counts: &HashMap<String, u32>,
-    entry: &rssp::course::CourseEntry,
+    entry: &CourseEntry,
     chart_type: &str,
-    course_difficulty: rssp::course::Difficulty,
-    sort: rssp::course::SongSort,
+    course_difficulty: Difficulty,
+    sort: SongSort,
     index: i32,
 ) -> Option<Arc<SongData>> {
     let mut ranked: Vec<(u32, Arc<SongData>)> = Vec::new();
@@ -579,9 +578,9 @@ fn resolve_sort_pick_song(
 
     let pick = index.max(0) as usize;
     match sort {
-        rssp::course::SongSort::MostPlays => ranked.sort_by(|a, b| b.0.cmp(&a.0)),
-        rssp::course::SongSort::FewestPlays => ranked.sort_by(|a, b| a.0.cmp(&b.0)),
-        rssp::course::SongSort::TopGrades | rssp::course::SongSort::LowestGrades => {
+        SongSort::MostPlays => ranked.sort_by(|a, b| b.0.cmp(&a.0)),
+        SongSort::FewestPlays => ranked.sort_by(|a, b| a.0.cmp(&b.0)),
+        SongSort::TopGrades | SongSort::LowestGrades => {
             return None;
         }
     }
@@ -607,13 +606,13 @@ fn resolve_random_song(
     all_songs: &[Arc<SongData>],
     songs_by_group: &HashMap<String, Vec<Arc<SongData>>>,
     used_song_keys: &HashSet<String>,
-    entry: &rssp::course::CourseEntry,
+    entry: &CourseEntry,
     chart_type: &str,
-    course_difficulty: rssp::course::Difficulty,
+    course_difficulty: Difficulty,
 ) -> Option<Arc<SongData>> {
     let pool: &[Arc<SongData>] = match &entry.song {
-        rssp::course::CourseSong::RandomAny => all_songs,
-        rssp::course::CourseSong::RandomWithinGroup { group } => songs_by_group
+        CourseSong::RandomAny => all_songs,
+        CourseSong::RandomWithinGroup { group } => songs_by_group
             .get(group.trim().to_ascii_lowercase().as_str())
             .map_or(&[], Vec::as_slice),
         _ => return None,
@@ -652,7 +651,7 @@ fn resolve_entry_song(
     course_path: &Path,
     entry_index: usize,
     random_seed: u64,
-    entry: &rssp::course::CourseEntry,
+    entry: &CourseEntry,
     by_group_song: &HashMap<(String, String), Arc<SongData>>,
     by_song: &HashMap<String, Arc<SongData>>,
     all_songs: &[Arc<SongData>],
@@ -660,10 +659,10 @@ fn resolve_entry_song(
     song_play_counts: &HashMap<String, u32>,
     used_song_keys: &HashSet<String>,
     chart_type: &str,
-    course_difficulty: rssp::course::Difficulty,
+    course_difficulty: Difficulty,
 ) -> Option<Arc<SongData>> {
     match &entry.song {
-        rssp::course::CourseSong::Fixed { group, song } => {
+        CourseSong::Fixed { group, song } => {
             let song_key = song.trim().to_ascii_lowercase();
             if let Some(group) = group.as_deref().map(str::trim) {
                 let group_key = group.to_ascii_lowercase();
@@ -672,7 +671,7 @@ fn resolve_entry_song(
                 by_song.get(&song_key).cloned()
             }
         }
-        rssp::course::CourseSong::SortPick { sort, index } => resolve_sort_pick_song(
+        CourseSong::SortPick { sort, index } => resolve_sort_pick_song(
             all_songs,
             song_play_counts,
             entry,
@@ -681,8 +680,7 @@ fn resolve_entry_song(
             *sort,
             *index,
         ),
-        rssp::course::CourseSong::RandomAny
-        | rssp::course::CourseSong::RandomWithinGroup { .. } => {
+        CourseSong::RandomAny | CourseSong::RandomWithinGroup { .. } => {
             let seeded = random_seed ^ ((course_difficulty as u64) << 32);
             resolve_random_song(
                 course_path,
@@ -696,7 +694,7 @@ fn resolve_entry_song(
                 course_difficulty,
             )
         }
-        rssp::course::CourseSong::Unknown { .. } => None,
+        CourseSong::Unknown { .. } => None,
     }
 }
 
@@ -735,13 +733,19 @@ fn make_course_song(meta: &CourseMeta) -> SongData {
         translit_title: meta.name.clone(),
         translit_subtitle: String::new(),
         artist: if meta.scripter.trim().is_empty() {
-            "Course".to_string()
+            tr("SelectCourse", "CourseScripter").to_string()
         } else {
             meta.scripter.clone()
         },
+        genre: String::new(),
         banner_path: meta.banner_path.clone(),
         background_path: None,
         background_changes: Vec::new(),
+        background_layer2_changes: Vec::new(),
+        foreground_changes: Vec::new(),
+        background_lua_changes: Vec::new(),
+        foreground_lua_changes: Vec::new(),
+        has_lua: false,
         cdtitle_path: None,
         music_path: None,
         display_bpm: String::new(),
@@ -751,14 +755,10 @@ fn make_course_song(meta: &CourseMeta) -> SongData {
         min_bpm: meta.min_bpm.unwrap_or(0.0),
         max_bpm: meta.max_bpm.unwrap_or(meta.min_bpm.unwrap_or(0.0)),
         normalized_bpms: String::new(),
-        normalized_stops: String::new(),
-        normalized_delays: String::new(),
-        normalized_warps: String::new(),
-        normalized_speeds: String::new(),
-        normalized_scrolls: String::new(),
-        normalized_fakes: String::new(),
         music_length_seconds: meta.total_length_seconds.max(0) as f32,
+        first_second: 0.0,
         total_length_seconds: meta.total_length_seconds.max(0),
+        precise_last_second_seconds: meta.total_length_seconds.max(0) as f32,
         charts: Vec::new(),
         cached_precise_last_second: 0.0,
     }
@@ -787,15 +787,14 @@ fn build_init_data() -> InitData {
         for (entry_idx, entry) in course.entries.iter().enumerate() {
             if matches!(
                 &entry.song,
-                rssp::course::CourseSong::RandomAny
-                    | rssp::course::CourseSong::RandomWithinGroup { .. }
+                CourseSong::RandomAny | CourseSong::RandomWithinGroup { .. }
             ) {
                 has_random_entries = true;
             }
             if matches!(
                 &entry.song,
-                rssp::course::CourseSong::SortPick {
-                    sort: rssp::course::SongSort::MostPlays,
+                CourseSong::SortPick {
+                    sort: SongSort::MostPlays,
                     ..
                 }
             ) {
@@ -814,7 +813,7 @@ fn build_init_data() -> InitData {
                 &song_play_counts,
                 &used_song_keys,
                 target_chart_type,
-                rssp::course::Difficulty::Medium,
+                Difficulty::Medium,
             );
 
             if let Some(song_data) = resolved.as_ref() {
@@ -832,12 +831,12 @@ fn build_init_data() -> InitData {
         let preferred_default_idx = course_difficulty_from_meters(course)
             .and_then(|(difficulty_name, _)| {
                 COURSE_RATING_ORDER.iter().position(|diff| {
-                    rssp::course::difficulty_label(*diff).eq_ignore_ascii_case(difficulty_name)
+                    course::difficulty_label(*diff).eq_ignore_ascii_case(difficulty_name)
                 })
             })
-            .unwrap_or(rssp::course::Difficulty::Medium as usize);
+            .unwrap_or(Difficulty::Medium as usize);
         let preferred_default_diff = COURSE_RATING_ORDER[preferred_default_idx];
-        let mut available_course_diffs: Vec<rssp::course::Difficulty> = COURSE_RATING_ORDER
+        let mut available_course_diffs: Vec<Difficulty> = COURSE_RATING_ORDER
             .iter()
             .copied()
             .filter(|diff| course_meter(course, *diff).is_some_and(|meter| meter >= 0))
@@ -867,7 +866,7 @@ fn build_init_data() -> InitData {
                 let mut difficulty = course_steps_label(&entry.steps);
                 let mut meter = None;
                 let mut step_artist = if course.scripter.trim().is_empty() {
-                    "Unknown".to_string()
+                    tr("SelectCourse", "UnknownStepArtist").to_string()
                 } else {
                     course.scripter.clone()
                 };
@@ -924,7 +923,7 @@ fn build_init_data() -> InitData {
                 .map(|v| v as u32);
             if rated_entry_count == 0
                 && explicit_meter.is_none()
-                && course_diff != rssp::course::Difficulty::Medium
+                && course_diff != Difficulty::Medium
             {
                 continue;
             }
@@ -936,7 +935,7 @@ fn build_init_data() -> InitData {
                     None
                 }
             });
-            let course_difficulty_name = rssp::course::difficulty_label(course_diff).to_string();
+            let course_difficulty_name = course::difficulty_label(course_diff).to_string();
             let course_stepchart_label =
                 course_stepchart_label(course_difficulty_name.as_str(), course_meter);
 
@@ -975,7 +974,7 @@ fn build_init_data() -> InitData {
             name: course_name(path, course),
             scripter: course.scripter.clone(),
             description: course.description.clone(),
-            banner_path: rssp::course::resolve_course_banner_path(path, &course.banner),
+            banner_path: course::resolve_course_banner_path(path, &course.banner),
             ratings,
             default_rating_index,
             min_bpm: meta_min_bpm,
@@ -1007,7 +1006,6 @@ fn build_init_data() -> InitData {
 
     InitData {
         all_entries,
-        pack_course_counts: HashMap::new(),
         course_meta_by_path,
         course_text_color_overrides,
     }
@@ -1179,6 +1177,19 @@ fn selected_banner_path(state: &State) -> Option<PathBuf> {
     }
 }
 
+fn restore_last_course(state: &mut State) {
+    let profile_data = profile::get();
+    let last_played = profile_data.last_played_course(profile::get_session_play_style());
+    let Some(path) = last_played.course_path.as_deref() else {
+        return;
+    };
+    restore_selection_for_course(
+        state,
+        Path::new(path),
+        last_played.difficulty_name.as_deref(),
+    );
+}
+
 pub fn init() -> State {
     let init = build_init_data();
     let mut state = State {
@@ -1190,10 +1201,9 @@ pub fn init() -> State {
         current_banner_key: "banner1.png".to_string(),
         session_elapsed: 0.0,
         all_entries: init.all_entries,
-        pack_course_counts: init.pack_course_counts,
         course_meta_by_path: init.course_meta_by_path,
         course_text_color_overrides: init.course_text_color_overrides,
-        bg: heart_bg::State::new(),
+        bg: visual_style_bg::State::new(),
         nav_key_held_direction: None,
         nav_key_held_since: None,
         last_requested_banner_path: None,
@@ -1207,8 +1217,12 @@ pub fn init() -> State {
         last_rating_nav_time_p1: None,
         last_rating_nav_dir_p2: None,
         last_rating_nav_time_p2: None,
+        menu_lr_chord: screen_input::MenuLrChordTracker::default(),
+        menu_lr_undo: 0,
+        three_key_focus: ThreeKeyFocus::Wheel,
     };
     rebuild_displayed_entries(&mut state);
+    restore_last_course(&mut state);
     state
 }
 
@@ -1333,7 +1347,7 @@ fn handle_wheel_dir(state: &mut State, dir: PadDir, pressed: bool, ts: Instant) 
 
 fn handle_rating_dir(
     state: &mut State,
-    side: profile::PlayerSide,
+    side: profile_data::PlayerSide,
     dir: PadDir,
     pressed: bool,
     timestamp: Instant,
@@ -1342,11 +1356,11 @@ fn handle_rating_dir(
         return ScreenAction::None;
     }
     let (last_dir, last_time) = match side {
-        profile::PlayerSide::P1 => (
+        profile_data::PlayerSide::P1 => (
             &mut state.last_rating_nav_dir_p1,
             &mut state.last_rating_nav_time_p1,
         ),
-        profile::PlayerSide::P2 => (
+        profile_data::PlayerSide::P2 => (
             &mut state.last_rating_nav_dir_p2,
             &mut state.last_rating_nav_time_p2,
         ),
@@ -1387,6 +1401,48 @@ fn handle_rating_dir(
     ScreenAction::None
 }
 
+#[inline(always)]
+fn clear_wheel_hold(state: &mut State) {
+    state.nav_key_held_direction = None;
+    state.nav_key_held_since = None;
+}
+
+#[inline(always)]
+fn selected_course_has_multiple_ratings(state: &State) -> bool {
+    selected_course_meta(state)
+        .map(|meta| meta.ratings.iter().filter(|r| r.is_some()).count() > 1)
+        .unwrap_or(false)
+}
+
+fn shift_selected_course_rating(state: &mut State, delta: isize) -> bool {
+    if delta == 0 {
+        return false;
+    }
+    let Some(meta) = selected_course_meta(state) else {
+        return false;
+    };
+    let available = meta.ratings.iter().filter(|r| r.is_some()).count();
+    if available <= 1 {
+        return false;
+    }
+    let current = selected_course_rating_index(state, &meta);
+    let next = if delta < 0 {
+        (0..current).rev().find(|&idx| meta.ratings[idx].is_some())
+    } else {
+        ((current + 1)..meta.ratings.len()).find(|&idx| meta.ratings[idx].is_some())
+    };
+    let Some(next) = next else {
+        return false;
+    };
+    set_selected_course_rating_index(state, &meta, next);
+    audio::play_sfx(if delta < 0 {
+        "assets/sounds/easier.ogg"
+    } else {
+        "assets/sounds/harder.ogg"
+    });
+    true
+}
+
 pub fn handle_confirm(state: &mut State) -> ScreenAction {
     if state.out_prompt != OutPromptState::None {
         return ScreenAction::None;
@@ -1397,6 +1453,8 @@ pub fn handle_confirm(state: &mut State) -> ScreenAction {
     }
     state.nav_key_held_direction = None;
     state.nav_key_held_since = None;
+    state.menu_lr_undo = 0;
+    state.three_key_focus = ThreeKeyFocus::Wheel;
 
     match state.entries.get(state.selected_index) {
         Some(MusicWheelEntry::Song(_)) => {
@@ -1409,13 +1467,81 @@ pub fn handle_confirm(state: &mut State) -> ScreenAction {
 }
 
 pub fn handle_input(state: &mut State, ev: &InputEvent) -> ScreenAction {
+    let three_key_action = screen_input::three_key_menu_action(&mut state.menu_lr_chord, ev);
+    if screen_input::dedicated_three_key_nav_enabled()
+        && matches!(state.three_key_focus, ThreeKeyFocus::Wheel)
+    {
+        match ev.action {
+            VirtualAction::p1_left
+            | VirtualAction::p1_menu_left
+            | VirtualAction::p2_left
+            | VirtualAction::p2_menu_left
+                if !ev.pressed =>
+            {
+                state.menu_lr_undo = 0;
+                return handle_wheel_dir(state, PadDir::Left, false, ev.timestamp);
+            }
+            VirtualAction::p1_right
+            | VirtualAction::p1_menu_right
+            | VirtualAction::p2_right
+            | VirtualAction::p2_menu_right
+                if !ev.pressed =>
+            {
+                state.menu_lr_undo = 0;
+                return handle_wheel_dir(state, PadDir::Right, false, ev.timestamp);
+            }
+            _ => {}
+        }
+    }
     if state.exit_prompt != ExitPromptState::None {
+        if let Some((_, nav)) = three_key_action {
+            return match nav {
+                screen_input::ThreeKeyMenuAction::Prev | screen_input::ThreeKeyMenuAction::Next => {
+                    let ExitPromptState::Active {
+                        active_choice,
+                        switch_from,
+                        switch_elapsed,
+                        ..
+                    } = &mut state.exit_prompt
+                    else {
+                        return ScreenAction::None;
+                    };
+                    let prev = *active_choice;
+                    *active_choice = 1 - prev;
+                    *switch_from = Some(prev);
+                    *switch_elapsed = 0.0;
+                    audio::play_sfx("assets/sounds/change.ogg");
+                    ScreenAction::None
+                }
+                screen_input::ThreeKeyMenuAction::Cancel => {
+                    audio::play_sfx("assets/sounds/start.ogg");
+                    state.exit_prompt = ExitPromptState::None;
+                    ScreenAction::None
+                }
+                screen_input::ThreeKeyMenuAction::Confirm => {
+                    let ExitPromptState::Active { active_choice, .. } = state.exit_prompt else {
+                        return ScreenAction::None;
+                    };
+                    audio::play_sfx("assets/sounds/start.ogg");
+                    state.exit_prompt = ExitPromptState::None;
+                    if active_choice == 1 {
+                        ScreenAction::Navigate(Screen::Menu)
+                    } else {
+                        ScreenAction::None
+                    }
+                }
+            };
+        }
         return handle_exit_prompt_input(state, ev);
     }
 
     if state.out_prompt != OutPromptState::None {
-        if ev.pressed
-            && matches!(ev.action, VirtualAction::p1_start | VirtualAction::p2_start)
+        let start_pressed = matches!(
+            three_key_action,
+            Some((_, screen_input::ThreeKeyMenuAction::Confirm))
+        ) || (ev.pressed
+            && matches!(ev.action, VirtualAction::p1_start | VirtualAction::p2_start));
+        if start_pressed
             && matches!(
                 state.out_prompt,
                 OutPromptState::PressStartForOptions { .. }
@@ -1427,8 +1553,75 @@ pub fn handle_input(state: &mut State, ev: &InputEvent) -> ScreenAction {
         return ScreenAction::None;
     }
 
+    if screen_input::dedicated_three_key_nav_enabled() {
+        if let Some((_, nav)) = three_key_action {
+            return match nav {
+                screen_input::ThreeKeyMenuAction::Prev => {
+                    if matches!(state.three_key_focus, ThreeKeyFocus::Rating) {
+                        state.menu_lr_undo = if shift_selected_course_rating(state, -1) {
+                            1
+                        } else {
+                            0
+                        };
+                        ScreenAction::None
+                    } else {
+                        state.menu_lr_undo = 1;
+                        handle_wheel_dir(state, PadDir::Left, true, ev.timestamp)
+                    }
+                }
+                screen_input::ThreeKeyMenuAction::Next => {
+                    if matches!(state.three_key_focus, ThreeKeyFocus::Rating) {
+                        state.menu_lr_undo = if shift_selected_course_rating(state, 1) {
+                            -1
+                        } else {
+                            0
+                        };
+                        ScreenAction::None
+                    } else {
+                        state.menu_lr_undo = -1;
+                        handle_wheel_dir(state, PadDir::Right, true, ev.timestamp)
+                    }
+                }
+                screen_input::ThreeKeyMenuAction::Confirm => {
+                    state.menu_lr_undo = 0;
+                    if matches!(state.three_key_focus, ThreeKeyFocus::Wheel)
+                        && selected_course_has_multiple_ratings(state)
+                    {
+                        clear_wheel_hold(state);
+                        state.three_key_focus = ThreeKeyFocus::Rating;
+                        audio::play_sfx("assets/sounds/start.ogg");
+                        ScreenAction::None
+                    } else {
+                        state.three_key_focus = ThreeKeyFocus::Wheel;
+                        handle_confirm(state)
+                    }
+                }
+                screen_input::ThreeKeyMenuAction::Cancel => {
+                    if matches!(state.three_key_focus, ThreeKeyFocus::Rating) {
+                        if state.menu_lr_undo != 0 {
+                            let _ =
+                                shift_selected_course_rating(state, -(state.menu_lr_undo as isize));
+                            state.menu_lr_undo = 0;
+                        }
+                        state.three_key_focus = ThreeKeyFocus::Wheel;
+                        audio::play_sfx("assets/sounds/change.ogg");
+                        ScreenAction::None
+                    } else {
+                        if state.menu_lr_undo != 0 {
+                            music_wheel_change(state, state.menu_lr_undo as isize);
+                            state.menu_lr_undo = 0;
+                        }
+                        clear_wheel_hold(state);
+                        begin_exit_prompt(state);
+                        ScreenAction::None
+                    }
+                }
+            };
+        }
+    }
+
     let play_style = profile::get_session_play_style();
-    if play_style == profile::PlayStyle::Versus {
+    if play_style == profile_data::PlayStyle::Versus {
         return match ev.action {
             VirtualAction::p1_left | VirtualAction::p1_menu_left => {
                 handle_wheel_dir(state, PadDir::Left, ev.pressed, ev.timestamp)
@@ -1444,28 +1637,28 @@ pub fn handle_input(state: &mut State, ev: &InputEvent) -> ScreenAction {
             }
             VirtualAction::p1_up | VirtualAction::p1_menu_up => handle_rating_dir(
                 state,
-                profile::PlayerSide::P1,
+                profile_data::PlayerSide::P1,
                 PadDir::Up,
                 ev.pressed,
                 ev.timestamp,
             ),
             VirtualAction::p2_up | VirtualAction::p2_menu_up => handle_rating_dir(
                 state,
-                profile::PlayerSide::P2,
+                profile_data::PlayerSide::P2,
                 PadDir::Up,
                 ev.pressed,
                 ev.timestamp,
             ),
             VirtualAction::p1_down | VirtualAction::p1_menu_down => handle_rating_dir(
                 state,
-                profile::PlayerSide::P1,
+                profile_data::PlayerSide::P1,
                 PadDir::Down,
                 ev.pressed,
                 ev.timestamp,
             ),
             VirtualAction::p2_down | VirtualAction::p2_menu_down => handle_rating_dir(
                 state,
-                profile::PlayerSide::P2,
+                profile_data::PlayerSide::P2,
                 PadDir::Down,
                 ev.pressed,
                 ev.timestamp,
@@ -1482,7 +1675,7 @@ pub fn handle_input(state: &mut State, ev: &InputEvent) -> ScreenAction {
     }
 
     match profile::get_session_player_side() {
-        profile::PlayerSide::P1 => match ev.action {
+        profile_data::PlayerSide::P1 => match ev.action {
             VirtualAction::p1_left | VirtualAction::p1_menu_left => {
                 handle_wheel_dir(state, PadDir::Left, ev.pressed, ev.timestamp)
             }
@@ -1491,14 +1684,14 @@ pub fn handle_input(state: &mut State, ev: &InputEvent) -> ScreenAction {
             }
             VirtualAction::p1_up | VirtualAction::p1_menu_up => handle_rating_dir(
                 state,
-                profile::PlayerSide::P1,
+                profile_data::PlayerSide::P1,
                 PadDir::Up,
                 ev.pressed,
                 ev.timestamp,
             ),
             VirtualAction::p1_down | VirtualAction::p1_menu_down => handle_rating_dir(
                 state,
-                profile::PlayerSide::P1,
+                profile_data::PlayerSide::P1,
                 PadDir::Down,
                 ev.pressed,
                 ev.timestamp,
@@ -1510,7 +1703,7 @@ pub fn handle_input(state: &mut State, ev: &InputEvent) -> ScreenAction {
             }
             _ => ScreenAction::None,
         },
-        profile::PlayerSide::P2 => match ev.action {
+        profile_data::PlayerSide::P2 => match ev.action {
             VirtualAction::p2_left | VirtualAction::p2_menu_left => {
                 handle_wheel_dir(state, PadDir::Left, ev.pressed, ev.timestamp)
             }
@@ -1519,14 +1712,14 @@ pub fn handle_input(state: &mut State, ev: &InputEvent) -> ScreenAction {
             }
             VirtualAction::p2_up | VirtualAction::p2_menu_up => handle_rating_dir(
                 state,
-                profile::PlayerSide::P2,
+                profile_data::PlayerSide::P2,
                 PadDir::Up,
                 ev.pressed,
                 ev.timestamp,
             ),
             VirtualAction::p2_down | VirtualAction::p2_menu_down => handle_rating_dir(
                 state,
-                profile::PlayerSide::P2,
+                profile_data::PlayerSide::P2,
                 PadDir::Down,
                 ev.pressed,
                 ev.timestamp,
@@ -1603,6 +1796,8 @@ pub fn update(state: &mut State, dt: f32) -> ScreenAction {
     if state.selected_index != state.prev_selected_index {
         state.prev_selected_index = state.selected_index;
         state.time_since_selection_change = 0.0;
+        state.menu_lr_undo = 0;
+        state.three_key_focus = ThreeKeyFocus::Wheel;
         state.last_rating_nav_dir_p1 = None;
         state.last_rating_nav_time_p1 = None;
         state.last_rating_nav_dir_p2 = None;
@@ -1619,7 +1814,7 @@ pub fn update(state: &mut State, dt: f32) -> ScreenAction {
     if state.time_since_selection_change >= BANNER_UPDATE_DELAY_SECONDS {
         let banner = selected_banner_path(state);
         if banner != state.last_requested_banner_path {
-            state.last_requested_banner_path = banner.clone();
+            state.last_requested_banner_path.clone_from(&banner);
             state.banner_high_quality_requested = false;
             return ScreenAction::RequestBanner(banner);
         }
@@ -1637,21 +1832,11 @@ pub fn update(state: &mut State, dt: f32) -> ScreenAction {
 }
 
 pub fn in_transition() -> (Vec<Actor>, f32) {
-    (
-        vec![
-            act!(quad: align(0.0, 0.0): xy(0.0, 0.0): zoomto(screen_width(), screen_height()): diffuse(0.0, 0.0, 0.0, 1.0): z(1100): linear(TRANSITION_IN_DURATION): alpha(0.0): linear(0.0): visible(false)),
-        ],
-        TRANSITION_IN_DURATION,
-    )
+    transitions::fade_in_black(TRANSITION_IN_DURATION, 1100)
 }
 
 pub fn out_transition() -> (Vec<Actor>, f32) {
-    (
-        vec![
-            act!(quad: align(0.0, 0.0): xy(0.0, 0.0): zoomto(screen_width(), screen_height()): diffuse(0.0, 0.0, 0.0, 0.0): z(1200): linear(TRANSITION_OUT_DURATION): alpha(1.0)),
-        ],
-        TRANSITION_OUT_DURATION,
-    )
+    transitions::fade_out_black(TRANSITION_OUT_DURATION, 1200)
 }
 
 #[inline(always)]
@@ -1794,11 +1979,11 @@ fn sl_select_music_bg_flash() -> Actor {
     )
 }
 
-pub fn get_actors(state: &State, _asset_manager: &AssetManager) -> Vec<Actor> {
-    let mut actors = Vec::with_capacity(256);
+pub fn push_actors(actors: &mut Vec<Actor>, state: &State, _asset_manager: &AssetManager) {
+    actors.reserve(256);
     let side = profile::get_session_player_side();
     let play_style = profile::get_session_play_style();
-    let is_p2_single = play_style == profile::PlayStyle::Single && side == profile::PlayerSide::P2;
+    let is_p2_single = profile_data::is_single_p2_side(play_style, side);
     let selected_entry = state.entries.get(state.selected_index);
     let selected_meta = selected_course_meta(state);
     let selected_rating = selected_meta
@@ -1815,19 +2000,22 @@ pub fn get_actors(state: &State, _asset_manager: &AssetManager) -> Vec<Actor> {
         )
     });
 
-    actors.extend(state.bg.build(heart_bg::Params {
-        active_color_index: state.active_color_index,
-        backdrop_rgba: [0.0, 0.0, 0.0, 1.0],
-        alpha_mul: 1.0,
-    }));
+    state.bg.push(
+        actors,
+        visual_style_bg::Params {
+            active_color_index: state.active_color_index,
+            backdrop_rgba: [0.0, 0.0, 0.0, 1.0],
+            alpha_mul: 1.0,
+        },
+    );
     actors.push(sl_select_music_bg_flash());
-    actors.extend(screen_bars::build("SELECT COURSE"));
+    screen_bars::push(actors, &tr("ScreenTitles", "SelectCourse"));
     actors.push(timers::build_session(format_session_time(
         state.session_elapsed,
     )));
 
-    let mode_text = gs_scorebox::select_music_mode_text(profile::PlayerSide::P1, None);
-    actors.push(mode_pads::build_label(mode_text.as_str()));
+    let mode_text = gs_scorebox::select_music_mode_text(profile_data::PlayerSide::P1, None);
+    actors.push(mode_pads::build_label(mode_text));
     actors.extend(mode_pads::build());
 
     let (banner_zoom, banner_cx, banner_cy) = if is_wide() {
@@ -1860,7 +2048,7 @@ pub fn get_actors(state: &State, _asset_manager: &AssetManager) -> Vec<Actor> {
                     .filter(|secs| *secs > 0)
                     .unwrap_or(meta.total_length_seconds.max(0));
                 (
-                    "SONGS".to_string(),
+                    tr("SelectCourse", "SongsLabel").to_string(),
                     selected_rating
                         .map_or(0, |rating| rating.entries.len())
                         .to_string(),
@@ -1870,7 +2058,7 @@ pub fn get_actors(state: &State, _asset_manager: &AssetManager) -> Vec<Actor> {
                 )
             }
             _ => (
-                "SONGS".to_string(),
+                tr("SelectCourse", "SongsLabel").to_string(),
                 "0".to_string(),
                 "?".to_string(),
                 "0:00".to_string(),
@@ -1882,54 +2070,53 @@ pub fn get_actors(state: &State, _asset_manager: &AssetManager) -> Vec<Actor> {
         match selected_rating {
             Some(rating) => {
                 let meter = if let Some(course_meter) = rating.course_meter {
-                    course_meter.to_string()
+                    cached_u32_text(course_meter)
                 } else if rating.meter_count > 0 {
-                    format!(
-                        "{}",
-                        (rating.meter_sum as f32 / rating.meter_count as f32).round() as i32
+                    cached_u32_text(
+                        (rating.meter_sum as f32 / rating.meter_count as f32).round() as u32,
                     )
                 } else {
-                    "?".to_string()
+                    unknown_text()
                 };
                 if rating.rated_entry_count > 0 {
                     (
-                        rating.totals.steps.to_string(),
-                        rating.totals.jumps.to_string(),
-                        rating.totals.holds.to_string(),
-                        rating.totals.mines.to_string(),
-                        rating.totals.hands.to_string(),
-                        rating.totals.rolls.to_string(),
+                        cached_u32_text(rating.totals.steps),
+                        cached_u32_text(rating.totals.jumps),
+                        cached_u32_text(rating.totals.holds),
+                        cached_u32_text(rating.totals.mines),
+                        cached_u32_text(rating.totals.hands),
+                        cached_u32_text(rating.totals.rolls),
                         meter,
                     )
                 } else {
                     (
-                        "?".to_string(),
-                        "?".to_string(),
-                        "?".to_string(),
-                        "?".to_string(),
-                        "?".to_string(),
-                        "?".to_string(),
+                        unknown_text(),
+                        unknown_text(),
+                        unknown_text(),
+                        unknown_text(),
+                        unknown_text(),
+                        unknown_text(),
                         meter,
                     )
                 }
             }
             None => (
-                "?".to_string(),
-                "?".to_string(),
-                "?".to_string(),
-                "?".to_string(),
-                "?".to_string(),
-                "?".to_string(),
-                "?".to_string(),
+                unknown_text(),
+                unknown_text(),
+                unknown_text(),
+                unknown_text(),
+                unknown_text(),
+                unknown_text(),
+                unknown_text(),
             ),
         };
 
     let pane_sel_col =
         selected_diff_col.unwrap_or_else(|| color::simply_love_rgba(state.active_color_index));
     let pane_side = if is_p2_single {
-        profile::PlayerSide::P2
+        profile_data::PlayerSide::P2
     } else {
-        profile::PlayerSide::P1
+        profile_data::PlayerSide::P1
     };
     let pane_profile = profile::get_for_side(pane_side);
     let pane_cx = if is_p2_single {
@@ -1943,7 +2130,7 @@ pub fn get_actors(state: &State, _asset_manager: &AssetManager) -> Vec<Actor> {
         .map(|meta| course_score_hash(meta.path.as_path()));
     let fallback_player = if let Some(hash) = selected_course_hash.as_deref()
         && let Some(sc) = scores::get_cached_local_score_for_side(hash, pane_side)
-        && (sc.grade != scores::Grade::Failed || sc.score_percent > 0.0)
+        && (sc.grade != score_data::Grade::Failed || sc.score_percent > 0.0)
     {
         (
             pane_profile.player_initials.clone(),
@@ -1954,7 +2141,7 @@ pub fn get_actors(state: &State, _asset_manager: &AssetManager) -> Vec<Actor> {
     };
     let fallback_machine = if let Some(hash) = selected_course_hash.as_deref()
         && let Some((initials, sc)) = scores::get_machine_record_local(hash)
-        && (sc.grade != scores::Grade::Failed || sc.score_percent > 0.0)
+        && (sc.grade != score_data::Grade::Failed || sc.score_percent > 0.0)
     {
         (initials, cached_score_percent_text(sc.score_percent))
     } else {
@@ -1970,29 +2157,28 @@ pub fn get_actors(state: &State, _asset_manager: &AssetManager) -> Vec<Actor> {
         show_rivals: false,
         loading_text: None,
     };
-    actors.extend(select_pane::build_base(select_pane::StatsPaneParams {
-        pane_cx,
-        accent_color: pane_sel_col,
-        values: select_pane::StatsValues {
-            steps: steps_text.as_str(),
-            mines: mines_text.as_str(),
-            jumps: jumps_text.as_str(),
-            hands: hands_text.as_str(),
-            holds: holds_text.as_str(),
-            rolls: rolls_text.as_str(),
+    select_pane::push_base(
+        actors,
+        select_pane::StatsPaneParams {
+            pane_cx,
+            accent_color: pane_sel_col,
+            values: select_pane::StatsValues {
+                steps: steps_text,
+                mines: mines_text,
+                jumps: jumps_text,
+                hands: hands_text,
+                holds: holds_text,
+                rolls: rolls_text,
+            },
+            meter: (!gs_view.show_rivals).then_some(meter_text),
         },
-        meter: (!gs_view.show_rivals).then_some(meter_text.as_str()),
-    }));
+    );
     let pane_layout = select_pane::layout();
     let lines = [
-        (
-            gs_view.machine_name.as_str(),
-            gs_view.machine_score.as_ref(),
-        ),
-        (gs_view.player_name.as_str(), gs_view.player_score.as_ref()),
+        (gs_view.machine_name.clone(), gs_view.machine_score.clone()),
+        (gs_view.player_name.clone(), gs_view.player_score.clone()),
     ];
-    for i in 0..2 {
-        let (name, pct) = lines[i];
+    for (i, (name, pct)) in lines.into_iter().enumerate() {
         actors.push(act!(text: font("miso"): settext(name): align(0.5, 0.5): xy(pane_cx + pane_layout.cols[2] - 50.0 * pane_layout.text_zoom, pane_layout.pane_top + pane_layout.rows[i]): maxwidth(30.0): zoom(pane_layout.text_zoom): z(121): diffuse(0.0, 0.0, 0.0, 1.0)));
         actors.push(act!(text: font("miso"): settext(pct): align(1.0, 0.5): xy(pane_cx + pane_layout.cols[2] + 25.0 * pane_layout.text_zoom, pane_layout.pane_top + pane_layout.rows[i]): zoom(pane_layout.text_zoom): z(121): diffuse(0.0, 0.0, 0.0, 1.0)));
     }
@@ -2002,9 +2188,8 @@ pub fn get_actors(state: &State, _asset_manager: &AssetManager) -> Vec<Actor> {
     if gs_view.show_rivals {
         for i in 0..3 {
             let (name, pct) = (&gs_view.rivals[i].0, &gs_view.rivals[i].1);
-            let pct = pct.as_ref();
-            actors.push(act!(text: font("miso"): settext(name): align(0.5, 0.5): xy(pane_cx + pane_layout.cols[2] + 50.0 * pane_layout.text_zoom, pane_layout.pane_top + pane_layout.rows[i]): maxwidth(30.0): zoom(pane_layout.text_zoom): z(121): diffuse(0.0, 0.0, 0.0, 1.0)));
-            actors.push(act!(text: font("miso"): settext(pct): align(1.0, 0.5): xy(pane_cx + pane_layout.cols[2] + 125.0 * pane_layout.text_zoom, pane_layout.pane_top + pane_layout.rows[i]): zoom(pane_layout.text_zoom): z(121): diffuse(0.0, 0.0, 0.0, 1.0)));
+            actors.push(act!(text: font("miso"): settext(name.clone()): align(0.5, 0.5): xy(pane_cx + pane_layout.cols[2] + 50.0 * pane_layout.text_zoom, pane_layout.pane_top + pane_layout.rows[i]): maxwidth(30.0): zoom(pane_layout.text_zoom): z(121): diffuse(0.0, 0.0, 0.0, 1.0)));
+            actors.push(act!(text: font("miso"): settext(pct.clone()): align(1.0, 0.5): xy(pane_cx + pane_layout.cols[2] + 125.0 * pane_layout.text_zoom, pane_layout.pane_top + pane_layout.rows[i]): zoom(pane_layout.text_zoom): z(121): diffuse(0.0, 0.0, 0.0, 1.0)));
         }
     }
 
@@ -2033,9 +2218,9 @@ pub fn get_actors(state: &State, _asset_manager: &AssetManager) -> Vec<Actor> {
                 children: vec![
                     act!(text: font("miso"): settext(songs_label): align(1.0, 0.0): y(-11.0): maxwidth(56.0): diffuse(0.5, 0.5, 0.5, 1.0): z(52)),
                     act!(text: font("miso"): settext(songs_value): align(0.0, 0.0): xy(5.0, -11.0): maxwidth(box_w - 60.0): zoomtoheight(15.0): diffuse(1.0, 1.0, 1.0, 1.0): z(52)),
-                    act!(text: font("miso"): settext("BPM"): align(1.0, 0.0): y(10.0): diffuse(0.5, 0.5, 0.5, 1.0): z(52)),
+                    act!(text: font("miso"): settext(tr("SelectMusic", "BPMLabel")): align(1.0, 0.0): y(10.0): diffuse(0.5, 0.5, 0.5, 1.0): z(52)),
                     act!(text: font("miso"): settext(bpm_text): align(0.0, 0.0): xy(5.0, 10.0): zoomtoheight(15.0): diffuse(1.0, 1.0, 1.0, 1.0): z(52)),
-                    act!(text: font("miso"): settext("LENGTH"): align(1.0, 0.0): xy(box_w - 130.0, 10.0): diffuse(0.5, 0.5, 0.5, 1.0): z(52)),
+                    act!(text: font("miso"): settext(tr("SelectMusic", "LengthLabel")): align(1.0, 0.0): xy(box_w - 130.0, 10.0): diffuse(0.5, 0.5, 0.5, 1.0): z(52)),
                     act!(text: font("miso"): settext(len_text): align(0.0, 0.0): xy(box_w - 125.0, 10.0): zoomtoheight(15.0): diffuse(1.0, 1.0, 1.0, 1.0): z(52)),
                 ],
             },
@@ -2074,12 +2259,12 @@ pub fn get_actors(state: &State, _asset_manager: &AssetManager) -> Vec<Actor> {
         }
         Some(_) => (
             "#-".to_string(),
-            "Step Artist".to_string(),
+            tr("SelectCourse", "StepArtistPlaceholder").to_string(),
             selected_diff_col.unwrap_or([0.5, 0.5, 0.5, 1.0]),
         ),
         _ => (
             "#-".to_string(),
-            "Step Artist".to_string(),
+            tr("SelectCourse", "StepArtistPlaceholder").to_string(),
             [0.5, 0.5, 0.5, 1.0],
         ),
     };
@@ -2095,8 +2280,7 @@ pub fn get_actors(state: &State, _asset_manager: &AssetManager) -> Vec<Actor> {
         let visible_rows = rating
             .entries
             .len()
-            .min(COURSE_TRACKLIST_TARGET_VISIBLE_ROWS)
-            .max(1);
+            .clamp(1, COURSE_TRACKLIST_TARGET_VISIBLE_ROWS);
         let row_spacing = COURSE_TRACKLIST_ROW_SPACING;
         let (start_idx, frac, _) =
             course_tracklist_scroll(rating.entries.len(), visible_rows, state.session_elapsed);
@@ -2150,7 +2334,7 @@ pub fn get_actors(state: &State, _asset_manager: &AssetManager) -> Vec<Actor> {
     } else {
         let mut no_course_actor = act!(text:
             font("miso"):
-            settext("Select a course to view songs."):
+            settext(tr("SelectCourse", "SelectCourseHint")):
             align(0.0, 0.0):
             xy(list_left_x, list_start_y):
             zoom(0.72):
@@ -2202,7 +2386,7 @@ pub fn get_actors(state: &State, _asset_manager: &AssetManager) -> Vec<Actor> {
                     state.active_color_index,
                 );
                 actors.push(act!(text:
-                    font("wendy"):
+                    font(current_machine_font_key(FontRole::Header)):
                     settext(meter_text):
                     align(0.5, 0.5):
                     xy(rating_box_cx, y):
@@ -2240,15 +2424,18 @@ pub fn get_actors(state: &State, _asset_manager: &AssetManager) -> Vec<Actor> {
         screen_center_x() - 345.5
     };
     let step_artist_y = (screen_center_y() - 9.0) - 0.5 * (screen_height() / 28.0);
-    actors.extend(step_artist_bar::build(
+    step_artist_bar::push(
+        actors,
         step_artist_bar::StepArtistBarParams {
             x0: step_artist_x0,
             center_y: step_artist_y,
+            layout: step_artist_bar::StepArtistBarLayout::Legacy,
+            expanded_line_count: 0,
             accent_color: step_artist_col,
             z_base: 122,
-            label_text: step_idx_text.as_str(),
+            label_text: step_idx_text.into(),
             label_max_width: 22.0,
-            artist_text: step_artist_text.as_str(),
+            artist_text: step_artist_text.into(),
             artist_x_offset: 60.0,
             artist_max_width: 138.0,
             artist_color: [
@@ -2258,7 +2445,7 @@ pub fn get_actors(state: &State, _asset_manager: &AssetManager) -> Vec<Actor> {
                 1.0,
             ],
         },
-    ));
+    );
 
     if has_desc {
         actors.push(act!(quad:
@@ -2280,28 +2467,38 @@ pub fn get_actors(state: &State, _asset_manager: &AssetManager) -> Vec<Actor> {
         ));
     }
 
-    actors.extend(music_wheel::build(music_wheel::MusicWheelParams {
-        entries: &state.entries,
-        selected_index: state.selected_index,
-        position_offset_from_selection: state.wheel_offset_from_selection,
-        selection_animation_timer: state.selection_animation_timer,
-        selection_animation_beat,
-        pack_song_counts: &state.pack_course_counts,
-        color_pack_headers: true,
-        preferred_difficulty_index: 0,
-        selected_steps_index: 0,
-        song_box_color: None,
-        song_text_color: Some(COURSE_WHEEL_SONG_TEXT_COLOR),
-        song_text_color_overrides: Some(&state.course_text_color_overrides),
-        song_has_edit_ptrs: None,
-        show_music_wheel_grades: true,
-        show_music_wheel_lamps: true,
-    }));
+    music_wheel::push(
+        actors,
+        music_wheel::MusicWheelParams {
+            entries: &state.entries,
+            selected_index: state.selected_index,
+            position_offset_from_selection: state.wheel_offset_from_selection,
+            selection_animation_timer: state.selection_animation_timer,
+            selection_animation_beat,
+            color_pack_headers: true,
+            selected_charts: [None, None],
+            preferred_difficulty_index: [0, 0],
+            song_box_color: None,
+            song_text_color: Some(COURSE_WHEEL_SONG_TEXT_COLOR),
+            song_text_color_overrides: Some(&state.course_text_color_overrides),
+            song_has_edit_ptrs: None,
+            show_music_wheel_grades: true,
+            show_music_wheel_lamps: true,
+            itl_rank_mode: crate::config::SelectMusicItlRankMode::None,
+            itl_wheel_mode: crate::config::SelectMusicItlWheelMode::Off,
+            song_select_bg_mode: crate::config::SelectMusicSongSelectBgMode::Off,
+            expanded_pack_name: None,
+            allow_online_fetch: false,
+            new_pack_names: None,
+            pack_sync_prefs: None,
+            default_sync_offset: crate::config::DefaultSyncOffset::Null,
+        },
+    );
 
     if !matches!(selected_entry, Some(MusicWheelEntry::Song(_))) {
         actors.push(act!(text:
             font("miso"):
-            settext("Pick a course"):
+            settext(tr("SelectCourse", "PickCoursePrompt")):
             align(0.5, 0.5):
             xy(screen_center_x() - 26.0, screen_center_y() + 67.0):
             zoom(0.8):
@@ -2325,8 +2522,8 @@ pub fn get_actors(state: &State, _asset_manager: &AssetManager) -> Vec<Actor> {
         match state.out_prompt {
             OutPromptState::PressStartForOptions { .. } => {
                 actors.push(act!(text:
-                    font("wendy"):
-                    settext(PRESS_START_FOR_OPTIONS_TEXT):
+                    font(current_machine_font_key(FontRole::Header)):
+                    settext(tr("SelectMusic", "PressStartForOptions")):
                     align(0.5, 0.5):
                     xy(screen_center_x(), screen_center_y()):
                     zoom(0.75):
@@ -2336,8 +2533,8 @@ pub fn get_actors(state: &State, _asset_manager: &AssetManager) -> Vec<Actor> {
             }
             OutPromptState::EnteringOptions { .. } => {
                 actors.push(act!(text:
-                    font("wendy"):
-                    settext(PRESS_START_FOR_OPTIONS_TEXT):
+                    font(current_machine_font_key(FontRole::Header)):
+                    settext(tr("SelectMusic", "PressStartForOptions")):
                     align(0.5, 0.5):
                     xy(screen_center_x(), screen_center_y()):
                     zoom(0.75):
@@ -2346,8 +2543,8 @@ pub fn get_actors(state: &State, _asset_manager: &AssetManager) -> Vec<Actor> {
                     linear(ENTERING_OPTIONS_FADE_OUT_SECONDS): alpha(0.0)
                 ));
                 actors.push(act!(text:
-                    font("wendy"):
-                    settext(ENTERING_OPTIONS_TEXT):
+                    font(current_machine_font_key(FontRole::Header)):
+                    settext(tr("SelectMusic", "EnteringOptions")):
                     align(0.5, 0.5):
                     xy(screen_center_x(), screen_center_y()):
                     zoom(0.75):
@@ -2385,7 +2582,7 @@ pub fn get_actors(state: &State, _asset_manager: &AssetManager) -> Vec<Actor> {
         ));
         actors.push(act!(text:
             font("miso"):
-            settext(SL_EXIT_PROMPT_TEXT):
+            settext(tr("SelectMusic", "ExitGamePrompt")):
             align(0.5, 0.0):
             xy(screen_center_x(), screen_center_y() + SL_EXIT_PROMPT_PROMPT_Y_OFFSET):
             zoom(SL_EXIT_PROMPT_PROMPT_ZOOM):
@@ -2398,12 +2595,16 @@ pub fn get_actors(state: &State, _asset_manager: &AssetManager) -> Vec<Actor> {
         let zoom_no = exit_prompt_choice_zoom(0, active_choice, switch_from, switch_elapsed);
         let zoom_yes = exit_prompt_choice_zoom(1, active_choice, switch_from, switch_elapsed);
         let cx = screen_center_x();
+        let no_label = tr("Common", "No");
+        let yes_label = tr("Common", "Yes");
+        let no_info = tr("SelectMusic", "KeepPlayingInfo");
+        let yes_info = tr("SelectMusic", "FinishedInfo");
         push_exit_prompt_choice(
-            &mut actors,
+            actors,
             cx - SL_EXIT_PROMPT_CHOICE_X_OFFSET,
             SL_EXIT_PROMPT_CHOICE_Y,
-            SL_EXIT_PROMPT_NO_LABEL,
-            SL_EXIT_PROMPT_NO_INFO,
+            no_label,
+            no_info,
             active_choice == 0,
             zoom_no,
             p2_color,
@@ -2411,11 +2612,11 @@ pub fn get_actors(state: &State, _asset_manager: &AssetManager) -> Vec<Actor> {
             1502,
         );
         push_exit_prompt_choice(
-            &mut actors,
+            actors,
             cx + SL_EXIT_PROMPT_CHOICE_X_OFFSET,
             SL_EXIT_PROMPT_CHOICE_Y,
-            SL_EXIT_PROMPT_YES_LABEL,
-            SL_EXIT_PROMPT_YES_INFO,
+            yes_label,
+            yes_info,
             active_choice == 1,
             zoom_yes,
             p2_color,
@@ -2423,7 +2624,11 @@ pub fn get_actors(state: &State, _asset_manager: &AssetManager) -> Vec<Actor> {
             1502,
         );
     }
+}
 
+pub fn get_actors(state: &State, asset_manager: &AssetManager) -> Vec<Actor> {
+    let mut actors = Vec::with_capacity(256);
+    push_actors(&mut actors, state, asset_manager);
     actors
 }
 
@@ -2435,6 +2640,8 @@ fn begin_exit_prompt(state: &mut State) {
         switch_from: None,
         switch_elapsed: 0.0,
     };
+    state.menu_lr_undo = 0;
+    state.three_key_focus = ThreeKeyFocus::Wheel;
     state.nav_key_held_direction = None;
     state.nav_key_held_since = None;
 }
@@ -2469,8 +2676,8 @@ fn push_exit_prompt_choice(
     out: &mut Vec<Actor>,
     cx: f32,
     cy: f32,
-    label: &str,
-    info: &str,
+    label: std::sync::Arc<str>,
+    info: std::sync::Arc<str>,
     active: bool,
     choice_zoom: f32,
     active_rgba: [f32; 4],
@@ -2486,7 +2693,7 @@ fn push_exit_prompt_choice(
     out.push(act!(text:
         align(0.5, 0.5):
         xy(cx, cy):
-        font("wendy"):
+        font(current_machine_font_key(FontRole::Header)):
         zoom(SL_EXIT_PROMPT_LABEL_ZOOM * choice_zoom):
         settext(label):
         diffuse(rgba[0], rgba[1], rgba[2], rgba[3]):

@@ -1,16 +1,19 @@
 use crate::act;
 use crate::assets::AssetManager;
-use crate::core::audio;
-use crate::core::input::{InputEvent, VirtualAction};
-use crate::core::space::{screen_center_x, screen_center_y};
+use crate::assets::i18n::tr;
+use crate::assets::{FontRole, current_machine_font_key};
 use crate::screens::components::shared::screen_bar::{
     AvatarParams, ScreenBarParams, ScreenBarPosition, ScreenBarTitlePlacement,
 };
-use crate::screens::components::shared::{heart_bg, screen_bar};
+use crate::screens::components::shared::{screen_bar, visual_style_bg};
 use crate::screens::{Screen, ScreenAction};
-use crate::ui::actors::Actor;
-use crate::ui::color;
-use crate::ui::font;
+use deadlib_present::actors::Actor;
+use deadlib_present::color;
+use deadlib_present::font;
+use deadlib_present::space::{screen_center_x, screen_center_y};
+use deadsync_audio_stream as audio;
+use deadsync_input::{InputEvent, VirtualAction};
+use deadsync_profile as profile_data;
 
 /* ------------------------------ layout ------------------------------- */
 const ROOT_X_OFF: f32 = 90.0;
@@ -35,9 +38,20 @@ const LOOP_RESET_Y: f32 = 24.0 * ARROW_H;
 const ARROW_SPRITE_SZ: f32 = 150.0;
 const ARROW_SPRITE_ZOOM: f32 = 0.18;
 
-const CHOICES: [&str; 2] = ["Regular", "Marathon"];
-const REGULAR_DESC: &str = "Choose your songs with a\nshort break between each.\n\nThese are dance games\nas we know and love them!";
-const MARATHON_DESC: &str = "Play a predetermined course\nof songs without any\nbreak between.\n\nMany courses have scripted\nmodifiers!";
+fn choice_labels() -> [String; 2] {
+    [
+        tr("SelectMode", "Regular").to_string(),
+        tr("SelectMode", "Marathon").to_string(),
+    ]
+}
+
+fn choice_description(choice: Choice) -> String {
+    let key = match choice {
+        Choice::Regular => "RegularDescription",
+        Choice::Marathon => "MarathonDescription",
+    };
+    tr("SelectMode", key).replace("\\n", "\n")
+}
 
 const PATTERN: [&str; 24] = [
     "left", "down", "left", "right", "down", "up", "left", "right", "left", "down", "up", "right",
@@ -58,13 +72,7 @@ const fn choice_from_index(idx: usize) -> Choice {
     }
 }
 
-#[inline(always)]
-const fn choice_desc(choice: Choice) -> &'static str {
-    match choice {
-        Choice::Regular => REGULAR_DESC,
-        Choice::Marathon => MARATHON_DESC,
-    }
-}
+const CHOICE_COUNT: usize = 2;
 
 #[inline(always)]
 const fn choice_cursor_label_width(choice: Choice) -> f32 {
@@ -76,10 +84,10 @@ const fn choice_cursor_label_width(choice: Choice) -> f32 {
 }
 
 #[inline(always)]
-const fn choice_play_mode(choice: Choice) -> crate::game::profile::PlayMode {
+const fn choice_play_mode(choice: Choice) -> profile_data::PlayMode {
     match choice {
-        Choice::Regular => crate::game::profile::PlayMode::Regular,
-        Choice::Marathon => crate::game::profile::PlayMode::Marathon,
+        Choice::Regular => profile_data::PlayMode::Regular,
+        Choice::Marathon => profile_data::PlayMode::Marathon,
     }
 }
 
@@ -87,11 +95,11 @@ pub struct State {
     pub active_color_index: i32,
     pub selected_index: usize,
     cursor_y: f32,
-    choice_zooms: [f32; CHOICES.len()],
+    choice_zooms: [f32; CHOICE_COUNT],
     demo_time: f32,
     exit_requested: bool,
     exit_target: Option<Screen>,
-    bg: heart_bg::State,
+    bg: visual_style_bg::State,
 }
 
 pub fn init() -> State {
@@ -99,18 +107,18 @@ pub fn init() -> State {
         active_color_index: color::DEFAULT_COLOR_INDEX,
         selected_index: 0,
         cursor_y: -60.0,
-        choice_zooms: [CHOICE_ZOOM_UNFOCUSED; CHOICES.len()],
+        choice_zooms: [CHOICE_ZOOM_UNFOCUSED; CHOICE_COUNT],
         demo_time: 0.0,
         exit_requested: false,
         exit_target: None,
-        bg: heart_bg::State::new(),
+        bg: visual_style_bg::State::new(),
     }
 }
 
 pub fn on_enter(state: &mut State) {
     state.selected_index = match crate::game::profile::get_session_play_mode() {
-        crate::game::profile::PlayMode::Regular => 0,
-        crate::game::profile::PlayMode::Marathon => 1,
+        profile_data::PlayMode::Regular => 0,
+        profile_data::PlayMode::Marathon => 1,
     };
     // Match SL behavior where switching mode requeues FirstLoopRegular/Marathon.
     state.demo_time = 0.0;
@@ -136,17 +144,14 @@ pub fn out_transition() -> (Vec<Actor>, f32) {
 
 #[inline(always)]
 fn exit_anim_t(exiting: bool) -> f32 {
-    if !exiting {
-        return 0.0;
-    }
-    use crate::ui::{anim, runtime};
-    static STEPS: std::sync::OnceLock<Vec<anim::Step>> = std::sync::OnceLock::new();
-    let steps = STEPS.get_or_init(|| vec![anim::linear(EXIT_TOTAL_DUR).x(EXIT_TOTAL_DUR).build()]);
-
-    let mut init = anim::TweenState::default();
-    init.x = 0.0;
-    let sid = runtime::site_id(file!(), line!(), column!(), 0x53504D4F44455849u64); // "SPMODEXI"
-    runtime::materialize(sid, init, steps).x.max(0.0)
+    static STEPS: std::sync::OnceLock<Vec<deadlib_present::anim::Step>> =
+        std::sync::OnceLock::new();
+    crate::screens::components::shared::transitions::linear_elapsed(
+        exiting,
+        EXIT_TOTAL_DUR,
+        &STEPS,
+        0x53504D4F44455849u64, // "SPMODEXI"
+    )
 }
 
 #[inline(always)]
@@ -202,13 +207,12 @@ pub fn update(state: &mut State, dt: f32) -> Option<ScreenAction> {
         }
     }
 
-    if state.exit_requested {
-        if let Some(target) = state.exit_target
-            && exit_anim_t(true) >= EXIT_TOTAL_DUR
-        {
-            state.exit_target = None;
-            return Some(ScreenAction::Navigate(target));
-        }
+    if state.exit_requested
+        && let Some(target) = state.exit_target
+        && exit_anim_t(true) >= EXIT_TOTAL_DUR
+    {
+        state.exit_target = None;
+        return Some(ScreenAction::Navigate(target));
     }
     None
 }
@@ -221,44 +225,41 @@ pub fn handle_input(state: &mut State, ev: &InputEvent) -> ScreenAction {
         return ScreenAction::None;
     }
 
-    let nav = match crate::game::profile::get_session_player_side() {
-        crate::game::profile::PlayerSide::P2 => match ev.action {
-            VirtualAction::p2_left
-            | VirtualAction::p2_menu_left
-            | VirtualAction::p2_up
-            | VirtualAction::p2_menu_up => Some(-1),
-            VirtualAction::p2_right
-            | VirtualAction::p2_menu_right
-            | VirtualAction::p2_down
-            | VirtualAction::p2_menu_down => Some(1),
-            VirtualAction::p2_start => Some(0),
-            VirtualAction::p2_back => Some(9),
-            _ => None,
-        },
-        crate::game::profile::PlayerSide::P1 => match ev.action {
-            VirtualAction::p1_left
-            | VirtualAction::p1_menu_left
-            | VirtualAction::p1_up
-            | VirtualAction::p1_menu_up => Some(-1),
-            VirtualAction::p1_right
-            | VirtualAction::p1_menu_right
-            | VirtualAction::p1_down
-            | VirtualAction::p1_menu_down => Some(1),
-            VirtualAction::p1_start => Some(0),
-            VirtualAction::p1_back => Some(9),
-            _ => None,
-        },
+    let nav = match ev.action {
+        VirtualAction::p1_left
+        | VirtualAction::p1_menu_left
+        | VirtualAction::p1_up
+        | VirtualAction::p1_menu_up
+        | VirtualAction::p2_left
+        | VirtualAction::p2_menu_left
+        | VirtualAction::p2_up
+        | VirtualAction::p2_menu_up => Some(-1),
+
+        VirtualAction::p1_right
+        | VirtualAction::p1_menu_right
+        | VirtualAction::p1_down
+        | VirtualAction::p1_menu_down
+        | VirtualAction::p2_right
+        | VirtualAction::p2_menu_right
+        | VirtualAction::p2_down
+        | VirtualAction::p2_menu_down => Some(1),
+
+        VirtualAction::p1_start | VirtualAction::p2_start => Some(0),
+
+        VirtualAction::p1_back | VirtualAction::p2_back => Some(9),
+
+        _ => None,
     };
 
     match nav {
         Some(-1) => {
-            state.selected_index = (state.selected_index + CHOICES.len() - 1) % CHOICES.len();
+            state.selected_index = (state.selected_index + CHOICE_COUNT - 1) % CHOICE_COUNT;
             state.demo_time = 0.0;
             audio::play_sfx("assets/sounds/change.ogg");
             ScreenAction::None
         }
         Some(1) => {
-            state.selected_index = (state.selected_index + 1) % CHOICES.len();
+            state.selected_index = (state.selected_index + 1) % CHOICE_COUNT;
             state.demo_time = 0.0;
             audio::play_sfx("assets/sounds/change.ogg");
             ScreenAction::None
@@ -316,24 +317,28 @@ fn arrow_rotation(dir: &str) -> f32 {
 
 #[inline(always)]
 fn ease01(x: f32, f_ease: f32) -> f32 {
-    use crate::ui::anim;
+    use deadlib_present::anim;
     let x = x.clamp(0.0, 1.0);
     // Use the same curve implementation as tween segments.
     anim::eval_ease_p_for_f_ease(x, f_ease)
 }
 
-pub fn get_actors(state: &State, asset_manager: &AssetManager) -> Vec<Actor> {
-    let mut actors = Vec::with_capacity(256);
+pub fn push_actors(actors: &mut Vec<Actor>, state: &State, asset_manager: &AssetManager) {
+    actors.reserve(256);
     let exit_t = exit_anim_t(state.exit_requested);
 
-    actors.extend(state.bg.build(heart_bg::Params {
-        active_color_index: state.active_color_index,
-        backdrop_rgba: [0.0, 0.0, 0.0, 1.0],
-        alpha_mul: 1.0,
-    }));
+    state.bg.push(
+        actors,
+        visual_style_bg::Params {
+            active_color_index: state.active_color_index,
+            backdrop_rgba: [0.0, 0.0, 0.0, 1.0],
+            alpha_mul: 1.0,
+        },
+    );
 
+    let select_mode = tr("ScreenTitles", "SelectMode");
     actors.push(screen_bar::build(ScreenBarParams {
-        title: "SELECT MODE",
+        title: &select_mode,
         title_placement: ScreenBarTitlePlacement::Left,
         position: ScreenBarPosition::Top,
         transparent: false,
@@ -345,8 +350,8 @@ pub fn get_actors(state: &State, asset_manager: &AssetManager) -> Vec<Actor> {
         right_avatar: None,
     }));
 
-    let p1_profile = crate::game::profile::get_for_side(crate::game::profile::PlayerSide::P1);
-    let p2_profile = crate::game::profile::get_for_side(crate::game::profile::PlayerSide::P2);
+    let p1_profile = crate::game::profile::get_for_side(profile_data::PlayerSide::P1);
+    let p2_profile = crate::game::profile::get_for_side(profile_data::PlayerSide::P2);
     let p1_avatar = p1_profile
         .avatar_texture_key
         .as_deref()
@@ -356,41 +361,40 @@ pub fn get_actors(state: &State, asset_manager: &AssetManager) -> Vec<Actor> {
         .as_deref()
         .map(|texture_key| AvatarParams { texture_key });
 
-    let p1_joined =
-        crate::game::profile::is_session_side_joined(crate::game::profile::PlayerSide::P1);
-    let p2_joined =
-        crate::game::profile::is_session_side_joined(crate::game::profile::PlayerSide::P2);
-    let p1_guest =
-        crate::game::profile::is_session_side_guest(crate::game::profile::PlayerSide::P1);
-    let p2_guest =
-        crate::game::profile::is_session_side_guest(crate::game::profile::PlayerSide::P2);
+    let p1_joined = crate::game::profile::is_session_side_joined(profile_data::PlayerSide::P1);
+    let p2_joined = crate::game::profile::is_session_side_joined(profile_data::PlayerSide::P2);
+    let p1_guest = crate::game::profile::is_session_side_guest(profile_data::PlayerSide::P1);
+    let p2_guest = crate::game::profile::is_session_side_guest(profile_data::PlayerSide::P2);
 
+    let insert_card = tr("Common", "InsertCard");
+    let press_start = tr("Common", "PressStart");
     let (footer_left, left_avatar) = if p1_joined {
         (
             Some(if p1_guest {
-                "INSERT CARD"
+                insert_card.as_ref()
             } else {
                 p1_profile.display_name.as_str()
             }),
             if p1_guest { None } else { p1_avatar },
         )
     } else {
-        (Some("PRESS START"), None)
+        (Some(press_start.as_ref()), None)
     };
     let (footer_right, right_avatar) = if p2_joined {
         (
             Some(if p2_guest {
-                "INSERT CARD"
+                insert_card.as_ref()
             } else {
                 p2_profile.display_name.as_str()
             }),
             if p2_guest { None } else { p2_avatar },
         )
     } else {
-        (Some("PRESS START"), None)
+        (Some(press_start.as_ref()), None)
     };
+    let event_mode = tr("Common", "EventMode");
     actors.push(screen_bar::build(ScreenBarParams {
-        title: "EVENT MODE",
+        title: &event_mode,
         title_placement: ScreenBarTitlePlacement::Center,
         position: ScreenBarPosition::Bottom,
         transparent: false,
@@ -443,7 +447,7 @@ pub fn get_actors(state: &State, asset_manager: &AssetManager) -> Vec<Actor> {
     let choice = choice_from_index(state.selected_index);
     actors.push(act!(text:
         font("miso"):
-        settext(choice_desc(choice)):
+        settext(choice_description(choice)):
         align(0.0, 0.0):
         xy(dx, dy):
         zoom(0.825 * ROOT_ZOOM):
@@ -454,10 +458,11 @@ pub fn get_actors(state: &State, asset_manager: &AssetManager) -> Vec<Actor> {
     // Cursor highlight.
     let cursor_crop = cropleft_after(exit_t, 0.4, 0.2);
     let cursor_alpha = 1.0;
-    let label = CHOICES[state.selected_index];
+    let labels = choice_labels();
+    let label = &labels[state.selected_index];
     let measured_w = asset_manager.with_fonts(|all_fonts| {
         asset_manager
-            .with_font("wendy", |f| {
+            .with_font(current_machine_font_key(FontRole::Header), |f| {
                 font::measure_line_width_logical(f, label, all_fonts) as f32
             })
             .unwrap_or(0.0)
@@ -490,7 +495,7 @@ pub fn get_actors(state: &State, asset_manager: &AssetManager) -> Vec<Actor> {
     let label_selected = color::simply_love_rgba(state.active_color_index);
     let label_unselected = color::rgba_hex("#888888");
     let zoom_den = (CHOICE_ZOOM_FOCUSED - CHOICE_ZOOM_UNFOCUSED).max(f32::EPSILON);
-    for (i, &label) in CHOICES.iter().enumerate() {
+    for (i, label) in labels.iter().enumerate() {
         let (x, y) = root_pt(-160.0, -60.0 + CURSOR_H * (i as f32));
         let zoom = state.choice_zooms[i];
         let t = ((zoom - CHOICE_ZOOM_UNFOCUSED) / zoom_den).clamp(0.0, 1.0);
@@ -502,8 +507,8 @@ pub fn get_actors(state: &State, asset_manager: &AssetManager) -> Vec<Actor> {
         ];
 
         actors.push(act!(text:
-            font("wendy"):
-            settext(label):
+            font(current_machine_font_key(FontRole::Header)):
+            settext(label.clone()):
             align(1.0, 0.5):
             xy(x, y):
             zoom(zoom):
@@ -516,7 +521,7 @@ pub fn get_actors(state: &State, asset_manager: &AssetManager) -> Vec<Actor> {
     let score_alpha = fade_after(exit_t, 0.4, 0.2);
     let (sx, sy) = root_pt(124.0, -68.0);
     actors.push(act!(text:
-        font("wendy_monospace_numbers"):
+        font(current_machine_font_key(FontRole::Numbers)):
         settext("77.41"):
         align(0.5, 0.5):
         xy(sx, sy):
@@ -661,6 +666,10 @@ pub fn get_actors(state: &State, asset_manager: &AssetManager) -> Vec<Actor> {
             rotationz(rot):
         ));
     }
+}
 
+pub fn get_actors(state: &State, asset_manager: &AssetManager) -> Vec<Actor> {
+    let mut actors = Vec::with_capacity(256);
+    push_actors(&mut actors, state, asset_manager);
     actors
 }

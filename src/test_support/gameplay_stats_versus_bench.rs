@@ -1,49 +1,67 @@
 use crate::assets::AssetManager;
 use crate::game::profile;
-use crate::game::timing::WindowCounts;
 use crate::screens::components::gameplay::gameplay_stats;
+use crate::screens::gameplay as gameplay_screen;
 use crate::test_support::{compose_scenarios, notefield_bench};
-use crate::ui::actors::Actor;
+use deadlib_present::actors::Actor;
+use deadsync_profile as profile_data;
+use deadsync_rules::timing::WindowCounts;
 use std::sync::Arc;
 
 pub const SCENARIO_NAME: &str = "gameplay-stats-versus";
 
 pub struct GameplayStatsVersusBenchFixture {
-    base: notefield_bench::NotefieldBenchFixture,
+    state: gameplay_screen::State,
     asset_manager: AssetManager,
 }
 
 impl GameplayStatsVersusBenchFixture {
     pub fn build(&self) -> Vec<Actor> {
-        gameplay_stats::build_versus_step_stats(self.base.state(), &self.asset_manager)
+        let mut actors = Vec::new();
+        gameplay_stats::push_versus_step_stats(&mut actors, &self.state, &self.asset_manager);
+        actors
     }
 }
 
 pub fn fixture() -> GameplayStatsVersusBenchFixture {
-    profile::set_session_play_style(profile::PlayStyle::Versus);
-    profile::set_session_player_side(profile::PlayerSide::P1);
+    profile::set_session_play_style(profile_data::PlayStyle::Versus);
+    profile::set_session_player_side(profile_data::PlayerSide::P1);
     profile::set_session_joined(true, true);
 
     let mut base = notefield_bench::fixture();
     {
         let state = base.state_mut();
-        state.num_players = 2;
-        state.num_cols = 8;
-        state.cols_per_player = 4;
-        state.note_ranges[1] = state.note_ranges[0];
-        state.total_elapsed_in_screen = 9.6;
-        state.current_music_time_display = 64.25;
+        state.set_num_players(2);
+        state.set_num_cols(8);
+        state.set_cols_per_player(4);
+        let p1_range = state.note_range_for_player(0);
+        state.set_note_range(1, p1_range);
+        state.set_screen_elapsed(9.6);
+        state.set_song_position_for_benchmark(
+            state.current_beat(),
+            state.current_music_time_ns(),
+            state.current_beat_display(),
+            64.25,
+        );
 
-        state.players[0].judgment_counts = [22_481, 2_118, 351, 49, 12, 3];
-        state.players[1].judgment_counts = [20_204, 1_804, 404, 88, 23, 7];
-        state.player_profiles[0].data_visualizations = profile::DataVisualizations::StepStatistics;
-        state.player_profiles[1].data_visualizations = profile::DataVisualizations::StepStatistics;
-        state.player_profiles[0].show_fa_plus_window = true;
-        state.player_profiles[0].fa_plus_10ms_blue_window = true;
-        state.player_profiles[1].show_fa_plus_window = false;
-        state.player_profiles[1].custom_fantastic_window = false;
+        state.update_player(0, |player| {
+            player.judgment_counts = [22_481, 2_118, 351, 49, 12, 3];
+        });
+        state.update_player(1, |player| {
+            player.judgment_counts = [20_204, 1_804, 404, 88, 23, 7];
+        });
+        state.update_profile(0, |profile| {
+            profile.step_statistics = profile_data::StepStatisticsMask::all_widgets();
+            profile.show_fa_plus_window = true;
+            profile.fa_plus_10ms_blue_window = true;
+        });
+        state.update_profile(1, |profile| {
+            profile.step_statistics = profile_data::StepStatisticsMask::all_widgets();
+            profile.show_fa_plus_window = false;
+            profile.custom_fantastic_window = false;
+        });
 
-        state.live_window_counts[0] = WindowCounts {
+        let p1_canonical = WindowCounts {
             w0: 18_992,
             w1: 3_489,
             w2: 2_118,
@@ -52,7 +70,7 @@ pub fn fixture() -> GameplayStatsVersusBenchFixture {
             w5: 12,
             miss: 3,
         };
-        state.live_window_counts_10ms_blue[0] = WindowCounts {
+        let p1_ten_ms_blue = WindowCounts {
             w0: 19_704,
             w1: 2_777,
             w2: 2_118,
@@ -61,8 +79,8 @@ pub fn fixture() -> GameplayStatsVersusBenchFixture {
             w5: 12,
             miss: 3,
         };
-        state.live_window_counts_display_blue[0] = state.live_window_counts_10ms_blue[0];
-        state.live_window_counts[1] = WindowCounts {
+        state.set_live_window_counts(0, p1_canonical, p1_ten_ms_blue, p1_ten_ms_blue);
+        let p2_counts = WindowCounts {
             w0: 20_204,
             w1: 0,
             w2: 1_804,
@@ -71,13 +89,15 @@ pub fn fixture() -> GameplayStatsVersusBenchFixture {
             w5: 23,
             miss: 7,
         };
-        state.live_window_counts_10ms_blue[1] = state.live_window_counts[1];
-        state.live_window_counts_display_blue[1] = state.live_window_counts[1];
+        state.set_live_window_counts(1, p2_counts, p2_counts, p2_counts);
 
-        let song = Arc::make_mut(&mut state.song);
-        song.banner_path = Some("bench/banner.png".into());
-        state.song_full_title = Arc::from("Gameplay Stats Versus Benchmark");
+        state.set_song_banner_path(Some("bench/banner.png".into()));
     }
+
+    let (state, noteskin_assets, _) = base.into_parts();
+    let mut state = gameplay_screen::State::from_gameplay(state, noteskin_assets);
+    state.song_full_title = Arc::from("Gameplay Stats Versus Benchmark");
+    gameplay_stats::refresh_density_graph_meshes(&mut state);
 
     let mut asset_manager = AssetManager::new();
     for (name, font) in compose_scenarios::bench_fonts() {
@@ -85,7 +105,7 @@ pub fn fixture() -> GameplayStatsVersusBenchFixture {
     }
 
     GameplayStatsVersusBenchFixture {
-        base,
+        state,
         asset_manager,
     }
 }

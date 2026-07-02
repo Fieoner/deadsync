@@ -1,17 +1,21 @@
 use crate::act;
 use crate::assets::AssetManager;
-use crate::core::audio;
-use crate::core::input::{
-    GamepadCodeBinding, InputBinding, InputEvent, InputSource, PadEvent, RawKeyboardEvent,
-    VirtualAction, with_keymap,
-};
-use crate::core::space::{screen_height, screen_width, widescale};
+use crate::assets::{FontRole, current_machine_font_key};
 use crate::screens::components::shared::screen_bar::{ScreenBarPosition, ScreenBarTitlePlacement};
-use crate::screens::components::shared::{heart_bg, screen_bar};
+use crate::screens::components::shared::{screen_bar, transitions, visual_style_bg};
+use crate::screens::input as screen_input;
 use crate::screens::{Screen, ScreenAction};
-use crate::ui::actors::Actor;
-use crate::ui::color;
-use crate::ui::font;
+use deadlib_present::actors::Actor;
+use deadlib_present::color;
+use deadlib_present::font;
+use deadlib_present::space::{screen_height, screen_width, widescale};
+use deadsync_audio_stream as audio;
+use deadsync_core::input::InputSource;
+use deadsync_input::RawKeyboardEvent;
+use deadsync_input::{
+    GamepadCodeBinding, InputBinding, InputEvent, Keymap, PadEvent, VirtualAction,
+    any_player_has_dedicated_menu_buttons_for_mode, clamp_input_debounce_seconds, with_keymap,
+};
 use std::time::{Duration, Instant};
 use winit::keyboard::KeyCode;
 
@@ -61,23 +65,24 @@ const CURSOR_TWEEN_SECONDS: f32 = 0.1;
 /// Spacing between inline items (for cursor ring sizing).
 const INLINE_SPACING: f32 = 15.75;
 
-/// Physical keys that are considered "default" and are not
-/// accepted as candidates when capturing a new mapping.
-const DEFAULT_PROTECTED_KEYS: &[KeyCode] = &[
-    // P1 defaults (arrows + Enter/Escape)
-    KeyCode::ArrowUp,
-    KeyCode::ArrowDown,
-    KeyCode::ArrowLeft,
-    KeyCode::ArrowRight,
-    KeyCode::Enter,
-    KeyCode::Escape,
-    // P2 defaults (numpad directions + Start)
-    KeyCode::Numpad8,
-    KeyCode::Numpad2,
-    KeyCode::Numpad4,
-    KeyCode::Numpad6,
-    KeyCode::NumpadEnter,
-];
+#[inline(always)]
+const fn invalid_capture_key(code: KeyCode) -> bool {
+    matches!(
+        code,
+        KeyCode::F1
+            | KeyCode::F2
+            | KeyCode::F3
+            | KeyCode::F4
+            | KeyCode::F5
+            | KeyCode::F6
+            | KeyCode::F7
+            | KeyCode::F8
+            | KeyCode::F9
+            | KeyCode::F10
+            | KeyCode::F11
+            | KeyCode::F12
+    )
+}
 
 /// Logical mapping rows we expose in this prototype.
 const NUM_MAPPING_ROWS: usize = 18;
@@ -142,13 +147,7 @@ const fn row_actions(row_idx: usize) -> (Option<VirtualAction>, Option<VirtualAc
 
 #[inline(always)]
 fn ease_out_cubic(t: f32) -> f32 {
-    let clamped = if t < 0.0 {
-        0.0
-    } else if t > 1.0 {
-        1.0
-    } else {
-        t
-    };
+    let clamped = t.clamp(0.0, 1.0);
     let u = 1.0 - clamped;
     (u * u).mul_add(-u, 1.0)
 }
@@ -157,6 +156,12 @@ fn ease_out_cubic(t: f32) -> f32 {
 pub enum NavDirection {
     Up,
     Down,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NavWrap {
+    Wrap,
+    Clamp,
 }
 
 /// Which slot (player + primary/secondary) is currently focused.
@@ -190,9 +195,16 @@ pub const fn active_slot_prev(slot: ActiveSlot) -> ActiveSlot {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ThreeKeyFocus {
+    #[default]
+    Row,
+    Slot,
+}
+
 pub struct State {
     pub active_color_index: i32,
-    bg: heart_bg::State,
+    bg: visual_style_bg::State,
     /// 0..NUM_MAPPING_ROWS-1 = mapping rows, `NUM_MAPPING_ROWS` = Exit.
     selected_row: usize,
     prev_selected_row: usize,
@@ -214,12 +226,18 @@ pub struct State {
     capture_row: Option<usize>,
     capture_slot: Option<ActiveSlot>,
     capture_pulse_t: f32,
+    capture_ignore_until: Option<Instant>,
+    capture_keyboard_arming_key: Option<KeyCode>,
+    three_key_focus: ThreeKeyFocus,
+    menu_lr_chord: screen_input::MenuLrChordTracker,
+    menu_lr_undo_row: i8,
+    menu_lr_undo_slot: Option<ActiveSlot>,
 }
 
 pub fn init() -> State {
     State {
         active_color_index: color::DEFAULT_COLOR_INDEX,
-        bg: heart_bg::State::new(),
+        bg: visual_style_bg::State::new(),
         selected_row: 0,
         prev_selected_row: 0,
         active_slot: ActiveSlot::P1Primary,
@@ -236,30 +254,21 @@ pub fn init() -> State {
         capture_row: None,
         capture_slot: None,
         capture_pulse_t: 0.0,
+        capture_ignore_until: None,
+        capture_keyboard_arming_key: None,
+        three_key_focus: ThreeKeyFocus::Row,
+        menu_lr_chord: screen_input::MenuLrChordTracker::default(),
+        menu_lr_undo_row: 0,
+        menu_lr_undo_slot: None,
     }
 }
 
 pub fn in_transition() -> (Vec<Actor>, f32) {
-    let actor = act!(quad:
-        align(0.0, 0.0): xy(0.0, 0.0):
-        zoomto(screen_width(), screen_height()):
-        diffuse(0.0, 0.0, 0.0, 1.0):
-        z(1100):
-        linear(TRANSITION_IN_DURATION): alpha(0.0):
-        linear(0.0): visible(false)
-    );
-    (vec![actor], TRANSITION_IN_DURATION)
+    transitions::fade_in_black(TRANSITION_IN_DURATION, 1100)
 }
 
 pub fn out_transition() -> (Vec<Actor>, f32) {
-    let actor = act!(quad:
-        align(0.0, 0.0): xy(0.0, 0.0):
-        zoomto(screen_width(), screen_height()):
-        diffuse(0.0, 0.0, 0.0, 0.0):
-        z(1200):
-        linear(TRANSITION_OUT_DURATION): alpha(1.0)
-    );
-    (vec![actor], TRANSITION_OUT_DURATION)
+    transitions::fade_out_black(TRANSITION_OUT_DURATION, 1200)
 }
 
 fn on_nav_press(state: &mut State, dir: NavDirection) {
@@ -282,28 +291,192 @@ const fn total_rows() -> usize {
     NUM_MAPPING_ROWS + 1 // + Exit row
 }
 
-fn move_selection(state: &mut State, dir: NavDirection) {
+fn move_selection(state: &mut State, dir: NavDirection, wrap: NavWrap) {
     let total = total_rows();
     if total == 0 {
         return;
     }
     let old = state.selected_row;
+    let last = total - 1;
     let new = match dir {
         NavDirection::Up => {
             if state.selected_row == 0 {
-                total.saturating_sub(1)
+                match wrap {
+                    NavWrap::Wrap => last,
+                    NavWrap::Clamp => 0,
+                }
             } else {
                 state.selected_row - 1
             }
         }
-        NavDirection::Down => (state.selected_row + 1) % total,
+        NavDirection::Down => {
+            if state.selected_row >= last {
+                match wrap {
+                    NavWrap::Wrap => 0,
+                    NavWrap::Clamp => last,
+                }
+            } else {
+                state.selected_row + 1
+            }
+        }
     };
     if new != old {
         state.selected_row = new;
+        state.three_key_focus = ThreeKeyFocus::Row;
+        state.menu_lr_undo_slot = None;
         // Reset row tween; update() will compute from_y based on layout.
         state.cursor_row_anim_t = 0.0;
         state.cursor_row_anim_from_row = Some(old);
         audio::play_sfx("assets/sounds/change.ogg");
+    }
+}
+
+#[inline(always)]
+fn set_active_slot(state: &mut State, new_slot: ActiveSlot) {
+    let old_slot = state.active_slot;
+    if new_slot == old_slot {
+        return;
+    }
+    state.active_slot = new_slot;
+    state.slot_anim_from = old_slot;
+    state.slot_anim_to = new_slot;
+    state.slot_anim_t = 0.0;
+}
+
+#[inline(always)]
+fn capture_debounce_window() -> Duration {
+    Duration::from_secs_f32(clamp_input_debounce_seconds(
+        crate::config::get().input_debounce_seconds,
+    ))
+}
+
+#[inline(always)]
+fn begin_capture(state: &mut State, timestamp: Instant) {
+    state.capture_active = true;
+    state.capture_row = Some(state.selected_row);
+    state.capture_slot = Some(state.active_slot);
+    state.capture_pulse_t = 0.0;
+    state.capture_ignore_until = Some(timestamp + capture_debounce_window());
+    state.capture_keyboard_arming_key = None;
+    state.nav_key_held_direction = None;
+    state.nav_key_held_since = None;
+    state.nav_key_last_scrolled_at = None;
+    state.menu_lr_undo_row = 0;
+    state.menu_lr_undo_slot = None;
+}
+
+#[inline(always)]
+fn begin_keyboard_capture(state: &mut State, keycode: KeyCode, timestamp: Instant) {
+    begin_capture(state, timestamp);
+    state.capture_keyboard_arming_key = Some(keycode);
+}
+
+#[inline(always)]
+fn capture_debounce_active(state: &State, timestamp: Instant) -> bool {
+    state
+        .capture_ignore_until
+        .is_some_and(|until| timestamp < until)
+}
+
+#[inline(always)]
+fn cancel_capture(state: &mut State) {
+    state.capture_active = false;
+    state.capture_row = None;
+    state.capture_slot = None;
+    state.capture_pulse_t = 0.0;
+    state.capture_ignore_until = None;
+    state.capture_keyboard_arming_key = None;
+    state.three_key_focus = ThreeKeyFocus::Row;
+    state.menu_lr_undo_row = 0;
+    state.menu_lr_undo_slot = None;
+}
+
+#[inline(always)]
+fn focused_binding_target(state: &State) -> Option<(VirtualAction, usize)> {
+    if state.selected_row >= NUM_MAPPING_ROWS {
+        return None;
+    }
+    let (p1_act_opt, p2_act_opt) = row_actions(state.selected_row);
+    match state.active_slot {
+        ActiveSlot::P1Primary => p1_act_opt.map(|action| (action, 1)),
+        ActiveSlot::P1Secondary => p1_act_opt.map(|action| (action, 2)),
+        ActiveSlot::P2Primary => p2_act_opt.map(|action| (action, 1)),
+        ActiveSlot::P2Secondary => p2_act_opt.map(|action| (action, 2)),
+    }
+}
+
+#[inline(always)]
+fn clear_focused_binding(state: &State) -> bool {
+    let Some((action, index)) = focused_binding_target(state) else {
+        return false;
+    };
+    let cleared = crate::config::clear_keymap_binding(action, index);
+    if cleared
+        && crate::config::get().only_dedicated_menu_buttons
+        && !any_player_has_dedicated_menu_buttons_for_mode(
+            crate::config::get().three_key_navigation,
+        )
+    {
+        crate::config::update_only_dedicated_menu_buttons(false);
+    }
+    cleared
+}
+
+const RAW_NAV_ACTION_PRIORITY: [VirtualAction; 18] = [
+    VirtualAction::p1_back,
+    VirtualAction::p2_back,
+    VirtualAction::p1_up,
+    VirtualAction::p1_menu_up,
+    VirtualAction::p2_up,
+    VirtualAction::p2_menu_up,
+    VirtualAction::p1_down,
+    VirtualAction::p1_menu_down,
+    VirtualAction::p2_down,
+    VirtualAction::p2_menu_down,
+    VirtualAction::p1_left,
+    VirtualAction::p1_menu_left,
+    VirtualAction::p2_left,
+    VirtualAction::p2_menu_left,
+    VirtualAction::p1_right,
+    VirtualAction::p1_menu_right,
+    VirtualAction::p2_right,
+    VirtualAction::p2_menu_right,
+];
+
+#[inline(always)]
+fn keymap_raw_nav_action(keymap: &Keymap, key_event: &RawKeyboardEvent) -> Option<VirtualAction> {
+    RAW_NAV_ACTION_PRIORITY
+        .iter()
+        .copied()
+        .find(|&action| keymap.raw_key_event_has_action(key_event, |mapped| mapped == action))
+        .or_else(|| {
+            [
+                VirtualAction::p1_start,
+                VirtualAction::p2_start,
+                VirtualAction::p1_select,
+                VirtualAction::p2_select,
+            ]
+            .into_iter()
+            .find(|&action| keymap.raw_key_event_has_action(key_event, |mapped| mapped == action))
+        })
+}
+
+#[inline(always)]
+fn mapped_raw_nav_action(key_event: &RawKeyboardEvent) -> Option<VirtualAction> {
+    with_keymap(|keymap| keymap_raw_nav_action(keymap, key_event))
+}
+
+#[inline(always)]
+fn input_event_from_raw(action: VirtualAction, key_event: &RawKeyboardEvent) -> InputEvent {
+    InputEvent {
+        action,
+        input_slot: 0,
+        pressed: key_event.pressed,
+        source: InputSource::Keyboard,
+        timestamp: key_event.timestamp,
+        timestamp_host_nanos: key_event.host_nanos,
+        stored_at: key_event.timestamp,
+        emitted_at: key_event.timestamp,
     }
 }
 
@@ -319,7 +492,7 @@ pub fn update(state: &mut State, dt: f32) {
         if now.duration_since(held_since) > NAV_INITIAL_HOLD_DELAY / sm
             && now.duration_since(last_scrolled_at) >= NAV_REPEAT_SCROLL_INTERVAL / sm
         {
-            move_selection(state, direction);
+            move_selection(state, direction, NavWrap::Clamp);
             state.nav_key_last_scrolled_at = Some(now);
         }
     }
@@ -422,13 +595,25 @@ pub fn handle_raw_key_event(state: &mut State, key_event: &RawKeyboardEvent) -> 
     let code = key_event.code;
 
     // If we're capturing, treat this as a candidate mapping; otherwise,
-    // interpret arrows / Enter / Escape as navigation/back/capture.
+    // handle reserved raw navigation keys first and then fall back to the
+    // currently mapped menu actions for whichever player owns the key.
     if state.capture_active {
+        if state.capture_keyboard_arming_key == Some(code) {
+            if !is_pressed {
+                state.capture_keyboard_arming_key = None;
+                state.capture_ignore_until = Some(key_event.timestamp + capture_debounce_window());
+            }
+            return ScreenAction::None;
+        }
         if !is_pressed {
             return ScreenAction::None;
         }
-        // Default/protected keys do nothing while capturing; remain locked.
-        if DEFAULT_PROTECTED_KEYS.contains(&code) {
+        if capture_debounce_active(state, key_event.timestamp) {
+            return ScreenAction::None;
+        }
+        // Match ITGmania's mapper behavior: function keys remain reserved,
+        // but arrows, Enter, Escape, and other normal keys are valid bindings.
+        if invalid_capture_key(code) {
             return ScreenAction::None;
         }
 
@@ -451,7 +636,9 @@ pub fn handle_raw_key_event(state: &mut State, key_event: &RawKeyboardEvent) -> 
                 audio::play_sfx("assets/sounds/change_value.ogg");
 
                 if crate::config::get().only_dedicated_menu_buttons
-                    && !crate::core::input::any_player_has_dedicated_menu_buttons()
+                    && !any_player_has_dedicated_menu_buttons_for_mode(
+                        crate::config::get().three_key_navigation,
+                    )
                 {
                     crate::config::update_only_dedicated_menu_buttons(false);
                 }
@@ -459,10 +646,7 @@ pub fn handle_raw_key_event(state: &mut State, key_event: &RawKeyboardEvent) -> 
         }
 
         // Any captured key ends capture.
-        state.capture_active = false;
-        state.capture_row = None;
-        state.capture_slot = None;
-        state.capture_pulse_t = 0.0;
+        cancel_capture(state);
 
         return ScreenAction::None;
     }
@@ -471,7 +655,7 @@ pub fn handle_raw_key_event(state: &mut State, key_event: &RawKeyboardEvent) -> 
     match code {
         KeyCode::ArrowUp => {
             if is_pressed {
-                move_selection(state, NavDirection::Up);
+                move_selection(state, NavDirection::Up, NavWrap::Wrap);
                 on_nav_press(state, NavDirection::Up);
             } else {
                 on_nav_release(state, NavDirection::Up);
@@ -479,7 +663,7 @@ pub fn handle_raw_key_event(state: &mut State, key_event: &RawKeyboardEvent) -> 
         }
         KeyCode::ArrowDown => {
             if is_pressed {
-                move_selection(state, NavDirection::Down);
+                move_selection(state, NavDirection::Down, NavWrap::Wrap);
                 on_nav_press(state, NavDirection::Down);
             } else {
                 on_nav_release(state, NavDirection::Down);
@@ -487,28 +671,19 @@ pub fn handle_raw_key_event(state: &mut State, key_event: &RawKeyboardEvent) -> 
         }
         KeyCode::ArrowLeft => {
             if is_pressed && state.selected_row < NUM_MAPPING_ROWS {
-                let old_slot = state.active_slot;
-                let new_slot = active_slot_prev(state.active_slot);
-                if new_slot != old_slot {
-                    state.active_slot = new_slot;
-                    state.slot_anim_from = old_slot;
-                    state.slot_anim_to = new_slot;
-                    state.slot_anim_t = 0.0;
-                }
+                set_active_slot(state, active_slot_prev(state.active_slot));
                 audio::play_sfx("assets/sounds/change_value.ogg");
             }
         }
         KeyCode::ArrowRight => {
             if is_pressed && state.selected_row < NUM_MAPPING_ROWS {
-                let old_slot = state.active_slot;
-                let new_slot = active_slot_next(state.active_slot);
-                if new_slot != old_slot {
-                    state.active_slot = new_slot;
-                    state.slot_anim_from = old_slot;
-                    state.slot_anim_to = new_slot;
-                    state.slot_anim_t = 0.0;
-                }
+                set_active_slot(state, active_slot_next(state.active_slot));
                 audio::play_sfx("assets/sounds/change_value.ogg");
+            }
+        }
+        KeyCode::Delete | KeyCode::Backspace => {
+            if is_pressed && clear_focused_binding(state) {
+                audio::play_sfx("assets/sounds/change.ogg");
             }
         }
         KeyCode::Enter => {
@@ -518,13 +693,7 @@ pub fn handle_raw_key_event(state: &mut State, key_event: &RawKeyboardEvent) -> 
                     return ScreenAction::Navigate(Screen::Options);
                 }
                 if state.selected_row < NUM_MAPPING_ROWS {
-                    state.capture_active = true;
-                    state.capture_row = Some(state.selected_row);
-                    state.capture_slot = Some(state.active_slot);
-                    state.capture_pulse_t = 0.0;
-                    state.nav_key_held_direction = None;
-                    state.nav_key_held_since = None;
-                    state.nav_key_last_scrolled_at = None;
+                    begin_keyboard_capture(state, code, key_event.timestamp);
                     audio::play_sfx("assets/sounds/change_value.ogg");
                 }
             }
@@ -534,51 +703,73 @@ pub fn handle_raw_key_event(state: &mut State, key_event: &RawKeyboardEvent) -> 
                 return ScreenAction::Navigate(Screen::Options);
             }
         }
-        _ => {}
+        _ => {
+            if let Some(action) = mapped_raw_nav_action(key_event) {
+                let was_capture_active = state.capture_active;
+                let action = handle_input(state, &input_event_from_raw(action, key_event));
+                if !was_capture_active && state.capture_active {
+                    state.capture_keyboard_arming_key = Some(code);
+                }
+                return action;
+            }
+        }
     }
 
     ScreenAction::None
 }
 
 /// Raw gamepad handler used only while capturing a new mapping.
-/// This consumes the first pressed gamepad element and writes it into
-/// the appropriate binding slot for the active row/slot.
-pub fn handle_raw_pad_event(state: &mut State, pad_event: &PadEvent) {
+/// Returns `true` when the raw press was consumed as the new binding.
+pub fn handle_raw_pad_event(state: &mut State, pad_event: &PadEvent) -> bool {
     if !state.capture_active {
-        return;
+        return false;
     }
 
     // Only react to press edges; releases and pure axis motion are ignored.
     let binding_opt = match *pad_event {
         PadEvent::RawButton {
-            id, code, pressed, ..
+            id,
+            timestamp,
+            code,
+            pressed,
+            ..
         } => {
             if !pressed {
-                return;
+                return false;
             }
             let dev = usize::from(id);
             let code_u32 = code.into_u32();
-            Some(InputBinding::GamepadCode(GamepadCodeBinding {
-                code_u32,
-                device: Some(dev),
-                uuid: None,
-            }))
+            Some((
+                InputBinding::GamepadCode(GamepadCodeBinding {
+                    code_u32,
+                    device: Some(dev),
+                    uuid: None,
+                }),
+                timestamp,
+            ))
         }
         PadEvent::Dir {
-            id, dir, pressed, ..
+            id,
+            timestamp,
+            dir,
+            pressed,
+            ..
         } => {
             if !pressed {
-                return;
+                return false;
             }
             let dev = usize::from(id);
-            Some(InputBinding::PadDirOn { device: dev, dir })
+            Some((InputBinding::PadDirOn { device: dev, dir }, timestamp))
         }
         PadEvent::RawAxis { .. } => None,
     };
 
-    let Some(binding) = binding_opt else {
-        return;
+    let Some((binding, timestamp)) = binding_opt else {
+        return false;
     };
+    if capture_debounce_active(state, timestamp) {
+        return false;
+    }
 
     if let (Some(row_idx), Some(slot)) = (state.capture_row, state.capture_slot) {
         let (p1_act_opt, p2_act_opt) = row_actions(row_idx);
@@ -596,7 +787,9 @@ pub fn handle_raw_pad_event(state: &mut State, pad_event: &PadEvent) {
             audio::play_sfx("assets/sounds/change_value.ogg");
 
             if crate::config::get().only_dedicated_menu_buttons
-                && !crate::core::input::any_player_has_dedicated_menu_buttons()
+                && !any_player_has_dedicated_menu_buttons_for_mode(
+                    crate::config::get().three_key_navigation,
+                )
             {
                 crate::config::update_only_dedicated_menu_buttons(false);
             }
@@ -604,76 +797,170 @@ pub fn handle_raw_pad_event(state: &mut State, pad_event: &PadEvent) {
     }
 
     // Any captured pad input ends capture.
-    state.capture_active = false;
-    state.capture_row = None;
-    state.capture_slot = None;
-    state.capture_pulse_t = 0.0;
+    cancel_capture(state);
+    true
 }
 
 pub fn handle_input(state: &mut State, ev: &InputEvent) -> ScreenAction {
+    let three_key_action = screen_input::three_key_menu_action(&mut state.menu_lr_chord, ev);
     // While capturing, lock navigation and only allow backing out
     // of the screen; candidate keys are handled in handle_raw_key_event.
     if state.capture_active {
-        if ev.action == VirtualAction::p1_back && ev.pressed {
+        if let Some((_, screen_input::ThreeKeyMenuAction::Cancel)) = three_key_action {
+            cancel_capture(state);
+            audio::play_sfx("assets/sounds/change.ogg");
+            return ScreenAction::None;
+        }
+        if ev.pressed && matches!(ev.action, VirtualAction::p1_back | VirtualAction::p2_back) {
             return ScreenAction::Navigate(Screen::Options);
         }
         return ScreenAction::None;
     }
 
-    // Outside of capture, navigation on this screen is strictly keyboard-only.
-    // Gamepad inputs should not move the cursor or activate UI here; they are
-    // used only when explicitly capturing a new mapping.
-    if ev.source == InputSource::Gamepad {
-        return ScreenAction::None;
+    if screen_input::dedicated_three_key_nav_enabled() {
+        match ev.action {
+            VirtualAction::p1_left
+            | VirtualAction::p1_menu_left
+            | VirtualAction::p2_left
+            | VirtualAction::p2_menu_left
+                if !ev.pressed && matches!(state.three_key_focus, ThreeKeyFocus::Row) =>
+            {
+                state.menu_lr_undo_row = 0;
+                on_nav_release(state, NavDirection::Up);
+                return ScreenAction::None;
+            }
+            VirtualAction::p1_right
+            | VirtualAction::p1_menu_right
+            | VirtualAction::p2_right
+            | VirtualAction::p2_menu_right
+                if !ev.pressed && matches!(state.three_key_focus, ThreeKeyFocus::Row) =>
+            {
+                state.menu_lr_undo_row = 0;
+                on_nav_release(state, NavDirection::Down);
+                return ScreenAction::None;
+            }
+            _ => {}
+        }
+        if let Some((_, nav)) = three_key_action {
+            return match nav {
+                screen_input::ThreeKeyMenuAction::Prev => {
+                    if matches!(state.three_key_focus, ThreeKeyFocus::Row) {
+                        move_selection(state, NavDirection::Up, NavWrap::Wrap);
+                        on_nav_press(state, NavDirection::Up);
+                        state.menu_lr_undo_row = 1;
+                    } else if state.selected_row < NUM_MAPPING_ROWS {
+                        let prev_slot = state.active_slot;
+                        set_active_slot(state, active_slot_prev(state.active_slot));
+                        state.menu_lr_undo_slot = Some(prev_slot);
+                        audio::play_sfx("assets/sounds/change_value.ogg");
+                    }
+                    ScreenAction::None
+                }
+                screen_input::ThreeKeyMenuAction::Next => {
+                    if matches!(state.three_key_focus, ThreeKeyFocus::Row) {
+                        move_selection(state, NavDirection::Down, NavWrap::Wrap);
+                        on_nav_press(state, NavDirection::Down);
+                        state.menu_lr_undo_row = -1;
+                    } else if state.selected_row < NUM_MAPPING_ROWS {
+                        let prev_slot = state.active_slot;
+                        set_active_slot(state, active_slot_next(state.active_slot));
+                        state.menu_lr_undo_slot = Some(prev_slot);
+                        audio::play_sfx("assets/sounds/change_value.ogg");
+                    }
+                    ScreenAction::None
+                }
+                screen_input::ThreeKeyMenuAction::Confirm => {
+                    state.menu_lr_undo_row = 0;
+                    if matches!(state.three_key_focus, ThreeKeyFocus::Row) {
+                        if state.selected_row == NUM_MAPPING_ROWS {
+                            audio::play_sfx("assets/sounds/start.ogg");
+                            ScreenAction::Navigate(Screen::Options)
+                        } else {
+                            state.three_key_focus = ThreeKeyFocus::Slot;
+                            state.menu_lr_undo_slot = None;
+                            audio::play_sfx("assets/sounds/start.ogg");
+                            ScreenAction::None
+                        }
+                    } else if state.selected_row < NUM_MAPPING_ROWS {
+                        begin_capture(state, ev.emitted_at);
+                        audio::play_sfx("assets/sounds/change_value.ogg");
+                        ScreenAction::None
+                    } else {
+                        ScreenAction::None
+                    }
+                }
+                screen_input::ThreeKeyMenuAction::Cancel => {
+                    if matches!(state.three_key_focus, ThreeKeyFocus::Slot) {
+                        if let Some(prev_slot) = state.menu_lr_undo_slot.take() {
+                            set_active_slot(state, prev_slot);
+                        }
+                        state.three_key_focus = ThreeKeyFocus::Row;
+                        audio::play_sfx("assets/sounds/change.ogg");
+                        ScreenAction::None
+                    } else {
+                        match state.menu_lr_undo_row {
+                            1 => move_selection(state, NavDirection::Down, NavWrap::Wrap),
+                            -1 => move_selection(state, NavDirection::Up, NavWrap::Wrap),
+                            _ => {}
+                        }
+                        state.menu_lr_undo_row = 0;
+                        ScreenAction::Navigate(Screen::Options)
+                    }
+                }
+            };
+        }
     }
 
     match ev.action {
-        VirtualAction::p1_back if ev.pressed => {
+        VirtualAction::p1_back | VirtualAction::p2_back if ev.pressed => {
             return ScreenAction::Navigate(Screen::Options);
         }
-        VirtualAction::p1_menu_up => {
+        VirtualAction::p1_up
+        | VirtualAction::p1_menu_up
+        | VirtualAction::p2_up
+        | VirtualAction::p2_menu_up => {
             if ev.pressed {
-                move_selection(state, NavDirection::Up);
+                move_selection(state, NavDirection::Up, NavWrap::Wrap);
                 on_nav_press(state, NavDirection::Up);
             } else {
                 on_nav_release(state, NavDirection::Up);
             }
         }
-        VirtualAction::p1_menu_down => {
+        VirtualAction::p1_down
+        | VirtualAction::p1_menu_down
+        | VirtualAction::p2_down
+        | VirtualAction::p2_menu_down => {
             if ev.pressed {
-                move_selection(state, NavDirection::Down);
+                move_selection(state, NavDirection::Down, NavWrap::Wrap);
                 on_nav_press(state, NavDirection::Down);
             } else {
                 on_nav_release(state, NavDirection::Down);
             }
         }
-        VirtualAction::p1_menu_left => {
+        VirtualAction::p1_left
+        | VirtualAction::p1_menu_left
+        | VirtualAction::p2_left
+        | VirtualAction::p2_menu_left => {
             if ev.pressed && state.selected_row < NUM_MAPPING_ROWS {
-                let old_slot = state.active_slot;
-                let new_slot = active_slot_prev(state.active_slot);
-                if new_slot != old_slot {
-                    state.active_slot = new_slot;
-                    state.slot_anim_from = old_slot;
-                    state.slot_anim_to = new_slot;
-                    state.slot_anim_t = 0.0;
-                }
+                set_active_slot(state, active_slot_prev(state.active_slot));
                 audio::play_sfx("assets/sounds/change_value.ogg");
             }
         }
-        VirtualAction::p1_menu_right => {
+        VirtualAction::p1_right
+        | VirtualAction::p1_menu_right
+        | VirtualAction::p2_right
+        | VirtualAction::p2_menu_right => {
             if ev.pressed && state.selected_row < NUM_MAPPING_ROWS {
-                let old_slot = state.active_slot;
-                let new_slot = active_slot_next(state.active_slot);
-                if new_slot != old_slot {
-                    state.active_slot = new_slot;
-                    state.slot_anim_from = old_slot;
-                    state.slot_anim_to = new_slot;
-                    state.slot_anim_t = 0.0;
-                }
+                set_active_slot(state, active_slot_next(state.active_slot));
                 audio::play_sfx("assets/sounds/change_value.ogg");
             }
         }
-        VirtualAction::p1_start if ev.pressed => {
+        VirtualAction::p1_start
+        | VirtualAction::p1_select
+        | VirtualAction::p2_start
+        | VirtualAction::p2_select
+            if ev.pressed =>
+        {
             if state.selected_row == NUM_MAPPING_ROWS {
                 audio::play_sfx("assets/sounds/start.ogg");
                 return ScreenAction::Navigate(Screen::Options);
@@ -681,14 +968,7 @@ pub fn handle_input(state: &mut State, ev: &InputEvent) -> ScreenAction {
 
             // Begin capture on the currently focused slot in this row.
             if state.selected_row < NUM_MAPPING_ROWS {
-                state.capture_active = true;
-                state.capture_row = Some(state.selected_row);
-                state.capture_slot = Some(state.active_slot);
-                state.capture_pulse_t = 0.0;
-                // Stop any held navigation so the list does not keep scrolling.
-                state.nav_key_held_direction = None;
-                state.nav_key_held_since = None;
-                state.nav_key_last_scrolled_at = None;
+                begin_capture(state, ev.emitted_at);
                 audio::play_sfx("assets/sounds/change_value.ogg");
             }
         }
@@ -698,61 +978,6 @@ pub fn handle_input(state: &mut State, ev: &InputEvent) -> ScreenAction {
 }
 
 /* -------------------------------- drawing -------------------------------- */
-
-fn apply_alpha_to_actor(actor: &mut Actor, alpha: f32) {
-    match actor {
-        Actor::Sprite { tint, .. } => tint[3] *= alpha,
-        Actor::Text { color, .. } => color[3] *= alpha,
-        Actor::Mesh { vertices, .. } => {
-            let mut out: Vec<crate::core::gfx::MeshVertex> = Vec::with_capacity(vertices.len());
-            for v in vertices.iter() {
-                let mut c = v.color;
-                c[3] *= alpha;
-                out.push(crate::core::gfx::MeshVertex {
-                    pos: v.pos,
-                    color: c,
-                });
-            }
-            *vertices = std::sync::Arc::from(out);
-        }
-        Actor::TexturedMesh { vertices, .. } => {
-            let mut out: Vec<crate::core::gfx::TexturedMeshVertex> =
-                Vec::with_capacity(vertices.len());
-            for v in vertices.iter() {
-                let mut c = v.color;
-                c[3] *= alpha;
-                out.push(crate::core::gfx::TexturedMeshVertex {
-                    pos: v.pos,
-                    uv: v.uv,
-                    tex_matrix_scale: v.tex_matrix_scale,
-                    color: c,
-                });
-            }
-            *vertices = std::sync::Arc::from(out);
-        }
-        Actor::Frame {
-            background,
-            children,
-            ..
-        } => {
-            if let Some(crate::ui::actors::Background::Color(c)) = background {
-                c[3] *= alpha;
-            }
-            for child in children {
-                apply_alpha_to_actor(child, alpha);
-            }
-        }
-        Actor::Camera { children, .. } => {
-            for child in children {
-                apply_alpha_to_actor(child, alpha);
-            }
-        }
-        Actor::Shadow { color, child, .. } => {
-            color[3] *= alpha;
-            apply_alpha_to_actor(child, alpha);
-        }
-    }
-}
 
 #[inline(always)]
 fn slot_pulse_zoom_and_color(
@@ -790,6 +1015,15 @@ fn format_binding_for_display(binding: InputBinding) -> String {
             format!("Pad {device} Dir {dir:?}")
         }
         InputBinding::GamepadCode(binding) => {
+            // Prefer a friendly SMX label (e.g. "SMX[40ea] R") when the binding
+            // belongs to a connected StepManiaX pad; otherwise fall back to the
+            // generic "Pad N Btn 0x.." form.
+            if let Some(label) = binding
+                .device
+                .and_then(|dev| deadsync_smx::trigger_label(dev, binding.code_u32))
+            {
+                return label;
+            }
             let dev = binding.device.unwrap_or(0);
             // Display the full code but cropped at the first non-zero hex
             // digit for readability, e.g.:
@@ -812,41 +1046,38 @@ fn format_binding_for_display(binding: InputBinding) -> String {
 }
 
 #[inline(always)]
-fn editable_slot_indices_for_action(
-    keymap: &crate::core::input::Keymap,
-    action: VirtualAction,
-) -> (usize, usize) {
-    if keymap.first_key_binding(action).is_some() {
-        (1, 2)
-    } else {
-        (0, 1)
-    }
+fn editable_slot_indices_for_action(keymap: &Keymap, action: VirtualAction) -> (usize, usize) {
+    crate::config::editable_key_binding_slot_indices(keymap, action)
 }
 
-pub fn get_actors(
+pub fn push_actors(
+    actors: &mut Vec<Actor>,
     state: &State,
     asset_manager: &AssetManager,
     alpha_multiplier: f32,
-) -> Vec<Actor> {
-    let mut actors: Vec<Actor> = Vec::with_capacity(256);
+) {
+    actors.reserve(256);
 
     /* -------------------------- HEART BACKGROUND -------------------------- */
-    actors.extend(state.bg.build(heart_bg::Params {
-        active_color_index: state.active_color_index,
-        backdrop_rgba: [0.0, 0.0, 0.0, 1.0],
-        // Keep hearts always visible for actor-only fades; UI rows fade separately.
-        alpha_mul: 1.0,
-    }));
+    state.bg.push(
+        actors,
+        visual_style_bg::Params {
+            active_color_index: state.active_color_index,
+            backdrop_rgba: [0.0, 0.0, 0.0, 1.0],
+            // Keep hearts always visible for actor-only fades; UI rows fade separately.
+            alpha_mul: 1.0,
+        },
+    );
 
     if alpha_multiplier <= 0.0 {
-        return actors;
+        return;
     }
 
-    let mut ui_actors = Vec::new();
+    let ui_start = actors.len();
 
     /* ------------------------------ TOP BAR ------------------------------- */
     const FG: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
-    ui_actors.push(screen_bar::build(screen_bar::ScreenBarParams {
+    actors.push(screen_bar::build(screen_bar::ScreenBarParams {
         title: "KEYBOARD/PAD MAPPINGS",
         title_placement: ScreenBarTitlePlacement::Left,
         position: ScreenBarPosition::Top,
@@ -942,7 +1173,7 @@ pub fn get_actors(
     let desc_h = desc_rows_h_base * s;
 
     // Description box (center) – height matched to visible mapping rows only.
-    ui_actors.push(act!(quad:
+    actors.push(act!(quad:
         align(0.0, 0.0):
         xy(desc_x, first_row_y):
         zoomto(desc_w, desc_h):
@@ -959,7 +1190,7 @@ pub fn get_actors(
             }
             let row_center_y =
                 ((i_vis as f32) * (ROW_H + ROW_GAP)).mul_add(s, first_row_y) + 0.5 * ROW_H * s;
-            ui_actors.push(act!(text:
+            actors.push(act!(text:
                 align(0.5, 0.5):
                 xy(labels_center_x, row_center_y):
                 zoom(DESC_BODY_ZOOM):
@@ -1009,20 +1240,20 @@ pub fn get_actors(
     };
 
     // Top line: Player labels (Wendy, white).
-    ui_actors.push(act!(text:
+    actors.push(act!(text:
         align(0.5, 0.5):
         xy(p1_center_x, header_main_y):
         zoom(header_main_zoom):
         diffuse(1.0, 1.0, 1.0, 1.0):
-        font("wendy"): settext("Player 1"):
+        font(current_machine_font_key(FontRole::Header)): settext("Player 1"):
         horizalign(center)
     ));
-    ui_actors.push(act!(text:
+    actors.push(act!(text:
         align(0.5, 0.5):
         xy(p2_center_x, header_main_y):
         zoom(header_main_zoom):
         diffuse(1.0, 1.0, 1.0, 1.0):
-        font("wendy"): settext("Player 2"):
+        font(current_machine_font_key(FontRole::Header)): settext("Player 2"):
         horizalign(center)
     ));
 
@@ -1031,54 +1262,54 @@ pub fn get_actors(
     header_dec[3] = 1.0;
 
     // P1 headers
-    ui_actors.push(act!(text:
+    actors.push(act!(text:
         align(0.5, 0.5):
         xy(p1_primary_x, header_sub_y):
         zoom(header_zoom):
         diffuse(header_dec[0], header_dec[1], header_dec[2], header_dec[3]):
-        font("wendy"): settext("Primary"):
+        font(current_machine_font_key(FontRole::Header)): settext("Primary"):
         horizalign(center)
     ));
-    ui_actors.push(act!(text:
+    actors.push(act!(text:
         align(0.5, 0.5):
         xy(p1_secondary_x, header_sub_y):
         zoom(header_zoom):
         diffuse(header_dec[0], header_dec[1], header_dec[2], header_dec[3]):
-        font("wendy"): settext("Secondary"):
+        font(current_machine_font_key(FontRole::Header)): settext("Secondary"):
         horizalign(center)
     ));
-    ui_actors.push(act!(text:
+    actors.push(act!(text:
         align(0.5, 0.5):
         xy(p1_default_x, header_sub_y):
         zoom(header_zoom):
         diffuse(header_dec[0], header_dec[1], header_dec[2], header_dec[3]):
-        font("wendy"): settext("Default"):
+        font(current_machine_font_key(FontRole::Header)): settext("Default"):
         horizalign(center)
     ));
 
     // P2 headers
-    ui_actors.push(act!(text:
+    actors.push(act!(text:
         align(0.5, 0.5):
         xy(p2_primary_x, header_sub_y):
         zoom(header_zoom):
         diffuse(header_dec[0], header_dec[1], header_dec[2], header_dec[3]):
-        font("wendy"): settext("Primary"):
+        font(current_machine_font_key(FontRole::Header)): settext("Primary"):
         horizalign(center)
     ));
-    ui_actors.push(act!(text:
+    actors.push(act!(text:
         align(0.5, 0.5):
         xy(p2_secondary_x, header_sub_y):
         zoom(header_zoom):
         diffuse(header_dec[0], header_dec[1], header_dec[2], header_dec[3]):
-        font("wendy"): settext("Secondary"):
+        font(current_machine_font_key(FontRole::Header)): settext("Secondary"):
         horizalign(center)
     ));
-    ui_actors.push(act!(text:
+    actors.push(act!(text:
         align(0.5, 0.5):
         xy(p2_default_x, header_sub_y):
         zoom(header_zoom):
         diffuse(header_dec[0], header_dec[1], header_dec[2], header_dec[3]):
-        font("wendy"): settext("Default"):
+        font(current_machine_font_key(FontRole::Header)): settext("Default"):
         horizalign(center)
     ));
 
@@ -1096,8 +1327,9 @@ pub fn get_actors(
         if !is_exit && row_idx >= NUM_MAPPING_ROWS {
             continue;
         }
+        let show_mapping_row = !is_exit;
 
-        if !is_exit {
+        if show_mapping_row {
             let bg = if is_active {
                 col_active_bg
             } else {
@@ -1105,13 +1337,13 @@ pub fn get_actors(
             };
 
             // Row backgrounds for P1 and P2 sides.
-            ui_actors.push(act!(quad:
+            actors.push(act!(quad:
                 align(0.0, 0.0):
                 xy(p1_side_x, row_y):
                 zoomto(side_w, ROW_H * s):
                 diffuse(bg[0], bg[1], bg[2], bg[3])
             ));
-            ui_actors.push(act!(quad:
+            actors.push(act!(quad:
                 align(0.0, 0.0):
                 xy(p2_side_x, row_y):
                 zoomto(side_w, ROW_H * s):
@@ -1120,13 +1352,13 @@ pub fn get_actors(
 
             // Label-style default columns (third column on each side).
             let default_bg_color = [0.0, 0.0, 0.0, 0.25];
-            ui_actors.push(act!(quad:
+            actors.push(act!(quad:
                 align(0.0, 0.0):
                 xy(2.0f32.mul_add(col_w, p1_side_x), row_y):
                 zoomto(col_w, ROW_H * s):
                 diffuse(default_bg_color[0], default_bg_color[1], default_bg_color[2], default_bg_color[3])
             ));
-            ui_actors.push(act!(quad:
+            actors.push(act!(quad:
                 align(0.0, 0.0):
                 xy(2.0f32.mul_add(col_w, p2_side_x), row_y):
                 zoomto(col_w, ROW_H * s):
@@ -1142,8 +1374,9 @@ pub fn get_actors(
                 p1_default_text,
                 p2_default_text,
             ) = with_keymap(|keymap| {
-                // Actions with a default key use [default, primary, secondary].
-                // Actions without a default use [primary, secondary].
+                // Actions whose protected default is still present use
+                // [default, primary, secondary]. Others use
+                // [primary, secondary].
                 let p1_slots = p1_act_opt.map(|act| editable_slot_indices_for_action(keymap, act));
                 let p2_slots = p2_act_opt.map(|act| editable_slot_indices_for_action(keymap, act));
                 let p1_primary_text = p1_act_opt
@@ -1160,11 +1393,11 @@ pub fn get_actors(
                     .map_or_else(|| "------".to_string(), format_binding_for_display);
 
                 let p1_default_text = p1_act_opt
-                    .and_then(|act| keymap.first_key_binding(act))
+                    .and_then(|act| crate::config::protected_default_key_for_action(keymap, act))
                     .map(|code| format!("{code:?}"))
                     .unwrap_or_else(|| "------".to_string());
                 let p2_default_text = p2_act_opt
-                    .and_then(|act| keymap.first_key_binding(act))
+                    .and_then(|act| crate::config::protected_default_key_for_action(keymap, act))
                     .map(|code| format!("{code:?}"))
                     .unwrap_or_else(|| "------".to_string());
 
@@ -1222,7 +1455,7 @@ pub fn get_actors(
 
             // P1 columns: Primary, Secondary, Default.
             // P1 primary / secondary (editable).
-            ui_actors.push(act!(text:
+            actors.push(act!(text:
                 align(0.5, 0.5):
                 xy(p1_primary_x, row_mid_y):
                 zoom(p1_primary_zoom):
@@ -1232,7 +1465,7 @@ pub fn get_actors(
                 maxwidth(col_w * 0.8):
                 horizalign(center)
             ));
-            ui_actors.push(act!(text:
+            actors.push(act!(text:
                 align(0.5, 0.5):
                 xy(p1_secondary_x, row_mid_y):
                 zoom(p1_secondary_zoom):
@@ -1244,7 +1477,7 @@ pub fn get_actors(
             ));
 
             // P1 default (non-selectable).
-            ui_actors.push(act!(text:
+            actors.push(act!(text:
                 align(0.5, 0.5):
                 xy(p1_default_x, row_mid_y):
                 zoom(value_zoom):
@@ -1256,7 +1489,7 @@ pub fn get_actors(
             ));
 
             // P2 primary / secondary (editable).
-            ui_actors.push(act!(text:
+            actors.push(act!(text:
                 align(0.5, 0.5):
                 xy(p2_primary_x, row_mid_y):
                 zoom(p2_primary_zoom):
@@ -1266,7 +1499,7 @@ pub fn get_actors(
                 maxwidth(col_w * 0.8):
                 horizalign(center)
             ));
-            ui_actors.push(act!(text:
+            actors.push(act!(text:
                 align(0.5, 0.5):
                 xy(p2_secondary_x, row_mid_y):
                 zoom(p2_secondary_zoom):
@@ -1278,7 +1511,7 @@ pub fn get_actors(
             ));
 
             // P2 default (non-selectable).
-            ui_actors.push(act!(text:
+            actors.push(act!(text:
                 align(0.5, 0.5):
                 xy(p2_default_x, row_mid_y):
                 zoom(value_zoom):
@@ -1373,28 +1606,28 @@ pub fn get_actors(
                 let mut ring_color = color::decorative_rgba(state.active_color_index);
                 ring_color[3] = 1.0;
 
-                ui_actors.push(act!(quad:
+                actors.push(act!(quad:
                     align(0.5, 0.5):
                     xy(center_x, top + border_w * 0.5):
                     zoomto(ring_w, border_w):
                     diffuse(ring_color[0], ring_color[1], ring_color[2], ring_color[3]):
                     z(101)
                 ));
-                ui_actors.push(act!(quad:
+                actors.push(act!(quad:
                     align(0.5, 0.5):
                     xy(center_x, bottom - border_w * 0.5):
                     zoomto(ring_w, border_w):
                     diffuse(ring_color[0], ring_color[1], ring_color[2], ring_color[3]):
                     z(101)
                 ));
-                ui_actors.push(act!(quad:
+                actors.push(act!(quad:
                     align(0.5, 0.5):
                     xy(left + border_w * 0.5, center_y):
                     zoomto(border_w, ring_h):
                     diffuse(ring_color[0], ring_color[1], ring_color[2], ring_color[3]):
                     z(101)
                 ));
-                ui_actors.push(act!(quad:
+                actors.push(act!(quad:
                     align(0.5, 0.5):
                     xy(right - border_w * 0.5, center_y):
                     zoomto(border_w, ring_h):
@@ -1418,14 +1651,14 @@ pub fn get_actors(
             } else {
                 col_inactive_bg
             };
-            ui_actors.push(act!(quad:
+            actors.push(act!(quad:
                 align(0.0, 0.0):
                 xy(exit_row_left, row_y):
                 zoomto(exit_row_width, ROW_H * s):
                 diffuse(exit_bg[0], exit_bg[1], exit_bg[2], exit_bg[3])
             ));
 
-            ui_actors.push(act!(text:
+            actors.push(act!(text:
                 align(0.5, 0.5):
                 xy(exit_center_x, exit_y):
                 zoom(0.835):
@@ -1497,28 +1730,28 @@ pub fn get_actors(
                         let mut ring_color = color::decorative_rgba(state.active_color_index);
                         ring_color[3] = 1.0;
 
-                        ui_actors.push(act!(quad:
+                        actors.push(act!(quad:
                             align(0.5, 0.5):
                             xy(center_x, top + border_w * 0.5):
                             zoomto(ring_w, border_w):
                             diffuse(ring_color[0], ring_color[1], ring_color[2], ring_color[3]):
                             z(101)
                         ));
-                        ui_actors.push(act!(quad:
+                        actors.push(act!(quad:
                             align(0.5, 0.5):
                             xy(center_x, bottom - border_w * 0.5):
                             zoomto(ring_w, border_w):
                             diffuse(ring_color[0], ring_color[1], ring_color[2], ring_color[3]):
                             z(101)
                         ));
-                        ui_actors.push(act!(quad:
+                        actors.push(act!(quad:
                             align(0.5, 0.5):
                             xy(left + border_w * 0.5, center_y):
                             zoomto(border_w, ring_h):
                             diffuse(ring_color[0], ring_color[1], ring_color[2], ring_color[3]):
                             z(101)
                         ));
-                        ui_actors.push(act!(quad:
+                        actors.push(act!(quad:
                             align(0.5, 0.5):
                             xy(right - border_w * 0.5, center_y):
                             zoomto(border_w, ring_h):
@@ -1532,10 +1765,186 @@ pub fn get_actors(
     }
 
     let combined_alpha = alpha_multiplier;
-    for actor in &mut ui_actors {
-        apply_alpha_to_actor(actor, combined_alpha);
+    for actor in &mut actors[ui_start..] {
+        actor.mul_alpha(combined_alpha);
     }
-    actors.extend(ui_actors);
+}
 
+pub fn get_actors(
+    state: &State,
+    asset_manager: &AssetManager,
+    alpha_multiplier: f32,
+) -> Vec<Actor> {
+    let mut actors = Vec::with_capacity(256);
+    push_actors(&mut actors, state, asset_manager, alpha_multiplier);
     actors
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ActiveSlot, begin_capture, handle_input, handle_raw_key_event, handle_raw_pad_event, init,
+        invalid_capture_key, keymap_raw_nav_action,
+    };
+    use deadsync_core::input::InputSource;
+    use deadsync_input::RawKeyboardEvent;
+    use deadsync_input::{
+        InputBinding, InputEvent, Keymap, PadCode, PadEvent, PadId, VirtualAction,
+    };
+    use std::time::{Duration, Instant};
+    use winit::keyboard::KeyCode;
+
+    fn input_event(action: VirtualAction, pressed: bool, source: InputSource) -> InputEvent {
+        let now = Instant::now();
+        InputEvent {
+            action,
+            input_slot: 0,
+            pressed,
+            source,
+            timestamp: now,
+            timestamp_host_nanos: 0,
+            stored_at: now,
+            emitted_at: now,
+        }
+    }
+
+    fn raw_key(code: KeyCode, pressed: bool, timestamp: Instant) -> RawKeyboardEvent {
+        RawKeyboardEvent {
+            code,
+            pressed,
+            repeat: false,
+            timestamp,
+            host_nanos: 0,
+        }
+    }
+
+    #[test]
+    fn capture_allows_default_menu_keys() {
+        assert!(!invalid_capture_key(KeyCode::ArrowLeft));
+        assert!(!invalid_capture_key(KeyCode::ArrowRight));
+        assert!(!invalid_capture_key(KeyCode::ArrowUp));
+        assert!(!invalid_capture_key(KeyCode::ArrowDown));
+        assert!(!invalid_capture_key(KeyCode::Enter));
+        assert!(!invalid_capture_key(KeyCode::Escape));
+        assert!(!invalid_capture_key(KeyCode::NumpadEnter));
+    }
+
+    #[test]
+    fn capture_rejects_function_keys() {
+        assert!(invalid_capture_key(KeyCode::F1));
+        assert!(invalid_capture_key(KeyCode::F12));
+    }
+
+    #[test]
+    fn p2_gamepad_can_navigate_and_begin_capture() {
+        let mut state = init();
+
+        handle_input(
+            &mut state,
+            &input_event(VirtualAction::p2_down, true, InputSource::Gamepad),
+        );
+        assert_eq!(state.selected_row, 1);
+
+        handle_input(
+            &mut state,
+            &input_event(VirtualAction::p2_right, true, InputSource::Gamepad),
+        );
+        assert_eq!(state.active_slot, ActiveSlot::P1Secondary);
+
+        handle_input(
+            &mut state,
+            &input_event(VirtualAction::p2_start, true, InputSource::Gamepad),
+        );
+        assert!(state.capture_active);
+        assert_eq!(state.capture_row, Some(1));
+        assert_eq!(state.capture_slot, Some(ActiveSlot::P1Secondary));
+    }
+
+    #[test]
+    fn capture_ignores_keyboard_arming_key_until_release() {
+        let mut state = init();
+        let t0 = Instant::now();
+
+        handle_raw_key_event(&mut state, &raw_key(KeyCode::Enter, true, t0));
+        assert!(state.capture_active);
+        assert_eq!(state.capture_keyboard_arming_key, Some(KeyCode::Enter));
+
+        handle_raw_key_event(
+            &mut state,
+            &raw_key(KeyCode::Enter, true, t0 + Duration::from_millis(1)),
+        );
+        assert!(state.capture_active);
+        assert_eq!(state.capture_keyboard_arming_key, Some(KeyCode::Enter));
+
+        handle_raw_key_event(
+            &mut state,
+            &raw_key(KeyCode::Enter, false, t0 + Duration::from_millis(2)),
+        );
+        assert!(state.capture_active);
+        assert_eq!(state.capture_keyboard_arming_key, None);
+
+        handle_raw_key_event(
+            &mut state,
+            &raw_key(KeyCode::Enter, true, t0 + Duration::from_millis(3)),
+        );
+        assert!(state.capture_active);
+    }
+
+    #[test]
+    fn raw_pad_capture_consumes_accepted_press() {
+        let mut state = init();
+        let t0 = Instant::now();
+        state.selected_row = 8;
+        begin_capture(&mut state, t0);
+
+        let event = PadEvent::RawButton {
+            id: PadId(0),
+            timestamp: t0 + Duration::from_millis(250),
+            host_nanos: 7,
+            code: PadCode(9),
+            uuid: [1; 16],
+            value: 1.0,
+            pressed: true,
+        };
+
+        assert!(handle_raw_pad_event(&mut state, &event));
+        assert!(!state.capture_active);
+    }
+
+    #[test]
+    fn keymap_raw_nav_action_detects_p2_keyboard_bindings() {
+        let mut keymap = Keymap::default();
+        keymap.bind(
+            VirtualAction::p2_down,
+            &[InputBinding::Key(KeyCode::Numpad2)],
+        );
+        keymap.bind(
+            VirtualAction::p2_start,
+            &[InputBinding::Key(KeyCode::NumpadEnter)],
+        );
+
+        let down = RawKeyboardEvent {
+            code: KeyCode::Numpad2,
+            pressed: true,
+            repeat: false,
+            timestamp: Instant::now(),
+            host_nanos: 0,
+        };
+        let start = RawKeyboardEvent {
+            code: KeyCode::NumpadEnter,
+            pressed: true,
+            repeat: false,
+            timestamp: Instant::now(),
+            host_nanos: 0,
+        };
+
+        assert_eq!(
+            keymap_raw_nav_action(&keymap, &down),
+            Some(VirtualAction::p2_down)
+        );
+        assert_eq!(
+            keymap_raw_nav_action(&keymap, &start),
+            Some(VirtualAction::p2_start)
+        );
+    }
 }

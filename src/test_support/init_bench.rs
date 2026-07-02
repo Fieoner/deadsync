@@ -1,5 +1,5 @@
 use crate::screens::init;
-use crate::ui::actors::Actor;
+use deadlib_present::actors::Actor;
 
 pub const SCENARIO_NAME: &str = "init";
 

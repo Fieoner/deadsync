@@ -1,0 +1,61 @@
+struct Proj {
+    proj: mat4x4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> u_proj: Proj;
+@group(1) @binding(0) var u_sampler: sampler;
+@group(1) @binding(1) var u_texture: texture_2d<f32>;
+
+struct VertexIn {
+    @location(0) pos: vec3<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) color: vec4<f32>,
+    @location(3) tex_matrix_scale: vec2<f32>,
+    @location(4) model_col0: vec4<f32>,
+    @location(5) model_col1: vec4<f32>,
+    @location(6) model_col2: vec4<f32>,
+    @location(7) model_col3: vec4<f32>,
+    @location(8) tint: vec4<f32>,
+    @location(9) uv_scale: vec2<f32>,
+    @location(10) uv_offset: vec2<f32>,
+    @location(11) uv_tex_shift: vec2<f32>,
+    @location(12) texture_mask: f32,
+};
+
+struct VertexOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) color: vec4<f32>,
+    @location(2) texture_mask: f32,
+};
+
+@vertex
+fn vs_main(input: VertexIn) -> VertexOut {
+    var out: VertexOut;
+    let model = mat4x4<f32>(
+        input.model_col0,
+        input.model_col1,
+        input.model_col2,
+        input.model_col3,
+    );
+    out.pos = u_proj.proj * model * vec4<f32>(input.pos, 1.0);
+    out.uv = input.uv * input.uv_scale
+        + input.uv_offset
+        + input.uv_tex_shift * (input.tex_matrix_scale - vec2<f32>(1.0, 1.0));
+    out.color = input.color * input.tint;
+    out.texture_mask = input.texture_mask;
+    return out;
+}
+
+@fragment
+fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
+    let texel = textureSample(u_texture, u_sampler, input.uv);
+    var color = texel * input.color;
+    if input.texture_mask > 0.5 {
+        color = vec4<f32>(input.color.rgb, texel.a * input.color.a);
+    }
+    if color.a <= (1.0 / 256.0) {
+        discard;
+    }
+    return color;
+}
