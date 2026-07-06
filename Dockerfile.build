@@ -1,0 +1,32 @@
+# Use the official Rust image
+FROM rust:bookworm
+
+RUN dpkg --add-architecture arm64
+
+# Install host tools + ALL ARM64 dependencies including the transitive ones
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake pkg-config git \
+    gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+    # Target libraries
+    libudev-dev:arm64 \
+    libasound2-dev:arm64 \
+    libvulkan-dev:arm64 \
+    libgl1-mesa-dev:arm64 \
+    libx11-dev:arm64 \
+    libxcb1-dev:arm64 \
+    liblua5.4-dev:arm64 \
+    # Transitive dependencies the linker asked for
+    libcap-dev:arm64 \
+    libxau-dev:arm64 \
+    libxdmcp-dev:arm64
+
+RUN rustup target add aarch64-unknown-linux-gnu
+
+# Environment mappings
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+ENV CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+ENV CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
+ENV PKG_CONFIG_PATH_aarch64_unknown_linux_gnu=/usr/lib/aarch64-linux-gnu/pkgconfig
+ENV PKG_CONFIG_ALLOW_CROSS=1
+
+WORKDIR /usr/src/app

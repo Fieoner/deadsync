@@ -1,0 +1,27 @@
+[2026-07-06T01:59:13Z INFO  startup] deadsync 0.4.1962 (build 6281a33d48, 20260705 @ 19:14:16)
+[2026-07-06T01:59:13Z INFO  startup] --------------------------------------
+[2026-07-06T01:59:13Z INFO  startup] Log starting 2026-07-06 03:59:13
+[2026-07-06T01:59:13Z INFO  startup] OS: Bazzite [linux x86_64]
+[2026-07-06T01:59:13Z INFO  startup] CPU: AMD RYZEN AI MAX+ 395 w/ Radeon 8060S (32 logical cores)
+[2026-07-06T01:59:13Z INFO  startup] Memory: 27685 total, 13842 swap (6742 swap avail)
+[2026-07-06T01:59:13Z INFO  startup] Executable: /var/home/fieoner/projects/deadsync/deadsync
+[2026-07-06T01:59:13Z INFO  startup] Runtime dir: /var/home/fieoner/projects/deadsync
+[2026-07-06T01:59:13Z INFO  startup] Drive: /
+[2026-07-06T01:59:13Z INFO  startup] Portable mode: true
+[2026-07-06T01:59:13Z INFO  startup] Data directory: /var/home/fieoner/projects/deadsync
+[2026-07-06T01:59:13Z INFO  startup] Cache directory: /var/home/fieoner/projects/deadsync/cache
+[2026-07-06T01:59:13Z INFO  startup] Log file: /var/home/fieoner/projects/deadsync/deadsync.log
+[2026-07-06T01:59:13Z INFO  startup] Log level: Warn
+[2026-07-06T01:59:13Z INFO  startup] Video renderer: Vulkan
+[2026-07-06T01:59:13Z INFO  startup] Display: Fullscreen Exclusive 1920x1080 monitor=0
+[2026-07-06T01:59:13Z INFO  startup] Present: vsync=off policy=immediate
+[2026-07-06T01:59:13Z INFO  startup] Audio request: device=Auto, mode=Auto, backend=ALSA, rate=Auto
+[2026-07-06T01:59:13Z WARN  deadsync_audio_backend_native::linux_alsa] Failed to probe ALSA playback device 'HD-Audio Generic, ALC294 Analog' (hw:CARD=1,DEV=0): failed to open ALSA PCM 'hw:CARD=1,DEV=0': ALSA function 'snd_pcm_open' failed with error 'Device or resource busy (16)'. Listing it with fallback defaults.
+[2026-07-06T01:59:13Z INFO  startup] Startup audio devices:
+[2026-07-06T01:59:13Z INFO  startup] Sound device 0: HD-Audio Generic, HDMI 0 (default) [32000, 44100, 48000, 88200, 96000, 176400, 192000 Hz]
+[2026-07-06T01:59:13Z INFO  startup] Sound device 1: HD-Audio Generic, HDMI 1 [32000, 44100, 48000, 88200, 96000, 176400, 192000 Hz]
+[2026-07-06T01:59:13Z INFO  startup] Sound device 2: HD-Audio Generic, HDMI 2 [32000, 44100, 48000, 88200, 96000, 176400, 192000 Hz]
+[2026-07-06T01:59:13Z INFO  startup] Sound device 3: HD-Audio Generic, HDMI 3 [32000, 44100, 48000, 88200, 96000, 176400, 192000 Hz]
+[2026-07-06T01:59:13Z INFO  startup] Sound device 4: HD-Audio Generic, ALC294 Analog
+[2026-07-06T01:59:13Z WARN  deadlib_platform::display] No exact EXCLUSIVE mode 1920x1080; using BORDERLESS.
+[2026-07-06T01:59:35Z WARN  deadsync::app] Missing stepchart index 2 for '[08] Festivo'; using fallback index 4

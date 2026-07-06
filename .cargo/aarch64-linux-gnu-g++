@@ -1,0 +1,2 @@
+#!/bin/bash
+exec "$HOME/.local/aarch64-toolchain/bin/aarch64-linux-gnu-g++" --sysroot=/home/fieoner/projects/deadsync/sysroot "$@"
