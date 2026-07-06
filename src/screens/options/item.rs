@@ -163,6 +163,7 @@ pub enum ItemId {
     SmPreviews,
     SmPreviewMarker,
     SmPreviewLoop,
+    SmPreviewStartsImmediately,
     SmGameplayTimer,
     SmStageDisplay,
     SmShowRivals,

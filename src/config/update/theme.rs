@@ -231,6 +231,17 @@ pub fn update_select_music_preview_loop(enabled: bool) {
     save_without_keymaps();
 }
 
+pub fn update_select_music_preview_starts_immediately(enabled: bool) {
+    {
+        let mut cfg = lock_config();
+        if cfg.select_music_preview_starts_immediately == enabled {
+            return;
+        }
+        cfg.select_music_preview_starts_immediately = enabled;
+    }
+    save_without_keymaps();
+}
+
 pub fn update_select_music_pattern_info_mode(mode: SelectMusicPatternInfoMode) {
     {
         let mut cfg = lock_config();

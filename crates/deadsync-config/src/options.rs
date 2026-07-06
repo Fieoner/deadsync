@@ -759,6 +759,7 @@ pub struct SelectMusicOptions {
     pub show_previews: bool,
     pub show_preview_marker: bool,
     pub preview_loop: bool,
+    pub preview_starts_immediately: bool,
     pub pattern_info_mode: SelectMusicPatternInfoMode,
     pub step_artist_box_mode: SelectMusicStepArtistBoxMode,
     pub show_scorebox: bool,
@@ -861,6 +862,10 @@ pub fn load_select_music_options(
         preview_loop: parse_u8_bool_or_default(
             conf.get("Options", "SelectMusicPreviewLoop").as_deref(),
             default.preview_loop,
+        ),
+        preview_starts_immediately: parse_u8_bool_or_default(
+            conf.get("Options", "SelectMusicPreviewStartsImmediately").as_deref(),
+            default.preview_starts_immediately,
         ),
         pattern_info_mode: conf
             .get("Options", "SelectMusicPatternInfo")
@@ -982,6 +987,7 @@ pub fn push_select_music_option_lines(content: &mut String, options: SelectMusic
         select.show_preview_marker,
     );
     push_bool(content, "SelectMusicPreviewLoop", select.preview_loop);
+    push_bool(content, "SelectMusicPreviewStartsImmediately", select.preview_starts_immediately);
     push_line(
         content,
         "SelectMusicPatternInfo",
@@ -2613,6 +2619,7 @@ mod tests {
             SelectMusicPreviews=0
             SelectMusicPreviewMarker=0
             SelectMusicPreviewLoop=1
+            SelectMusicStartsImmediately=1
             SelectMusicPatternInfo=Stamina
             SelectMusicStepArtistBox=Expanded
             SelectMusicScorebox=1
@@ -2711,6 +2718,7 @@ mod tests {
                 "SelectMusicPreviews=1\n",
                 "SelectMusicPreviewMarker=1\n",
                 "SelectMusicPreviewLoop=0\n",
+                "SelectMusicPreviewStartsImmediately=0\n",
                 "SelectMusicPatternInfo=Auto\n",
                 "SelectMusicStepArtistBox=Default\n",
                 "SelectMusicScorebox=0\n",

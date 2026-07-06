@@ -256,6 +256,7 @@ fn load_select_music_opts(conf: &SimpleIni, default: Config, cfg: &mut Config) {
             show_previews: default.show_select_music_previews,
             show_preview_marker: default.show_select_music_preview_marker,
             preview_loop: default.select_music_preview_loop,
+            preview_starts_immediately: default.select_music_preview_starts_immediately,
             pattern_info_mode: default.select_music_pattern_info_mode,
             step_artist_box_mode: default.select_music_step_artist_box_mode,
             show_scorebox: default.show_select_music_scorebox,
@@ -289,6 +290,7 @@ fn load_select_music_opts(conf: &SimpleIni, default: Config, cfg: &mut Config) {
     cfg.show_select_music_previews = loaded.show_previews;
     cfg.show_select_music_preview_marker = loaded.show_preview_marker;
     cfg.select_music_preview_loop = loaded.preview_loop;
+    cfg.select_music_preview_starts_immediately = loaded.preview_starts_immediately;
     cfg.select_music_pattern_info_mode = loaded.pattern_info_mode;
     cfg.select_music_step_artist_box_mode = loaded.step_artist_box_mode;
     cfg.show_select_music_scorebox = loaded.show_scorebox;
